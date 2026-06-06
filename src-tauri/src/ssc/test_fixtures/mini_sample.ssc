@@ -1,0 +1,43 @@
+#VERSION:0.81;
+#TITLE:Mini Sample;
+#ARTIST:AI Artist;
+#MUSIC:mini_sample.mp3;
+#OFFSET:-0.030000;
+#BPMS:0.000=140.000;
+
+//---------------pump-single - S3----------------
+#NOTEDATA:;
+#STEPSTYPE:pump-single;
+#DESCRIPTION:S3;
+#DIFFICULTY:Beginner;
+#METER:3;
+#CREDIT:CONRAD;
+#OFFSET:-0.080000;
+#BPMS:0.000000=140.000;
+#NOTES:
+00000
+00000
+00000
+00000
+;
+
+//---------------pump-single - S15----------------
+#NOTEDATA:;
+#STEPSTYPE:pump-single;
+#DESCRIPTION:S15;
+#DIFFICULTY:Hard;
+#METER:15;
+#CREDIT:CONRAD;
+#OFFSET:-0.080000;
+#BPMS:0.000000=140.000;
+#SPEEDS:0.000=1.000=0.000=0;
+#SCROLLS:0.000=1.000;
+#FAKES:;
+#NOTES:
+00000
+,
+10000
+00100
+00001
+00100
+;

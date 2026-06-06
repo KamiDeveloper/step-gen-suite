@@ -1,0 +1,192 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "SongAnalysisReport",
+  "type": "object",
+  "properties": {
+    "schema_version": { "type": "string", "const": "music-analysis-report.v1" },
+    "song_id": { "type": "string" },
+    "title": { "type": "string" },
+    "artist": { "type": "string" },
+    "duration_seconds": { "type": "number" },
+    "audio_summary": {
+      "type": "object",
+      "properties": {
+        "sample_rate": { "type": "integer" },
+        "detected_bpm": { "type": "number" },
+        "rms_energy_mean": { "type": "number" },
+        "rms_energy_max": { "type": "number" },
+        "spectral_centroid_mean": { "type": "number" },
+        "spectral_flatness_mean": { "type": "number" },
+        "zero_crossing_rate_mean": { "type": "number" },
+        "chroma_mean": {
+          "type": ["array", "null"],
+          "items": { "type": "number" }
+        },
+        "spectral_contrast_mean": {
+          "type": ["array", "null"],
+          "items": { "type": "number" }
+        },
+        "analysis_mode": { "type": "string", "enum": ["dsp", "fallback"] }
+      },
+      "required": ["sample_rate", "detected_bpm", "analysis_mode"]
+    },
+    "timing_grid": {
+      "type": "object",
+      "properties": {
+        "initial_offset": { "type": "number" },
+        "bpms": {
+          "type": "array",
+          "items": {
+            "type": "array",
+            "minItems": 2,
+            "maxItems": 2,
+            "items": { "type": "number" }
+          }
+        },
+        "display_bpm": { "type": "string" },
+        "song_type": { "type": "string" }
+      },
+      "required": ["initial_offset", "bpms"]
+    },
+    "event_features": {
+      "type": "object",
+      "properties": {
+        "beats": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "properties": {
+              "beat": { "type": "number" },
+              "time_seconds": { "type": "number" },
+              "measure_index": { "type": "integer" },
+              "beat_in_measure": { "type": "number" },
+              "bpm": { "type": "number" },
+              "confidence": { "type": "number" },
+              "audio_event_summary": {
+                "type": "object",
+                "properties": {
+                  "onset_strength": { "type": "number" },
+                  "energy": { "type": "number" }
+                }
+              }
+            },
+            "required": ["beat", "time_seconds", "measure_index", "beat_in_measure", "bpm"]
+          }
+        }
+      }
+    },
+    "sections": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "properties": {
+          "section_id": { "type": "string" },
+          "start_beat": { "type": "number" },
+          "end_beat": { "type": "number" },
+          "start_measure": { "type": "integer" },
+          "end_measure": { "type": "integer" },
+          "music_role": { "type": "string" },
+          "piu_role": { "type": "string" },
+          "boundary_confidence": { "type": "number" },
+          "energy_profile": { "type": "string" }
+        },
+        "required": ["section_id", "start_beat", "end_beat", "start_measure", "end_measure", "music_role", "piu_role"]
+      }
+    },
+    "choreographic_intent": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "properties": {
+          "schema_version": { "type": "string", "const": "choreographic-intent.v1" },
+          "section_id": { "type": "string" },
+          "mode": { "type": "string" },
+          "target_level": { "type": "integer" },
+          "measure_start": { "type": "integer" },
+          "measure_end": { "type": "integer" },
+          "density_target": { "type": "string" },
+          "difficulty_budget": { "type": "number" },
+          "recommended_pattern_families": {
+            "type": "array",
+            "items": { "type": "string" }
+          },
+          "avoid_pattern_families": {
+            "type": "array",
+            "items": { "type": "string" }
+          },
+          "accent_plan": {
+            "type": "array",
+            "items": { "type": "object" }
+          },
+          "rest_plan": {
+            "type": "array",
+            "items": { "type": "object" }
+          },
+          "motif_strategy": { "type": "string" },
+          "evidence": {
+            "type": "array",
+            "items": { "type": "string" }
+          },
+          "confidence": { "type": "number" }
+        },
+        "required": [
+          "schema_version",
+          "section_id",
+          "mode",
+          "target_level",
+          "measure_start",
+          "measure_end",
+          "density_target",
+          "difficulty_budget",
+          "recommended_pattern_families",
+          "avoid_pattern_families",
+          "accent_plan",
+          "rest_plan",
+          "motif_strategy",
+          "evidence",
+          "confidence"
+        ]
+      }
+    },
+    "diagnostics": {
+      "type": "object",
+      "properties": {
+        "audio_bpm_detected": { "type": "number" },
+        "ssc_initial_bpm": { "type": "number" },
+        "audio_vs_ssc_tempo_agreement": { "type": "boolean" },
+        "beat_grid_error_ms_mean": { "type": "number" },
+        "timing_confidence": { "type": "number" },
+        "requires_manual_timing_review": { "type": "boolean" },
+        "warnings": {
+          "type": "array",
+          "items": { "type": "string" }
+        },
+        "analysis_mode": { "type": "string", "enum": ["dsp", "fallback"] }
+      },
+      "required": ["audio_bpm_detected", "ssc_initial_bpm", "audio_vs_ssc_tempo_agreement", "timing_confidence", "requires_manual_timing_review", "analysis_mode"]
+    },
+    "publicability": {
+      "type": "object",
+      "properties": {
+        "contains_original_audio": { "type": "boolean", "const": false },
+        "contains_full_chart": { "type": "boolean", "const": false },
+        "exportable": { "type": "boolean", "const": true }
+      },
+      "required": ["contains_original_audio", "contains_full_chart", "exportable"]
+    }
+  },
+  "required": [
+    "schema_version",
+    "song_id",
+    "title",
+    "artist",
+    "duration_seconds",
+    "audio_summary",
+    "timing_grid",
+    "event_features",
+    "sections",
+    "choreographic_intent",
+    "diagnostics",
+    "publicability"
+  ]
+}

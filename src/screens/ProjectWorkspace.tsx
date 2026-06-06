@@ -1,0 +1,1130 @@
+import { useState, useEffect } from "react";
+import { invoke } from "@tauri-apps/api/core";
+import { useSongProjectStore } from "../store/songProjectStore";
+import { useSettingsStore } from "../store/settingsStore";
+import {
+  Music,
+  Compass,
+  CheckCircle,
+  AlertCircle,
+  AlertTriangle,
+  ChevronRight,
+  Layers,
+  Sparkles,
+  FileJson
+} from "lucide-react";
+import { IAppendChartResult, IFileFingerprint } from "../types/song";
+import { SongAnalysisReport, AnalysisCommandResult } from "../types/musicAnalysis";
+
+interface ProjectWorkspaceProps {
+  onNavigate: (screen: string) => void;
+}
+
+export const ProjectWorkspace: React.FC<ProjectWorkspaceProps> = ({ onNavigate }) => {
+  const { currentSong, setCurrentSong, isLoading, setLoading, error, setError } = useSongProjectStore();
+  const { settings } = useSettingsStore();
+
+  const [activeTab, setActiveTab] = useState<"overview" | "metadata" | "assets" | "charts" | "generate" | "analysis">("overview");
+
+  // Generate tab states
+  const [playMode, setPlayMode] = useState<"Single" | "Double">("Single");
+  const [targetLevel, setTargetLevel] = useState(10);
+  const [sectionId, setSectionId] = useState("chorus_1");
+  const [author, setAuthor] = useState("");
+  const [passphrase, setPassphrase] = useState("");
+
+  // Preview result states
+  const [previewResult, setPreviewResult] = useState<IAppendChartResult | null>(null);
+  const [commitMessage, setCommitMessage] = useState<string | null>(null);
+
+  // Fingerprint states
+  const [fingerprintBefore, setFingerprintBefore] = useState<IFileFingerprint | null>(null);
+  const [fingerprintAfter, setFingerprintAfter] = useState<IFileFingerprint | null>(null);
+
+  // Music Analysis states
+  const [analysisReport, setAnalysisReport] = useState<SongAnalysisReport | null>(null);
+  const [reportPath, setReportPath] = useState<string | null>(null);
+  const [writeReportFile, setWriteReportFile] = useState(true);
+  const [analysisLoading, setAnalysisLoading] = useState(false);
+  const [analysisError, setAnalysisError] = useState<string | null>(null);
+  const [backupPath, setBackupPath] = useState<string | null>(null);
+  const [confirmModal, setConfirmModal] = useState<{ message: string; onConfirm: () => void } | null>(null);
+
+  // Sync default generation settings on song load
+  useEffect(() => {
+    if (settings) {
+      setAuthor(settings.default_author || "AI Step Gen");
+      setPlayMode((settings.default_play_mode as "Single" | "Double") || "Single");
+      setTargetLevel(settings.default_meter || 10);
+    }
+  }, [settings, currentSong]);
+
+  if (!currentSong) {
+    return (
+      <div className="workspace-empty-state">
+        <Compass size={48} className="text-slate-icon" />
+        <h2 className="empty-title-waldenburg">No Song Loaded</h2>
+        <p className="empty-desc-gravel">
+          Please load a song from the Import screen or Create Song Wizard.
+        </p>
+        <button className="btn-primary-pill" onClick={() => onNavigate("IMPORT_EDIT_SONG")}>
+          Go to Import
+        </button>
+      </div>
+    );
+  }
+
+  // Difficulty limit logic
+  const isGeminiBlocked = (playMode === "Single" && targetLevel > 26) || (playMode === "Double" && targetLevel > 15);
+
+  const handleGeneratePreview = async () => {
+    if (!passphrase.trim()) {
+      setError("Please enter your unlock passphrase to decrypt the API Key.");
+      return;
+    }
+
+    setLoading(true);
+    setError(null);
+    setPreviewResult(null);
+    setCommitMessage(null);
+    setFingerprintBefore(null);
+    setFingerprintAfter(null);
+
+    try {
+      // 1. Get file fingerprint BEFORE preview
+      let fpBefore: IFileFingerprint | null = null;
+      try {
+        fpBefore = await invoke<IFileFingerprint>("get_file_fingerprint", {
+          path: currentSong.ssc_path,
+        });
+        setFingerprintBefore(fpBefore);
+      } catch (fpErr: any) {
+        console.warn("Failed to get initial fingerprint:", fpErr);
+      }
+
+      // 2. Real Gemini Preview - writeMode is "PreviewOnly"
+      const result = await invoke<IAppendChartResult>("generate_gemini_chart_preview", {
+        sscPath: currentSong.ssc_path,
+        audioPath: currentSong.audio_path || "",
+        passphrase: passphrase.trim(),
+        playMode,
+        targetLevel,
+        sectionId: sectionId.trim() || "chorus_1",
+        author: author.trim() || "Gemini Preview",
+        writeMode: "PreviewOnly",
+      });
+
+      setPreviewResult(result);
+
+      // 3. Get file fingerprint AFTER preview
+      try {
+        const fpAfter = await invoke<IFileFingerprint>("get_file_fingerprint", {
+          path: currentSong.ssc_path,
+        });
+        setFingerprintAfter(fpAfter);
+      } catch (fpErr: any) {
+        console.warn("Failed to get final fingerprint:", fpErr);
+      }
+
+      const hasErrors = result.validation.issues.some((i) => i.severity === "Error");
+      if (hasErrors) {
+        setError("Biomechanical validation errors found. Check the report below.");
+      }
+    } catch (err: any) {
+      console.error(err);
+      setError("Preview Generation failed: " + err.toString());
+    } finally {
+      setPassphrase(""); // Wipe ephemeral passphrase
+      setLoading(false);
+    }
+  };
+
+  const handleCommitChart = () => {
+    if (!previewResult || !previewResult.raw_payload) {
+      setError("No valid preview data found to commit.");
+      return;
+    }
+
+    setConfirmModal({
+      message: "This will write the generated chart directly into the .ssc file on disk. This action is permanent. Do you want to proceed?",
+      onConfirm: async () => {
+        setConfirmModal(null);
+        await executeCommitChart();
+      }
+    });
+  };
+
+  const executeCommitChart = async () => {
+    if (!previewResult || !previewResult.raw_payload) return;
+    setLoading(true);
+    setError(null);
+    setCommitMessage(null);
+    setBackupPath(null);
+
+    try {
+      const result = await invoke<IAppendChartResult>("append_approved_gemini_payload", {
+        sscPath: currentSong.ssc_path,
+        payloadJson: previewResult.raw_payload,
+        author: author.trim() || "Gemini Approved",
+      });
+
+      if (result.written) {
+        setCommitMessage("Chart successfully written to .ssc file on disk!");
+        if (result.backup_path) {
+          setBackupPath(result.backup_path);
+        }
+        setCurrentSong({
+          ...currentSong,
+          charts: result.charts,
+        });
+        setPreviewResult(null); // Clear preview once committed
+        setFingerprintBefore(null);
+        setFingerprintAfter(null);
+      } else {
+        setError("Failed to commit chart: " + result.message);
+      }
+    } catch (err: any) {
+      console.error(err);
+      setError("Error committing chart: " + err.toString());
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  const handleDiscardPreview = () => {
+    setPreviewResult(null);
+    setError(null);
+    setCommitMessage(null);
+    setBackupPath(null);
+    setFingerprintBefore(null);
+    setFingerprintAfter(null);
+  };
+
+  // Developer tools handlers
+  const handleDevAppendLocalStub = () => {
+    setConfirmModal({
+      message: "This will append a basic fixed local chart stub to the active .ssc (does not use API, writes to disk). Proceed?",
+      onConfirm: async () => {
+        setConfirmModal(null);
+        await executeDevAppendLocalStub();
+      }
+    });
+  };
+
+  const executeDevAppendLocalStub = async () => {
+    setLoading(true);
+    setError(null);
+    setCommitMessage(null);
+    setBackupPath(null);
+
+    try {
+      const result = await invoke<IAppendChartResult>("append_ai_chart_stub", {
+        sscPath: currentSong.ssc_path,
+        playMode,
+        targetLevel,
+        author: author.trim() || "Dev Test",
+      });
+
+      if (result.written) {
+        setCommitMessage(`Successfully appended local stub chart! (${result.message})`);
+        if (result.backup_path) {
+          setBackupPath(result.backup_path);
+        }
+        setCurrentSong({
+          ...currentSong,
+          charts: result.charts,
+        });
+      } else {
+        setError("Local stub rejected: " + result.message);
+      }
+    } catch (err: any) {
+      console.error(err);
+      setError("Error appending local stub: " + err.toString());
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  const handleDevTestMockContract = () => {
+    setConfirmModal({
+      message: "This will append a mock structured Gemini payload to the .ssc to test parser boundaries (does not use API, writes to disk). Proceed?",
+      onConfirm: async () => {
+        setConfirmModal(null);
+        await executeDevTestMockContract();
+      }
+    });
+  };
+
+  const executeDevTestMockContract = async () => {
+    setLoading(true);
+    setError(null);
+    setCommitMessage(null);
+    setBackupPath(null);
+
+    try {
+      const mockPayload = {
+        section_id: "chorus_mock",
+        difficulty_level: targetLevel,
+        play_mode: playMode,
+        biomechanical_state: {
+          current_twist_debt: 0.0,
+          current_stamina_debt: 0.2,
+          last_left_foot_lane: playMode === "Single" ? 1 : 1,
+          last_right_foot_lane: playMode === "Single" ? 3 : 8,
+        },
+        measures: [
+          {
+            measure_index: 0,
+            subdivision: 4,
+            rows: playMode === "Single"
+              ? ["10000", "00100", "00001", "00100"]
+              : ["1000000000", "0000010000", "0000000001", "0000010000"],
+          },
+        ],
+      };
+
+      const result = await invoke<IAppendChartResult>("append_mock_gemini_payload", {
+        sscPath: currentSong.ssc_path,
+        payloadJson: JSON.stringify(mockPayload),
+        author: author.trim() || "Mock Contract",
+      });
+
+      if (result.written) {
+        setCommitMessage(`Successfully appended Mock Gemini Contract chart! (${result.message})`);
+        if (result.backup_path) {
+          setBackupPath(result.backup_path);
+        }
+        setCurrentSong({
+          ...currentSong,
+          charts: result.charts,
+        });
+      } else {
+        setError("Mock contract write rejected: " + result.message);
+      }
+    } catch (err: any) {
+      console.error(err);
+      setError("Error appending mock contract: " + err.toString());
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  const handleRunOfflineAnalysis = async () => {
+    if (!currentSong) return;
+    setAnalysisLoading(true);
+    setAnalysisError(null);
+    setAnalysisReport(null);
+    setReportPath(null);
+    try {
+      const result = await invoke<AnalysisCommandResult>("analyze_song_offline", {
+        sscPath: currentSong.ssc_path,
+        audioPath: currentSong.audio_path || "",
+        writeReport: writeReportFile,
+      });
+      setAnalysisReport(result.report);
+      setReportPath(result.report_path);
+    } catch (err: any) {
+      console.error(err);
+      setAnalysisError(err.toString());
+    } finally {
+      setAnalysisLoading(false);
+    }
+  };
+
+  return (
+    <div className="workspace-container">
+      {/* Workspace Sidebar / Navigation */}
+      <aside className="workspace-sidebar">
+        <div className="workspace-song-heading">
+          <Music className="text-obsidian" size={24} />
+          <div>
+            <h2 className="song-title-waldenburg">{currentSong.song_name}</h2>
+            <p className="song-artist-gravel">by {currentSong.artist}</p>
+          </div>
+        </div>
+
+        <nav className="workspace-nav">
+          <button
+            className={`workspace-nav-btn ${activeTab === "overview" ? "active" : ""}`}
+            onClick={() => setActiveTab("overview")}
+          >
+            Overview
+          </button>
+          <button
+            className={`workspace-nav-btn ${activeTab === "metadata" ? "active" : ""}`}
+            onClick={() => setActiveTab("metadata")}
+          >
+            Metadata
+          </button>
+          <button
+            className={`workspace-nav-btn ${activeTab === "assets" ? "active" : ""}`}
+            onClick={() => setActiveTab("assets")}
+          >
+            Assets Check
+          </button>
+          <button
+            className={`workspace-nav-btn ${activeTab === "charts" ? "active" : ""}`}
+            onClick={() => setActiveTab("charts")}
+          >
+            Charts List ({currentSong.charts.length})
+          </button>
+          <button
+            className={`workspace-nav-btn ${activeTab === "generate" ? "active" : ""}`}
+            onClick={() => setActiveTab("generate")}
+          >
+            Generate Chart
+          </button>
+          <button
+            className={`workspace-nav-btn ${activeTab === "analysis" ? "active" : ""}`}
+            onClick={() => setActiveTab("analysis")}
+          >
+            Music Analysis
+          </button>
+        </nav>
+
+        <div className="workspace-sidebar-footer">
+          <button className="btn-ghost-pill btn-sm-contained btn-danger-text" onClick={() => onNavigate("START_MENU")}>
+            Close Project
+          </button>
+        </div>
+      </aside>
+
+      {/* Main Workspace Workspace Tab Content */}
+      <main className="workspace-main-content">
+        {error && (
+          <div className="error-box">
+            <AlertCircle size={16} className="icon-mr text-danger-icon" />
+            <span>{error}</span>
+          </div>
+        )}
+
+        {commitMessage && (
+          <div className="success-box">
+            <CheckCircle size={16} className="icon-mr text-success-icon" />
+            <div className="success-box-content">
+              <span>{commitMessage}</span>
+              {backupPath && (
+                <div className="success-backup-text">
+                  Backup: {backupPath}
+                </div>
+              )}
+            </div>
+          </div>
+        )}
+
+        {/* Tab: Overview */}
+        {activeTab === "overview" && (
+          <div className="workspace-tab">
+            <h3 className="section-title-waldenburg">Song Overview</h3>
+            <p className="section-subtitle-gravel">Quick summary of the active project and assets.</p>
+
+            <div className="stats-grid">
+              <div className="stat-card">
+                <span className="stat-label">BPM</span>
+                <span className="stat-value">{currentSong.bpm}</span>
+              </div>
+              <div className="stat-card">
+                <span className="stat-label">Offset</span>
+                <span className="stat-value">{currentSong.offset}s</span>
+              </div>
+              <div className="stat-card">
+                <span className="stat-label">Existing Charts</span>
+                <span className="stat-value">{currentSong.charts.length}</span>
+              </div>
+            </div>
+
+            <div className="workspace-card">
+              <h4 className="card-subtitle-obsidian">Project File Paths</h4>
+              <div className="path-row">
+                <span className="path-label">SSC File:</span>
+                <code className="monospace-block">{currentSong.ssc_path}</code>
+              </div>
+              {currentSong.audio_path && (
+                <div className="path-row">
+                  <span className="path-label">Audio File:</span>
+                  <code className="monospace-block">{currentSong.audio_path}</code>
+                </div>
+              )}
+            </div>
+          </div>
+        )}
+
+        {/* Tab: Metadata */}
+        {activeTab === "metadata" && (
+          <div className="workspace-tab">
+            <h3 className="section-title-waldenburg">Song Metadata</h3>
+            <p className="section-subtitle-gravel">Technical parameters loaded from the SSC file headers.</p>
+
+            <div className="metadata-table-card">
+              <table className="workspace-table">
+                <thead>
+                  <tr>
+                    <th>Tag Key</th>
+                    <th>Value</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  <tr>
+                    <td><strong>TITLE</strong></td>
+                    <td>{currentSong.song_name}</td>
+                  </tr>
+                  <tr>
+                    <td><strong>ARTIST</strong></td>
+                    <td>{currentSong.artist}</td>
+                  </tr>
+                  <tr>
+                    <td><strong>BPMS</strong></td>
+                    <td>{currentSong.bpm}</td>
+                  </tr>
+                  <tr>
+                    <td><strong>OFFSET</strong></td>
+                    <td>{currentSong.offset}</td>
+                  </tr>
+                  <tr>
+                    <td><strong>SONG ID</strong></td>
+                    <td className="monospace-inline">{currentSong.song_id}</td>
+                  </tr>
+                </tbody>
+              </table>
+            </div>
+          </div>
+        )}
+
+        {/* Tab: Assets Check */}
+        {activeTab === "assets" && (
+          <div className="workspace-tab">
+            <h3 className="section-title-waldenburg">Assets Verification</h3>
+            <p className="section-subtitle-gravel">Simulator asset completeness and folder inspection.</p>
+
+            <div className="assets-status-grid">
+              <div className="asset-status-item">
+                <div className={`status-light ${currentSong.audio_path ? "green" : "red"}`} />
+                <div className="asset-status-meta">
+                  <span className="asset-status-name">Music Audio (.mp3/.ogg)</span>
+                  <span className="asset-status-path">{currentSong.audio_path || "Missing / Not configured"}</span>
+                </div>
+              </div>
+
+              <div className="asset-status-item">
+                <div className={`status-light ${currentSong.banner_path ? "green" : "gray"}`} />
+                <div className="asset-status-meta">
+                  <span className="asset-status-name">Pack Banner (.png)</span>
+                  <span className="asset-status-path">{currentSong.banner_path || "Optional (Missing)"}</span>
+                </div>
+              </div>
+
+              <div className="asset-status-item">
+                <div className={`status-light ${currentSong.background_path ? "green" : "gray"}`} />
+                <div className="asset-status-meta">
+                  <span className="asset-status-name">Background Image (.png)</span>
+                  <span className="asset-status-path">{currentSong.background_path || "Optional (Missing)"}</span>
+                </div>
+              </div>
+
+              <div className="asset-status-item">
+                <div className={`status-light ${currentSong.video_path ? "green" : "gray"}`} />
+                <div className="asset-status-meta">
+                  <span className="asset-status-name">Video Overlay (.mp4/.mpg)</span>
+                  <span className="asset-status-path">{currentSong.video_path || "Optional (Missing)"}</span>
+                </div>
+              </div>
+            </div>
+          </div>
+        )}
+
+        {/* Tab: Charts List */}
+        {activeTab === "charts" && (
+          <div className="workspace-tab">
+            <h3 className="section-title-waldenburg">Registered Charts</h3>
+            <p className="section-subtitle-gravel">List of choreography charts written inside the `.ssc` file.</p>
+
+            <div className="charts-table-container">
+              <table className="workspace-table">
+                <thead>
+                  <tr>
+                    <th>Mode</th>
+                    <th>Difficulty</th>
+                    <th>Level</th>
+                    <th>Stepmaker</th>
+                    <th>Description</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {currentSong.charts.map((chart, idx) => (
+                    <tr key={idx}>
+                      <td>
+                        <span className={`badge-mode-${chart.steps_type.includes("double") ? "double" : "single"}`}>
+                          {chart.steps_type.replace("pump-", "")}
+                        </span>
+                      </td>
+                      <td><strong>{chart.difficulty}</strong></td>
+                      <td><span className="level-badge">{chart.meter}</span></td>
+                      <td>{chart.credit || "—"}</td>
+                      <td className="desc-cell">{chart.description || "—"}</td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
+          </div>
+        )}
+
+        {/* Tab: Generate Chart */}
+        {activeTab === "generate" && (
+          <div className="workspace-tab">
+            <h3 className="section-title-waldenburg">Generate Stepchart Section</h3>
+            <p className="section-subtitle-gravel">
+              Generate choreography patterns using Gemini 3.5 Flash. Real Gemini requests run in memory and never modify disk files without explicit confirmation.
+            </p>
+
+            {/* Inputs Panel */}
+            <div className="generate-form-card">
+              <h4 className="card-subtitle-obsidian">Gemini Real Preview Configuration</h4>
+              <p className="caption-text-gravel">
+                Select target mode and difficulty parameters for real AI generation.
+              </p>
+
+              <div className="generate-grid">
+                <div className="form-group-contained">
+                  <label className="form-label-dark">Play Mode</label>
+                  <select
+                    className="input-contained"
+                    value={playMode}
+                    onChange={(e) => setPlayMode(e.target.value as "Single" | "Double")}
+                    disabled={isLoading}
+                  >
+                    <option value="Single">Single (5-Key)</option>
+                    <option value="Double">Double (10-Key)</option>
+                  </select>
+                </div>
+
+                <div className="form-group-contained">
+                  <label className="form-label-dark">Target Level</label>
+                  <input
+                    type="number"
+                    min="1"
+                    max="28"
+                    className="input-contained"
+                    value={targetLevel}
+                    onChange={(e) => setTargetLevel(parseInt(e.target.value) || 10)}
+                    disabled={isLoading}
+                  />
+                </div>
+
+                <div className="form-group-contained">
+                  <label className="form-label-dark">Section Identifier</label>
+                  <input
+                    type="text"
+                    className="input-contained"
+                    value={sectionId}
+                    onChange={(e) => setSectionId(e.target.value)}
+                    placeholder="e.g. chorus_1"
+                    disabled={isLoading}
+                  />
+                </div>
+
+                <div className="form-group-contained">
+                  <label className="form-label-dark">Stepmaker Credit</label>
+                  <input
+                    type="text"
+                    className="input-contained"
+                    value={author}
+                    onChange={(e) => setAuthor(e.target.value)}
+                    placeholder="e.g. Gemini Preview"
+                    disabled={isLoading}
+                  />
+                </div>
+              </div>
+
+              <div className="form-group-contained">
+                <label className="form-label-dark">Decryption Passphrase</label>
+                <input
+                  type="password"
+                  className="input-contained"
+                  placeholder="Enter passphrase to authorize API key usage"
+                  value={passphrase}
+                  onChange={(e) => setPassphrase(e.target.value)}
+                  disabled={isLoading}
+                />
+              </div>
+
+              {isGeminiBlocked && (
+                <div className="warning-box">
+                  <AlertTriangle size={16} className="icon-mr text-warning-icon" />
+                  <span>
+                    Gemini generation limits: Single up to Lv.26, Double up to Lv.15. Selection is blocked.
+                  </span>
+                </div>
+              )}
+
+              {!currentSong.audio_path && (
+                <div className="warning-box">
+                  <AlertTriangle size={16} className="icon-mr text-warning-icon" />
+                  <span>Audio file is required to analyze music structure.</span>
+                </div>
+              )}
+
+              <div className="action-row-with-sub">
+                <button
+                  className="btn-primary-pill"
+                  onClick={handleGeneratePreview}
+                  disabled={isLoading || isGeminiBlocked || !currentSong.audio_path || !passphrase}
+                >
+                  {isLoading ? "Generating..." : "Generar preview con Gemini (usa API, no escribe)"}
+                </button>
+                <span className="caption-text-gravel">
+                  * Real Gemini (uses network & API key, consumes tokens, <strong>PreviewOnly</strong> mode - does not write to disk).
+                </span>
+              </div>
+            </div>
+
+            {/* Pending Preview Review Area */}
+            {previewResult && (
+              <div className="preview-results-wrapper">
+                <div className="preview-header-meta">
+                  <h4 className="preview-result-title">Revisión de preview pendiente</h4>
+                  <button className="btn-ghost-pill btn-sm-contained btn-danger-text" onClick={handleDiscardPreview}>
+                    Descartar preview
+                  </button>
+                </div>
+
+                {/* Fingerprint Evidence Section */}
+                <div className="fingerprint-section">
+                  <div className="fingerprint-title">
+                    <CheckCircle size={16} className="text-success-icon" />
+                    <span>Evidencia de no escritura en disco (.ssc fingerprint)</span>
+                  </div>
+                  <div className="fingerprint-grid">
+                    <div className="fingerprint-card">
+                      <span className="fingerprint-label">Antes del Preview</span>
+                      {fingerprintBefore ? (
+                        <div>
+                          <div>Size: <span className="fingerprint-val">{fingerprintBefore.file_size} bytes</span></div>
+                          <div>Hash: <span className="fingerprint-val">{fingerprintBefore.sha256.slice(0, 16)}...</span></div>
+                        </div>
+                      ) : (
+                        <span className="caption-text-gravel">Unavailable</span>
+                      )}
+                    </div>
+                    <div className="fingerprint-card">
+                      <span className="fingerprint-label">Después del Preview</span>
+                      {fingerprintAfter ? (
+                        <div>
+                          <div>Size: <span className="fingerprint-val">{fingerprintAfter.file_size} bytes</span></div>
+                          <div>Hash: <span className="fingerprint-val">{fingerprintAfter.sha256.slice(0, 16)}...</span></div>
+                        </div>
+                      ) : (
+                        <span className="caption-text-gravel">Unavailable</span>
+                      )}
+                    </div>
+                  </div>
+
+                  {fingerprintBefore && fingerprintAfter && fingerprintBefore.sha256 === fingerprintAfter.sha256 ? (
+                    <div className="fingerprint-compare-banner fingerprint-match">
+                      ✓ Sin cambios detectados en el archivo .ssc (Escritura prevenida con éxito)
+                    </div>
+                  ) : fingerprintBefore && fingerprintAfter ? (
+                    <div className="fingerprint-compare-banner fingerprint-mismatch">
+                      ⚠ ADVERTENCIA: El archivo .ssc ha cambiado inesperadamente. Aprobación bloqueada.
+                    </div>
+                  ) : null}
+                </div>
+
+                {/* Validation Report */}
+                <div className={`validation-report-panel ${previewResult.validation.issues.some(i => i.severity === "Error")
+                    ? "has-errors"
+                    : previewResult.validation.issues.length > 0
+                      ? "has-warnings"
+                      : "clean"
+                  }`}>
+                  <div className="validation-report-header">
+                    <span className="validation-report-summary">
+                      Biomechanical Report ({previewResult.validation.play_mode} Lv.{previewResult.validation.difficulty_level})
+                    </span>
+                    <span className="validation-count-badge">
+                      {previewResult.validation.issues.length === 0
+                        ? "Clean (0 Issues)"
+                        : `${previewResult.validation.issues.filter(i => i.severity === "Error").length} errors, ${previewResult.validation.issues.filter(i => i.severity === "Warning").length} warnings`}
+                    </span>
+                  </div>
+
+                  {previewResult.validation.issues.length > 0 ? (
+                    <div className="validation-issues-list">
+                      {previewResult.validation.issues.map((issue, index) => (
+                        <div key={index} className={`issue-row-item ${issue.severity.toLowerCase()}`}>
+                          <span className="issue-meta">
+                            Measure {issue.measure_index + 1}, Row {issue.row_index + 1}
+                          </span>
+                          <span className="issue-message">
+                            [{issue.issue_type}] {issue.message}
+                          </span>
+                        </div>
+                      ))}
+                    </div>
+                  ) : (
+                    <p className="clean-validation-text">
+                      ✓ Zero biomechanical or structure issues detected for this section.
+                    </p>
+                  )}
+                </div>
+
+                {/* Collapsible Inspectors */}
+                <div className="collapsible-inspectors-stack">
+                  <details className="inspector-accordion">
+                    <summary className="inspector-summary">
+                      <ChevronRight size={14} className="icon-mr accordion-icon" />
+                      Inspect Raw Gemini Payload (JSON)
+                    </summary>
+                    <pre className="monospace-block">
+                      <code>{previewResult.raw_payload}</code>
+                    </pre>
+                  </details>
+
+                  <details className="inspector-accordion">
+                    <summary className="inspector-summary">
+                      <ChevronRight size={14} className="icon-mr accordion-icon" />
+                      Inspect Generated SSC Notes
+                    </summary>
+                    <pre className="monospace-block">
+                      <code>{previewResult.generated_notes}</code>
+                    </pre>
+                  </details>
+                </div>
+
+                {/* Committing Actions */}
+                <div className="commit-action-box">
+                  <div className="commit-meta-text">
+                    <h5 className="commit-box-title">Apply Generated Chart</h5>
+                    {previewResult.validation.issues.some(i => i.severity === "Error") ? (
+                      <p className="caption-text-gravel text-missing">
+                        * Committing blocked: Resolve severe biomechanical errors first.
+                      </p>
+                    ) : fingerprintBefore && fingerprintAfter && fingerprintBefore.sha256 !== fingerprintAfter.sha256 ? (
+                      <p className="caption-text-gravel text-missing">
+                        * Committing blocked: SSC fingerprint mismatch.
+                      </p>
+                    ) : (
+                      <p className="caption-text-gravel">
+                        If the preview checks out, commit it to disk. This is a local action, does not query the API, and does not consume tokens.
+                      </p>
+                    )}
+                  </div>
+
+                  <button
+                    className="btn-primary-pill btn-success-glow"
+                    onClick={handleCommitChart}
+                    disabled={
+                      previewResult.validation.issues.some(i => i.severity === "Error") ||
+                      (fingerprintBefore && fingerprintAfter && fingerprintBefore.sha256 !== fingerprintAfter.sha256) ||
+                      isLoading
+                    }
+                  >
+                    Añadir preview aprobado al SSC (escribe en disco)
+                  </button>
+                </div>
+              </div>
+            )}
+
+            {/* Collapsible Developer Tools */}
+            <details className="dev-tools-collapsible">
+              <summary className="dev-tools-summary">
+                <ChevronRight size={14} className="accordion-icon" />
+                Developer Tools
+              </summary>
+              <div className="dev-tools-content">
+                <h4 className="dev-tools-title">Offline Test Generators</h4>
+                <p className="caption-text-gravel">
+                  Offline mock operations for parser testing. These write directly to the SSC file and bypass the Gemini API.
+                </p>
+
+                <div className="dev-buttons-row">
+                  <button
+                    className="btn-primary-pill"
+                    onClick={handleDevAppendLocalStub}
+                    disabled={isLoading}
+                  >
+                    Dev: añadir chart local fijo (no usa API, escribe)
+                  </button>
+                  <button
+                    className="btn-ghost-pill"
+                    onClick={handleDevTestMockContract}
+                    disabled={isLoading}
+                  >
+                    Dev: probar contrato mock (no usa API, escribe)
+                  </button>
+                </div>
+                <span className="caption-text-gravel">
+                  * Warning: Both developer buttons <strong>write directly to disk</strong> (modifies the active .ssc) and bypass network API calls.
+                </span>
+              </div>
+            </details>
+          </div>
+        )}
+
+        {/* Tab: Music Analysis */}
+        {activeTab === "analysis" && (
+          <div className="workspace-tab">
+            <h3 className="section-title-waldenburg">Music Analysis</h3>
+            <p className="section-subtitle-gravel">Audio beat grid structure and phrase mapping.</p>
+
+            <div className="generate-form-card">
+              <div className="analysis-checkbox-container">
+                <input
+                  type="checkbox"
+                  id="writeReportFile"
+                  checked={writeReportFile}
+                  onChange={(e) => setWriteReportFile(e.target.checked)}
+                  disabled={analysisLoading}
+                  className="analysis-checkbox"
+                />
+                <label htmlFor="writeReportFile" className="analysis-checkbox-label">
+                  Write derived report JSON (.ai-step-gen-analysis/song-analysis-report.v1.json)
+                </label>
+              </div>
+
+              {analysisError && (
+                <div className="analysis-error-box">
+                  <AlertCircle size={16} className="icon-mr text-danger-icon" />
+                  <span>{analysisError}</span>
+                </div>
+              )}
+
+              <div className="action-row-with-sub">
+                <button
+                  className="btn-primary-pill"
+                  onClick={handleRunOfflineAnalysis}
+                  disabled={analysisLoading || !currentSong.audio_path}
+                >
+                  {analysisLoading ? "Running Analysis..." : "Run Offline Analysis"}
+                </button>
+                <span className="caption-text-gravel">
+                  * Runs offline DSP analysis. Does not call Gemini or write/modify .ssc files.
+                </span>
+              </div>
+            </div>
+
+            {analysisReport && (
+              <div className="preview-results-wrapper">
+                <div className="preview-header-meta">
+                  <h4 className="preview-result-title">Analysis Summary</h4>
+                  <div>
+                    {analysisReport.audio_summary.analysis_mode === "dsp" ? (
+                      <span className="badge-mode-single analysis-mode-badge">DSP Mode Active</span>
+                    ) : (
+                      <span className="badge-mode-double analysis-mode-badge">Fallback Mode (Metadata-Only)</span>
+                    )}
+                  </div>
+                </div>
+
+                {analysisReport.audio_summary.analysis_mode === "fallback" && (
+                  <div className="warning-box">
+                    <AlertTriangle size={16} className="icon-mr text-warning-icon warning-box-icon" />
+                    <span>
+                      <strong>Fallback Mode Active:</strong> Audio DSP features could not be calculated. The analysis is generated from the .ssc metadata only. Onset strength, energy metrics, and choreographic plans are estimated or zeroed.
+                    </span>
+                  </div>
+                )}
+
+                {reportPath && (
+                  <div className="analysis-success-box">
+                    <CheckCircle size={16} className="icon-mr text-success-icon" />
+                    <div className="success-box-content">
+                      <span>Report saved successfully!</span>
+                      <div className="analysis-report-path">
+                        {reportPath}
+                      </div>
+                    </div>
+                  </div>
+                )}
+
+                <div className="analysis-stats-grid">
+                  <div className="analysis-stat-card">
+                    <span className="analysis-stat-label">Duration</span>
+                    <span className="analysis-stat-value">{analysisReport.duration_seconds}s</span>
+                  </div>
+                  <div className="analysis-stat-card">
+                    <span className="analysis-stat-label">Analysis Mode</span>
+                    <span className={`analysis-stat-value ${analysisReport.audio_summary.analysis_mode === "fallback" ? "analysis-review-required" : ""}`}>
+                      {analysisReport.audio_summary.analysis_mode === "dsp" ? "DSP" : "Fallback"}
+                    </span>
+                  </div>
+                  <div className="analysis-stat-card">
+                    <span className="analysis-stat-label">SSC BPM</span>
+                    <span className="analysis-stat-value">{analysisReport.diagnostics.ssc_initial_bpm}</span>
+                  </div>
+                  <div className="analysis-stat-card">
+                    <span className="analysis-stat-label">Detected BPM</span>
+                    <span className="analysis-stat-value">{analysisReport.diagnostics.audio_bpm_detected}</span>
+                  </div>
+                  <div className="analysis-stat-card">
+                    <span className="analysis-stat-label">Confidence</span>
+                    <span className="analysis-stat-value">{(analysisReport.diagnostics.timing_confidence * 100).toFixed(0)}%</span>
+                  </div>
+                  <div className="analysis-stat-card">
+                    <span className="analysis-stat-label">Sections</span>
+                    <span className="analysis-stat-value">{analysisReport.sections.length}</span>
+                  </div>
+                  <div className="analysis-stat-card">
+                    <span className="analysis-stat-label">Manual Review</span>
+                    <span className={`analysis-stat-value ${analysisReport.diagnostics.requires_manual_timing_review ? 'analysis-review-required' : ''}`}>
+                      {analysisReport.diagnostics.requires_manual_timing_review ? "Yes" : "No"}
+                    </span>
+                  </div>
+                </div>
+
+                {analysisReport.diagnostics.warnings && analysisReport.diagnostics.warnings.length > 0 && (
+                  <div className="analysis-warnings-box">
+                    <AlertTriangle size={16} className="icon-mr text-warning-icon" />
+                    <div className="analysis-warnings-text">
+                      <strong>Timing Warnings:</strong>
+                      <ul>
+                        {analysisReport.diagnostics.warnings.map((warn: string, idx: number) => (
+                          <li key={idx}>{warn}</li>
+                        ))}
+                      </ul>
+                    </div>
+                  </div>
+                )}
+
+                {/* Sections Table */}
+                <div className="workspace-card">
+                  <h4 className="analysis-card-title">
+                    <Layers size={18} /> Sections segmentation ({analysisReport.sections.length})
+                  </h4>
+                  <div className="analysis-table-container">
+                    <table className="analysis-table">
+                      <thead>
+                        <tr>
+                          <th>Section</th>
+                          <th>Beats</th>
+                          <th>Measures</th>
+                          <th>Music Role</th>
+                          <th>PIU Role</th>
+                          <th>Energy Profile</th>
+                        </tr>
+                      </thead>
+                      <tbody>
+                        {analysisReport.sections.map((section: any, idx: number) => (
+                          <tr key={idx}>
+                            <td><strong>{section.section_id}</strong></td>
+                            <td>{section.start_beat.toFixed(1)} – {section.end_beat.toFixed(1)}</td>
+                            <td>M.{section.start_measure} – M.{section.end_measure}</td>
+                            <td>
+                              <span className="analysis-badge-music-role">
+                                {section.music_role}
+                              </span>
+                            </td>
+                            <td>
+                              <span className="badge-mode-double analysis-badge-piu-role">
+                                {section.piu_role.replace('_', ' ')}
+                              </span>
+                            </td>
+                            <td>
+                              <code className="analysis-energy-profile-code">{section.energy_profile}</code>
+                            </td>
+                          </tr>
+                        ))}
+                      </tbody>
+                    </table>
+                  </div>
+                </div>
+
+                {/* Choreographic Intent Map / Opportunities */}
+                <div className="workspace-card">
+                  <h4 className="analysis-card-title">
+                    <Sparkles size={18} /> Choreographic intent & opportunities
+                  </h4>
+                  <div className="validation-issues-list">
+                    {analysisReport.choreographic_intent.map((intent: any, idx: number) => (
+                      <div key={idx} className="analysis-intent-item">
+                        <div className="analysis-intent-header">
+                          <span className="analysis-intent-title">
+                            {intent.section_id} (M.{intent.measure_start} – M.{intent.measure_end})
+                          </span>
+                          <div className="analysis-intent-badges">
+                            <span className="level-badge">
+                              {intent.density_target}
+                            </span>
+                            <span className="level-badge analysis-budget-badge">
+                              {intent.difficulty_budget}
+                            </span>
+                          </div>
+                        </div>
+                        
+                        <div className="analysis-intent-evidence">
+                          <strong>Evidence:</strong> {intent.evidence.join(", ")}
+                        </div>
+
+                        <div className="analysis-intent-patterns">
+                          <span className="analysis-patterns-label">Recommend:</span>
+                          {intent.recommended_pattern_families.map((fam: string, fIdx: number) => (
+                            <span key={fIdx} className="analysis-badge-recommend">
+                              {fam.replace('_', ' ')}
+                            </span>
+                          ))}
+                        </div>
+
+                        {intent.avoid_pattern_families && intent.avoid_pattern_families.length > 0 && (
+                          <div className="analysis-intent-patterns">
+                            <span className="analysis-patterns-label">Avoid:</span>
+                            {intent.avoid_pattern_families.map((fam: string, fIdx: number) => (
+                              <span key={fIdx} className="analysis-badge-avoid">
+                                {fam.replace('_', ' ')}
+                              </span>
+                            ))}
+                          </div>
+                        )}
+
+                        {intent.accent_plan && intent.accent_plan.length > 0 && (
+                          <div className="analysis-accent-plan-text">
+                            <strong>Accents Plan:</strong> {intent.accent_plan.length} beats marked for accents (e.g. beats {intent.accent_plan.slice(0, 5).map((a: any) => a.beat.toFixed(1)).join(", ")}
+                            {intent.accent_plan.length > 5 ? "..." : ""})
+                          </div>
+                        )}
+                      </div>
+                    ))}
+                  </div>
+                </div>
+
+                {/* Raw JSON Accordion */}
+                <details className="inspector-accordion">
+                  <summary className="analysis-accordion-summary">
+                    <ChevronRight size={14} className="icon-mr accordion-icon" />
+                    <FileJson size={16} className="icon-mr" />
+                    Inspect Raw Analysis Report JSON
+                  </summary>
+                  <pre className="analysis-accordion-pre">
+                    <code>{JSON.stringify(analysisReport, null, 2)}</code>
+                  </pre>
+                </details>
+              </div>
+            )}
+          </div>
+        )}
+      </main>
+
+      {confirmModal && (
+        <div className="custom-modal-overlay">
+          <div className="custom-modal-card">
+            <h4 className="custom-modal-title">Confirm Action</h4>
+            <p className="custom-modal-message">{confirmModal.message}</p>
+            <div className="custom-modal-actions">
+              <button
+                className="btn-ghost-pill btn-sm-contained"
+                onClick={() => setConfirmModal(null)}
+              >
+                Cancel
+              </button>
+              <button
+                className="btn-primary-pill btn-sm-contained btn-danger-text"
+                onClick={confirmModal.onConfirm}
+              >
+                Confirm
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+    </div>
+  );
+};

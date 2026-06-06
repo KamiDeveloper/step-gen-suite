@@ -1,0 +1,1748 @@
+use crate::biomechanics::{
+    validate_chart, GeminiChartSectionPayload, PlayMode, ValidatedChartSection, ValidationIssue,
+    ValidationIssueType, ValidationSeverity,
+};
+use crate::gemini::{GeminiClient, GeminiWriteMode};
+use crate::ssc::parser::{SscChart, SscDocument, SscTag};
+use serde::{Deserialize, Serialize};
+use std::fs;
+use std::io::Write;
+use std::path::{Path, PathBuf};
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct ChartDetails {
+    pub steps_type: String,
+    pub difficulty: String,
+    pub meter: u32,
+    pub description: String,
+    pub credit: String,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct SongDetails {
+    pub song_id: String,
+    pub song_name: String,
+    pub artist: String,
+    pub bpm: f64,
+    pub offset: f64,
+    pub ssc_path: String,
+    pub audio_path: Option<String>,
+    pub banner_path: Option<String>,
+    pub background_path: Option<String>,
+    pub video_path: Option<String>,
+    pub charts: Vec<ChartDetails>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct AppendChartResult {
+    pub charts: Vec<ChartDetails>,
+    pub validation: ValidatedChartSection,
+    pub written: bool,
+    pub message: String,
+    pub generated_notes: Option<String>,
+    pub raw_payload: Option<String>,
+    pub backup_path: Option<String>,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq)]
+pub struct FileFingerprint {
+    pub file_size: u64,
+    pub sha256: String,
+    pub modified_time: u64,
+}
+
+#[tauri::command]
+pub fn get_file_fingerprint(path: String) -> Result<FileFingerprint, String> {
+    let file_path = Path::new(&path);
+    if !file_path.exists() || !file_path.is_file() {
+        return Err(format!(
+            "El archivo especificado no existe o no es un archivo válido: {}",
+            path
+        ));
+    }
+
+    let metadata = fs::metadata(file_path)
+        .map_err(|e| format!("Error al leer los metadatos del archivo: {}", e))?;
+    let file_size = metadata.len();
+
+    let modified_time = metadata
+        .modified()
+        .map_err(|e| format!("Error al obtener la fecha de modificación: {}", e))?
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+
+    let mut file = fs::File::open(file_path)
+        .map_err(|e| format!("Error al abrir el archivo para calcular el hash: {}", e))?;
+
+    use sha2::{Digest, Sha256};
+    use std::io::Read;
+    let mut hasher = Sha256::new();
+    let mut buffer = [0; 8192];
+    loop {
+        let count = file
+            .read(&mut buffer)
+            .map_err(|e| format!("Error al leer el archivo para calcular el hash: {}", e))?;
+        if count == 0 {
+            break;
+        }
+        hasher.update(&buffer[..count]);
+    }
+    let sha256 = format!("{:x}", hasher.finalize());
+
+    Ok(FileFingerprint {
+        file_size,
+        sha256,
+        modified_time,
+    })
+}
+
+fn create_ssc_backup(ssc_path: &Path) -> Result<Option<String>, String> {
+    if !ssc_path.exists() {
+        return Ok(None);
+    }
+    let parent_dir = ssc_path
+        .parent()
+        .ok_or_else(|| "Failed to get parent directory of SSC path".to_string())?;
+
+    // Create the backup directory inside the song's folder
+    let backup_dir = parent_dir.join(".ai-step-gen-backups");
+    fs::create_dir_all(&backup_dir)
+        .map_err(|e| format!("Failed to create backup directory: {}", e))?;
+
+    // Get the file stem (name without extension)
+    let stem = ssc_path
+        .file_stem()
+        .ok_or_else(|| "Failed to get file stem of SSC path".to_string())?
+        .to_string_lossy();
+
+    // Get current Unix timestamp
+    let timestamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+
+    // Initial backup file name: {stem}.{timestamp}.bak.ssc
+    let mut backup_file_name = format!("{}.{}.bak.ssc", stem, timestamp);
+    let mut backup_path = backup_dir.join(&backup_file_name);
+
+    // Prevent overwriting existing backups
+    let mut counter = 1;
+    while backup_path.exists() {
+        backup_file_name = format!("{}.{}_{}.bak.ssc", stem, timestamp, counter);
+        backup_path = backup_dir.join(&backup_file_name);
+        counter += 1;
+    }
+
+    // Copy original file content to the backup path
+    fs::copy(ssc_path, &backup_path).map_err(|e| format!("Failed to copy backup file: {}", e))?;
+
+    Ok(Some(backup_path.to_string_lossy().to_string()))
+}
+
+/// Helper atómico interno para validar y escribir un chart en un archivo .ssc.
+/// Este helper evita la duplicación de código en los comandos de Tauri.
+pub fn append_chart_to_ssc_atomic(
+    ssc_path: &Path,
+    play_mode: PlayMode,
+    target_level: u32,
+    notes_raw: &str,
+    description: String,
+    author: String,
+) -> Result<AppendChartResult, String> {
+    // 1. Biomechanical validation
+    let validation_result = validate_chart(play_mode, target_level, notes_raw);
+    let has_errors = validation_result
+        .issues
+        .iter()
+        .any(|i| i.severity == ValidationSeverity::Error);
+
+    if has_errors {
+        let current_charts = list_charts(ssc_path.to_string_lossy().to_string())?;
+        return Ok(AppendChartResult {
+            charts: current_charts,
+            validation: validation_result,
+            written: false,
+            message: "Se abortó la escritura en disco debido a errores de validación biomecánica."
+                .to_string(),
+            generated_notes: None,
+            raw_payload: None,
+            backup_path: None,
+        });
+    }
+
+    // 2. Parse existing ssc
+    let mut doc = SscDocument::parse(ssc_path)
+        .map_err(|e| format!("Error al parsear el archivo .ssc: {}", e))?;
+
+    let steps_type = match play_mode {
+        PlayMode::Single => "pump-single",
+        PlayMode::Double => "pump-double",
+    };
+
+    // 3. Create chart tags
+    let tags = vec![
+        SscTag {
+            key: Some("NOTEDATA".to_string()),
+            value: "".to_string(),
+            is_comment: false,
+        },
+        SscTag {
+            key: Some("STEPSTYPE".to_string()),
+            value: steps_type.to_string(),
+            is_comment: false,
+        },
+        SscTag {
+            key: Some("DESCRIPTION".to_string()),
+            value: description,
+            is_comment: false,
+        },
+        SscTag {
+            key: Some("DIFFICULTY".to_string()),
+            value: "Edit".to_string(),
+            is_comment: false,
+        },
+        SscTag {
+            key: Some("METER".to_string()),
+            value: target_level.to_string(),
+            is_comment: false,
+        },
+        SscTag {
+            key: Some("CREDIT".to_string()),
+            value: author,
+            is_comment: false,
+        },
+        SscTag {
+            key: Some("NOTES".to_string()),
+            value: "".to_string(),
+            is_comment: false,
+        },
+    ];
+
+    let new_chart = SscChart {
+        tags,
+        notes_raw: notes_raw.to_string(),
+    };
+
+    doc.charts.push(new_chart);
+
+    // Create backup before writing
+    let backup_path = match create_ssc_backup(ssc_path) {
+        Ok(path) => path,
+        Err(e) => return Err(format!("Failed to create backup: {}", e)),
+    };
+
+    // 4. Atomic write
+    let dir = ssc_path
+        .parent()
+        .ok_or("No se pudo obtener el directorio padre del archivo SSC.")?;
+    let file_name = ssc_path
+        .file_name()
+        .ok_or("No se pudo obtener el nombre del archivo SSC.")?;
+    let temp_file_name = format!("{}.tmp", file_name.to_string_lossy());
+    let temp_path = dir.join(temp_file_name);
+
+    let serialized_doc = doc.serialize_to_string();
+
+    {
+        let mut temp_file = fs::File::create(&temp_path)
+            .map_err(|e| format!("Error al crear el archivo temporal: {}", e))?;
+        temp_file
+            .write_all(serialized_doc.as_bytes())
+            .map_err(|e| format!("Error al escribir en el archivo temporal: {}", e))?;
+        temp_file
+            .sync_all()
+            .map_err(|e| format!("Error al sincronizar el archivo temporal: {}", e))?;
+    }
+
+    fs::rename(&temp_path, ssc_path)
+        .map_err(|e| format!("Error al reemplazar el archivo SSC original: {}", e))?;
+
+    let updated_charts = list_charts(ssc_path.to_string_lossy().to_string())?;
+
+    Ok(AppendChartResult {
+        charts: updated_charts,
+        validation: validation_result,
+        written: true,
+        message: "Chart añadido y guardado con éxito.".to_string(),
+        generated_notes: None,
+        raw_payload: None,
+        backup_path,
+    })
+}
+
+#[tauri::command]
+pub fn import_song_folder(folder_path: String) -> Result<SongDetails, String> {
+    let folder = Path::new(&folder_path);
+    if !folder.exists() || !folder.is_dir() {
+        return Err(format!(
+            "Folder path does not exist or is not a directory: {}",
+            folder_path
+        ));
+    }
+
+    // Find the first .ssc file
+    let mut ssc_file_path: Option<PathBuf> = None;
+    if let Ok(entries) = fs::read_dir(folder) {
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_file()
+                && path
+                    .extension()
+                    .map_or(false, |ext| ext.eq_ignore_ascii_case("ssc"))
+            {
+                ssc_file_path = Some(path);
+                break;
+            }
+        }
+    }
+
+    let ssc_path = match ssc_file_path {
+        Some(path) => path,
+        None => return Err(format!("No .ssc file found in folder: {}", folder_path)),
+    };
+
+    // Parse the .ssc file
+    let doc =
+        SscDocument::parse(&ssc_path).map_err(|e| format!("Failed to parse .ssc file: {}", e))?;
+
+    // Extract global metadata
+    let mut song_name = String::new();
+    let mut artist = String::new();
+    let mut bpm = 120.0;
+    let mut offset = 0.0;
+    let mut music_file = None;
+    let mut banner_file = None;
+    let mut bg_file = None;
+    let mut video_file = None;
+
+    for tag in &doc.global_tags {
+        if let Some(key) = &tag.key {
+            match key.as_str() {
+                "TITLE" => song_name = tag.value.clone(),
+                "ARTIST" => artist = tag.value.clone(),
+                "MUSIC" => music_file = Some(tag.value.clone()),
+                "BANNER" => banner_file = Some(tag.value.clone()),
+                "BACKGROUND" => bg_file = Some(tag.value.clone()),
+                "PREVIEWVID" => video_file = Some(tag.value.clone()),
+                "OFFSET" => {
+                    if let Ok(val) = tag.value.parse::<f64>() {
+                        offset = val;
+                    }
+                }
+                "BPMS" => {
+                    if let Some(first_bpm_part) = tag.value.split(',').next() {
+                        if let Some(val_str) = first_bpm_part.split('=').nth(1) {
+                            if let Ok(val) = val_str.parse::<f64>() {
+                                bpm = val;
+                            }
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+
+    // Resolve file paths
+    let audio_path = music_file.and_then(|f| {
+        let p = folder.join(&f);
+        if p.exists() {
+            Some(p.to_string_lossy().to_string())
+        } else {
+            None
+        }
+    });
+    let banner_path = banner_file.and_then(|f| {
+        let p = folder.join(&f);
+        if p.exists() {
+            Some(p.to_string_lossy().to_string())
+        } else {
+            None
+        }
+    });
+    let background_path = bg_file.and_then(|f| {
+        let p = folder.join(&f);
+        if p.exists() {
+            Some(p.to_string_lossy().to_string())
+        } else {
+            None
+        }
+    });
+    let video_path = video_file.and_then(|f| {
+        let p = folder.join(&f);
+        if p.exists() {
+            Some(p.to_string_lossy().to_string())
+        } else {
+            None
+        }
+    });
+
+    // Extract charts
+    let charts = doc
+        .charts
+        .iter()
+        .map(|chart| {
+            let mut steps_type = String::new();
+            let mut difficulty = String::new();
+            let mut meter = 0;
+            let mut description = String::new();
+            let mut credit = String::new();
+
+            for tag in &chart.tags {
+                if let Some(key) = &tag.key {
+                    match key.as_str() {
+                        "STEPSTYPE" => steps_type = tag.value.clone(),
+                        "DIFFICULTY" => difficulty = tag.value.clone(),
+                        "DESCRIPTION" => description = tag.value.clone(),
+                        "CREDIT" => credit = tag.value.clone(),
+                        "METER" => {
+                            if let Ok(val) = tag.value.parse::<u32>() {
+                                meter = val;
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+            }
+
+            ChartDetails {
+                steps_type,
+                difficulty,
+                meter,
+                description,
+                credit,
+            }
+        })
+        .collect();
+
+    use std::collections::hash_map::DefaultHasher;
+    use std::hash::{Hash, Hasher};
+    let mut hasher = DefaultHasher::new();
+    song_name.hash(&mut hasher);
+    let song_id = format!("{:016x}", hasher.finish());
+
+    Ok(SongDetails {
+        song_id,
+        song_name,
+        artist,
+        bpm,
+        offset,
+        ssc_path: ssc_path.to_string_lossy().to_string(),
+        audio_path,
+        banner_path,
+        background_path,
+        video_path,
+        charts,
+    })
+}
+
+#[tauri::command]
+pub fn list_charts(ssc_path: String) -> Result<Vec<ChartDetails>, String> {
+    let path = Path::new(&ssc_path);
+    if !path.exists() || !path.is_file() {
+        return Err(format!(
+            "SSC file path does not exist or is not a file: {}",
+            ssc_path
+        ));
+    }
+
+    let doc = SscDocument::parse(path).map_err(|e| format!("Failed to parse .ssc file: {}", e))?;
+
+    let charts = doc
+        .charts
+        .iter()
+        .map(|chart| {
+            let mut steps_type = String::new();
+            let mut difficulty = String::new();
+            let mut meter = 0;
+            let mut description = String::new();
+            let mut credit = String::new();
+
+            for tag in &chart.tags {
+                if let Some(key) = &tag.key {
+                    match key.as_str() {
+                        "STEPSTYPE" => steps_type = tag.value.clone(),
+                        "DIFFICULTY" => difficulty = tag.value.clone(),
+                        "DESCRIPTION" => description = tag.value.clone(),
+                        "CREDIT" => credit = tag.value.clone(),
+                        "METER" => {
+                            if let Ok(val) = tag.value.parse::<u32>() {
+                                meter = val;
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+            }
+
+            ChartDetails {
+                steps_type,
+                difficulty,
+                meter,
+                description,
+                credit,
+            }
+        })
+        .collect();
+
+    Ok(charts)
+}
+
+#[tauri::command]
+pub fn validate_chart_notes(
+    play_mode: PlayMode,
+    difficulty_level: u32,
+    notes_raw: String,
+) -> ValidatedChartSection {
+    validate_chart(play_mode, difficulty_level, &notes_raw)
+}
+
+#[tauri::command]
+pub fn append_ai_chart_stub(
+    ssc_path: String,
+    play_mode: String,
+    target_level: u32,
+    author: String,
+) -> Result<AppendChartResult, String> {
+    let env_mode = crate::settings::get_app_env();
+    if env_mode != "dev" {
+        return Err(
+            "This command is only available in development mode (AI_STEP_GEN_ENV=dev).".to_string(),
+        );
+    }
+
+    let path = Path::new(&ssc_path);
+    if !path.exists() || !path.is_file() {
+        return Err(format!(
+            "SSC file path does not exist or is not a file: {}",
+            ssc_path
+        ));
+    }
+
+    let mode = match play_mode.as_str() {
+        "Single" => PlayMode::Single,
+        "Double" => PlayMode::Double,
+        _ => return Err(format!("Unsupported play mode: {}", play_mode)),
+    };
+
+    let notes_raw = match mode {
+        PlayMode::Single => concat!(
+            "00000\n00000\n00000\n00000\n",
+            ",\n",
+            "10000\n00100\n00001\n00100\n",
+            ",\n",
+            "01000\n00100\n00010\n00100\n",
+            ",\n",
+            "00000\n00000\n00000\n00000\n",
+            ";"
+        )
+        .to_string(),
+        PlayMode::Double => concat!(
+            "0000000000\n0000000000\n0000000000\n0000000000\n",
+            ",\n",
+            "1000000000\n0010000000\n0000100000\n0000000100\n",
+            ",\n",
+            "0000000001\n0000000100\n0000010000\n0000000100\n",
+            ",\n",
+            "0000000000\n0000000000\n0000000000\n0000000000\n",
+            ";"
+        )
+        .to_string(),
+    };
+
+    let description = format!(
+        "Local Test {}",
+        match mode {
+            PlayMode::Single => format!("S{}", target_level),
+            PlayMode::Double => format!("D{}", target_level),
+        }
+    );
+
+    append_chart_to_ssc_atomic(path, mode, target_level, &notes_raw, description, author)
+}
+
+#[tauri::command]
+pub fn append_mock_gemini_payload(
+    ssc_path: String,
+    payload_json: String,
+    author: String,
+) -> Result<AppendChartResult, String> {
+    let env_mode = crate::settings::get_app_env();
+    if env_mode != "dev" {
+        return Err(
+            "This command is only available in development mode (AI_STEP_GEN_ENV=dev).".to_string(),
+        );
+    }
+
+    let path = Path::new(&ssc_path);
+    if !path.exists() || !path.is_file() {
+        return Err(format!(
+            "SSC file path does not exist or is not a file: {}",
+            ssc_path
+        ));
+    }
+
+    // 1. Parse payload JSON
+    let payload: GeminiChartSectionPayload = serde_json::from_str(&payload_json)
+        .map_err(|e| format!("Error parsing payload JSON: {}", e))?;
+
+    // 2. Structural validation
+    match payload.validate_structure() {
+        Ok(()) => {
+            // Convert to SSC notes
+            let notes_raw = payload.to_ssc_notes();
+
+            let description = format!(
+                "AI Mock {} {}",
+                payload.section_id,
+                match payload.play_mode {
+                    PlayMode::Single => format!("S{}", payload.difficulty_level),
+                    PlayMode::Double => format!("D{}", payload.difficulty_level),
+                }
+            );
+
+            append_chart_to_ssc_atomic(
+                path,
+                payload.play_mode,
+                payload.difficulty_level,
+                &notes_raw,
+                description,
+                author,
+            )
+        }
+        Err(err_msg) => {
+            // Build the ValidatedChartSection for the structural error
+            let validation_result = ValidatedChartSection {
+                play_mode: payload.play_mode,
+                difficulty_level: payload.difficulty_level,
+                issues: vec![ValidationIssue {
+                    measure_index: 0,
+                    row_index: 0,
+                    severity: ValidationSeverity::Error,
+                    issue_type: ValidationIssueType::InvalidGeminiStructure,
+                    message: err_msg,
+                }],
+            };
+
+            let current_charts = list_charts(ssc_path)?;
+            Ok(AppendChartResult {
+                charts: current_charts,
+                validation: validation_result,
+                written: false,
+                message: "Aborted: Gemini payload failed structural validation.".to_string(),
+                generated_notes: None,
+                raw_payload: None,
+                backup_path: None,
+            })
+        }
+    }
+}
+
+#[tauri::command]
+pub fn append_approved_gemini_payload(
+    ssc_path: String,
+    payload_json: String,
+    author: String,
+) -> Result<AppendChartResult, String> {
+    let path = Path::new(&ssc_path);
+    if !path.exists() || !path.is_file() {
+        return Err(format!(
+            "SSC file path does not exist or is not a file: {}",
+            ssc_path
+        ));
+    }
+
+    // 1. Parse payload JSON
+    let payload: GeminiChartSectionPayload = serde_json::from_str(&payload_json)
+        .map_err(|e| format!("Error parsing approved payload JSON: {}", e))?;
+
+    // 2. Structural validation
+    payload
+        .validate_structure()
+        .map_err(|e| format!("Approved payload structural validation failed: {}", e))?;
+
+    // 3. Biomechanical validation (but write only if no severe errors)
+    let notes_raw = payload.to_ssc_notes();
+    let validation_result = validate_chart(payload.play_mode, payload.difficulty_level, &notes_raw);
+    let has_errors = validation_result
+        .issues
+        .iter()
+        .any(|i| i.severity == ValidationSeverity::Error);
+
+    if has_errors {
+        return Err(
+            "Cannot commit chart: Biomechanical validation detected severe errors.".to_string(),
+        );
+    }
+
+    // 4. Formulate the production description without "Mock"
+    let description = format!(
+        "AI {} {}",
+        payload.section_id,
+        match payload.play_mode {
+            PlayMode::Single => format!("S{}", payload.difficulty_level),
+            PlayMode::Double => format!("D{}", payload.difficulty_level),
+        }
+    );
+
+    // 5. Append to SSC (which will automatically handle backups)
+    append_chart_to_ssc_atomic(
+        path,
+        payload.play_mode,
+        payload.difficulty_level,
+        &notes_raw,
+        description,
+        author,
+    )
+}
+
+pub async fn generate_gemini_chart_preview_core(
+    api_key: &str,
+    ssc_path: &str,
+    audio_path: &str,
+    play_mode: PlayMode,
+    target_level: u32,
+    section_id: &str,
+    author: &str,
+    w_mode: GeminiWriteMode,
+    client: &GeminiClient,
+) -> Result<AppendChartResult, String> {
+    // 1. Check environment variable gate
+    if !crate::settings::is_gemini_enabled() {
+        return Err("La integración real con Gemini está deshabilitada en esta sesión. Configure la variable de entorno AI_STEP_GEN_ENABLE_REAL_GEMINI=1 para habilitarla.".to_string());
+    }
+
+    // 4. Construct prompt
+    let prompt_text = format!(
+        "Genera un chart coreográfico de Pump It Up para la sección '{}' en modo {:?} con nivel de dificultad {}. \
+        Retorna la respuesta estrictamente en formato JSON que cumpla con el esquema requerido, sin bloques markdown, sin explicaciones ni texto adicional.",
+        section_id, play_mode, target_level
+    );
+
+    // 5. Invoke Gemini API
+    let audio_file_path = Path::new(audio_path);
+    if !audio_file_path.exists() || !audio_file_path.is_file() {
+        return Err(format!(
+            "Audio file path does not exist or is not a file: {}",
+            audio_path
+        ));
+    }
+
+    let raw_response = client
+        .process_audio_and_generate(api_key, audio_file_path, &prompt_text)
+        .await?;
+
+    // 6. Parse response JSON
+    let payload: GeminiChartSectionPayload = serde_json::from_str(&raw_response).map_err(|e| {
+        let error_summary = e.to_string();
+        let length = raw_response.len();
+        format!(
+            "Gemini returned invalid JSON: {}. Response length: {} bytes.",
+            error_summary, length
+        )
+    })?;
+
+    // Validate that the response matches the requested parameters
+    let mut mismatch_issues = Vec::new();
+    if payload.section_id != section_id {
+        mismatch_issues.push(ValidationIssue {
+            measure_index: 0,
+            row_index: 0,
+            severity: ValidationSeverity::Error,
+            issue_type: ValidationIssueType::InvalidGeminiStructure,
+            message: format!(
+                "El ID de sección en la respuesta ({}) no coincide con el solicitado ({}).",
+                payload.section_id, section_id
+            ),
+        });
+    }
+    if payload.play_mode != play_mode {
+        mismatch_issues.push(ValidationIssue {
+            measure_index: 0,
+            row_index: 0,
+            severity: ValidationSeverity::Error,
+            issue_type: ValidationIssueType::InvalidGeminiStructure,
+            message: format!(
+                "El modo de juego en la respuesta ({:?}) no coincide con el solicitado ({:?}).",
+                payload.play_mode, play_mode
+            ),
+        });
+    }
+    if payload.difficulty_level != target_level {
+        mismatch_issues.push(ValidationIssue {
+            measure_index: 0,
+            row_index: 0,
+            severity: ValidationSeverity::Error,
+            issue_type: ValidationIssueType::InvalidGeminiStructure,
+            message: format!(
+                "El nivel de dificultad en la respuesta ({}) no coincide con el solicitado ({}).",
+                payload.difficulty_level, target_level
+            ),
+        });
+    }
+
+    if !mismatch_issues.is_empty() {
+        let validation_result = ValidatedChartSection {
+            play_mode,
+            difficulty_level: target_level,
+            issues: mismatch_issues,
+        };
+        let current_charts = list_charts(ssc_path.to_string())?;
+        return Ok(AppendChartResult {
+            charts: current_charts,
+            validation: validation_result,
+            written: false,
+            message: "Aborted: Gemini payload mismatch with requested parameters.".to_string(),
+            generated_notes: None,
+            raw_payload: Some(raw_response.clone()),
+            backup_path: None,
+        });
+    }
+
+    // 7. Validate structure
+    let validation_result = match payload.validate_structure() {
+        Ok(()) => {
+            // Convert to SSC notes
+            let notes_raw = payload.to_ssc_notes();
+
+            let description = format!(
+                "AI Mock {} {}",
+                payload.section_id,
+                match payload.play_mode {
+                    PlayMode::Single => format!("S{}", payload.difficulty_level),
+                    PlayMode::Double => format!("D{}", payload.difficulty_level),
+                }
+            );
+
+            // If AppendIfValid, try to write chart using the helper
+            if w_mode == GeminiWriteMode::AppendIfValid {
+                let ssc_file_path = Path::new(ssc_path);
+                return append_chart_to_ssc_atomic(
+                    ssc_file_path,
+                    payload.play_mode,
+                    payload.difficulty_level,
+                    &notes_raw,
+                    description,
+                    author.to_string(),
+                );
+            }
+
+            // Otherwise, validate and return preview only
+            validate_chart(payload.play_mode, payload.difficulty_level, &notes_raw)
+        }
+        Err(err_msg) => {
+            // Structural validation failed
+            ValidatedChartSection {
+                play_mode: payload.play_mode,
+                difficulty_level: payload.difficulty_level,
+                issues: vec![ValidationIssue {
+                    measure_index: 0,
+                    row_index: 0,
+                    severity: ValidationSeverity::Error,
+                    issue_type: ValidationIssueType::InvalidGeminiStructure,
+                    message: err_msg,
+                }],
+            }
+        }
+    };
+
+    let current_charts = list_charts(ssc_path.to_string())?;
+    let written = false;
+
+    // Determine semantic message based on errors/warnings in PreviewOnly
+    let has_errors = validation_result
+        .issues
+        .iter()
+        .any(|i| i.severity == ValidationSeverity::Error);
+    let has_warnings = validation_result
+        .issues
+        .iter()
+        .any(|i| i.severity == ValidationSeverity::Warning);
+
+    let message = if w_mode == GeminiWriteMode::PreviewOnly {
+        if has_errors {
+            "preview generado pero inválido; no se escribió en disco".to_string()
+        } else if has_warnings {
+            "preview generado con advertencias".to_string()
+        } else {
+            "Preview content generated and validated successfully without writing to disk."
+                .to_string()
+        }
+    } else {
+        "Aborted: Gemini payload has errors and was not written to disk.".to_string()
+    };
+
+    Ok(AppendChartResult {
+        charts: current_charts,
+        validation: validation_result,
+        written,
+        message,
+        generated_notes: Some(payload.to_ssc_notes()),
+        raw_payload: Some(raw_response),
+        backup_path: None,
+    })
+}
+
+#[tauri::command]
+pub async fn generate_gemini_chart_preview<R: tauri::Runtime>(
+    app_handle: tauri::AppHandle<R>,
+    ssc_path: String,
+    audio_path: String,
+    passphrase: String,
+    play_mode: String,
+    target_level: u32,
+    section_id: String,
+    author: String,
+    write_mode: String,
+) -> Result<AppendChartResult, String> {
+    let play_mode_enum = match play_mode.as_str() {
+        "Single" => PlayMode::Single,
+        "Double" => PlayMode::Double,
+        _ => return Err(format!("Unsupported play mode: {}", play_mode)),
+    };
+
+    let w_mode = match write_mode.as_str() {
+        "PreviewOnly" => GeminiWriteMode::PreviewOnly,
+        "AppendIfValid" => GeminiWriteMode::AppendIfValid,
+        _ => return Err(format!("Unsupported write mode: {}", write_mode)),
+    };
+
+    // 2. Decrypt stored API key
+    let api_key =
+        crate::credentials::decrypt_stored_api_key(&app_handle, &passphrase).map_err(|e| {
+            format!(
+                "Error al descifrar la API Key (verifique la contraseña): {}",
+                e
+            )
+        })?;
+
+    // 3. Initialize Gemini Client
+    #[cfg(test)]
+    let client = {
+        let base_url = std::env::var("AI_STEP_GEN_MOCK_BASE_URL").ok();
+        GeminiClient::new(base_url)
+    };
+    #[cfg(not(test))]
+    let client = GeminiClient::new();
+
+    generate_gemini_chart_preview_core(
+        &api_key,
+        &ssc_path,
+        &audio_path,
+        play_mode_enum,
+        target_level,
+        &section_id,
+        &author,
+        w_mode,
+        &client,
+    )
+    .await
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use mockito::Server;
+    use std::path::PathBuf;
+
+    fn get_fixture_path() -> PathBuf {
+        let mut p = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+        p.push("src");
+        p.push("ssc");
+        p.push("test_fixtures");
+        p.push("mini_sample.ssc");
+        p
+    }
+
+    #[test]
+    fn test_get_file_fingerprint_success_and_failure() {
+        let fixture_path = get_fixture_path();
+        assert!(fixture_path.exists());
+
+        // 1. Valid file fingerprint
+        let fp_result = get_file_fingerprint(fixture_path.to_string_lossy().to_string());
+        assert!(fp_result.is_ok());
+        let fp = fp_result.unwrap();
+        assert!(fp.file_size > 0);
+        assert!(!fp.sha256.is_empty());
+        assert_eq!(fp.sha256.len(), 64); // SHA-256 length in hex
+        assert!(fp.modified_time > 0);
+
+        // 2. Non-existent file fingerprint
+        let fake_path = "/nonexistent/path/to/some/file.ssc".to_string();
+        let fp_result_err = get_file_fingerprint(fake_path);
+        assert!(fp_result_err.is_err());
+        assert!(fp_result_err.unwrap_err().contains("no existe"));
+    }
+
+    #[test]
+    fn test_append_ai_chart_stub_single() {
+        crate::settings::set_test_env(Some("dev"));
+        let original_path = get_fixture_path();
+        assert!(original_path.exists());
+
+        // Create a temporary file path
+        let temp_dir = std::env::temp_dir();
+        let temp_ssc_path = temp_dir.join("test_mini_single.ssc");
+
+        // Copy original file to temp path
+        std::fs::copy(&original_path, &temp_ssc_path)
+            .expect("Failed to copy Mini Sample ssc to temp");
+
+        // Parse original to get original chart count
+        let original_doc = SscDocument::parse(&temp_ssc_path).expect("Failed to parse copied ssc");
+        let original_count = original_doc.charts.len();
+
+        // Append chart stub
+        let result = append_ai_chart_stub(
+            temp_ssc_path.to_string_lossy().to_string(),
+            "Single".to_string(),
+            18,
+            "AI Test Author".to_string(),
+        )
+        .expect("Failed to append AI chart stub");
+
+        assert!(result.written);
+        let updated_charts = result.charts;
+
+        // Assert count incremented
+        assert_eq!(updated_charts.len(), original_count + 1);
+
+        // Verify the appended chart details
+        let new_chart = &updated_charts[original_count];
+        assert_eq!(new_chart.steps_type, "pump-single");
+        assert_eq!(new_chart.meter, 18);
+        assert_eq!(new_chart.credit, "AI Test Author");
+        assert_eq!(new_chart.difficulty, "Edit");
+        assert_eq!(new_chart.description, "Local Test S18");
+
+        // Clean up
+        crate::settings::set_test_env(None);
+        let _ = std::fs::remove_file(temp_ssc_path);
+    }
+
+    #[test]
+    fn test_append_ai_chart_stub_double_preserves_existing() {
+        crate::settings::set_test_env(Some("dev"));
+        let original_path = get_fixture_path();
+        assert!(original_path.exists());
+
+        // Create a temporary file path
+        let temp_dir = std::env::temp_dir();
+        let temp_ssc_path = temp_dir.join("test_mini_double.ssc");
+
+        // Copy original file to temp path
+        std::fs::copy(&original_path, &temp_ssc_path)
+            .expect("Failed to copy Mini Sample ssc to temp");
+
+        // Parse original to compare charts
+        let original_doc = SscDocument::parse(&temp_ssc_path).expect("Failed to parse copied ssc");
+        let original_count = original_doc.charts.len();
+
+        // Append double chart stub
+        let result = append_ai_chart_stub(
+            temp_ssc_path.to_string_lossy().to_string(),
+            "Double".to_string(),
+            12, // Level under 16 limit for double
+            "AI Test Author 2".to_string(),
+        )
+        .expect("Failed to append AI chart stub");
+
+        assert!(result.written);
+        let updated_charts = result.charts;
+        assert_eq!(updated_charts.len(), original_count + 1);
+
+        // Parse back the written document
+        let final_doc =
+            SscDocument::parse(&temp_ssc_path).expect("Failed to parse final written ssc");
+
+        // Verify original charts remain completely identical
+        for i in 0..original_count {
+            assert_eq!(
+                final_doc.charts[i].notes_raw,
+                original_doc.charts[i].notes_raw
+            );
+            assert_eq!(
+                final_doc.charts[i]
+                    .tags
+                    .iter()
+                    .filter(|t| !t.is_comment)
+                    .collect::<Vec<_>>(),
+                original_doc.charts[i]
+                    .tags
+                    .iter()
+                    .filter(|t| !t.is_comment)
+                    .collect::<Vec<_>>()
+            );
+        }
+
+        // Verify the last chart (appended one) has correct double column format (10 characters per note line)
+        let final_new_chart = &final_doc.charts[original_count];
+        let rows: Vec<&str> = final_new_chart
+            .notes_raw
+            .lines()
+            .map(|l| l.trim())
+            .collect();
+        for row in rows {
+            if row == "," || row == ";" || row.starts_with("//") || row.is_empty() {
+                continue;
+            }
+            assert_eq!(
+                row.len(),
+                10,
+                "Row must have exactly 10 characters for Double chart: {}",
+                row
+            );
+        }
+
+        // Clean up
+        crate::settings::set_test_env(None);
+        let _ = std::fs::remove_file(temp_ssc_path);
+    }
+
+    #[test]
+    fn test_mock_gemini_payload_valid_and_invalid() {
+        crate::settings::set_test_env(Some("dev"));
+        let original_path = get_fixture_path();
+        let temp_dir = std::env::temp_dir();
+        let temp_ssc_path = temp_dir.join("test_mock_gemini.ssc");
+        std::fs::copy(&original_path, &temp_ssc_path).expect("Failed to copy");
+
+        // Count original charts
+        let original_doc = SscDocument::parse(&temp_ssc_path).expect("Failed to parse");
+        let original_count = original_doc.charts.len();
+
+        // 1. Test VALID payload
+        let valid_payload = r#"{
+            "section_id": "chorus_1",
+            "difficulty_level": 15,
+            "play_mode": "Single",
+            "biomechanical_state": {
+                "current_twist_debt": 0.0,
+                "current_stamina_debt": 0.5,
+                "last_left_foot_lane": 1,
+                "last_right_foot_lane": 3
+            },
+            "measures": [
+                {
+                    "measure_index": 0,
+                    "subdivision": 4,
+                    "rows": [
+                        "10000",
+                        "00100",
+                        "00001",
+                        "00100"
+                    ]
+                }
+            ]
+        }"#;
+
+        let result = append_mock_gemini_payload(
+            temp_ssc_path.to_string_lossy().to_string(),
+            valid_payload.to_string(),
+            "Gemini Mock Tester".to_string(),
+        )
+        .expect("Valid payload should succeed");
+
+        assert!(result.written);
+        assert!(result.validation.issues.is_empty());
+        assert_eq!(
+            result.charts.last().unwrap().description,
+            "AI Mock chorus_1 S15"
+        );
+        assert_eq!(result.charts.len(), original_count + 1);
+
+        // 2. Test INVALID payload (Structural error: Mina 'M' Detected)
+        let invalid_payload = r#"{
+            "section_id": "chorus_2",
+            "difficulty_level": 15,
+            "play_mode": "Single",
+            "biomechanical_state": {
+                "current_twist_debt": 0.0,
+                "current_stamina_debt": 0.5,
+                "last_left_foot_lane": 1,
+                "last_right_foot_lane": 3
+            },
+            "measures": [
+                {
+                    "measure_index": 0,
+                    "subdivision": 4,
+                    "rows": [
+                        "10M00",
+                        "00100",
+                        "00001",
+                        "00100"
+                    ]
+                }
+            ]
+        }"#;
+
+        let result_invalid = append_mock_gemini_payload(
+            temp_ssc_path.to_string_lossy().to_string(),
+            invalid_payload.to_string(),
+            "Gemini Mock Tester".to_string(),
+        )
+        .expect("Command should return Ok with written = false");
+
+        assert!(!result_invalid.written);
+        assert!(!result_invalid.validation.issues.is_empty());
+        assert_eq!(
+            result_invalid.validation.issues[0].issue_type,
+            ValidationIssueType::InvalidGeminiStructure
+        );
+        assert!(result_invalid.validation.issues[0]
+            .message
+            .contains("carácter inválido 'M'"));
+
+        // Check file was not appended further
+        let current_doc = SscDocument::parse(&temp_ssc_path).expect("Failed to parse");
+        // Count should still match count after valid append (original + 1)
+        assert_eq!(current_doc.charts.len(), original_count + 1);
+
+        crate::settings::set_test_env(None);
+        let _ = std::fs::remove_file(temp_ssc_path);
+    }
+
+    #[tokio::test]
+    async fn test_generate_gemini_chart_preview_flow() {
+        let mut server = Server::new_async().await;
+
+        // Mock Gemini response (Valid structured response)
+        let mock_post = server.mock("POST", "/v1beta/models/gemini-3.5-flash:generateContent")
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(r#"{
+                "candidates": [
+                    {
+                        "content": {
+                            "parts": [
+                                {
+                                    "text": "{\n  \"section_id\": \"preview_section\",\n  \"difficulty_level\": 10,\n  \"play_mode\": \"Single\",\n  \"biomechanical_state\": {\n    \"current_twist_debt\": 0.0,\n    \"current_stamina_debt\": 0.1\n  },\n  \"measures\": [\n    {\n      \"measure_index\": 0,\n      \"subdivision\": 4,\n      \"rows\": [\n        \"10000\",\n        \"00100\",\n        \"00001\",\n        \"00100\"\n      ]\n    }\n  ]\n}"
+                                }
+                            ]
+                        }
+                    }
+                ]
+            }"#)
+            .create_async()
+            .await;
+
+        // Copy ssc fixture
+        let original_path = get_fixture_path();
+        let temp_dir = std::env::temp_dir();
+        let temp_ssc_path = temp_dir.join("test_gemini_preview_core.ssc");
+        std::fs::copy(&original_path, &temp_ssc_path).expect("Failed to copy");
+
+        // Create a dummy audio file
+        let test_audio_path = temp_dir.join("test_audio_core.mp3");
+        {
+            let mut file = std::fs::File::create(&test_audio_path).unwrap();
+            file.write_all(b"audio content").unwrap();
+        }
+
+        let doc_before = SscDocument::parse(&temp_ssc_path).unwrap();
+        let charts_count_before = doc_before.charts.len();
+
+        let client = GeminiClient::new(Some(server.url()));
+
+        // Case 1: Env gate is NOT enabled -> should return error and NOT call Mock server
+        crate::settings::set_test_gemini_enabled(Some(false));
+        let result_gate = generate_gemini_chart_preview_core(
+            "fake-key",
+            &temp_ssc_path.to_string_lossy(),
+            &test_audio_path.to_string_lossy(),
+            PlayMode::Single,
+            10,
+            "preview_section",
+            "AI Previewer",
+            GeminiWriteMode::PreviewOnly,
+            &client,
+        )
+        .await;
+        assert!(result_gate.is_err());
+        assert!(result_gate.unwrap_err().contains("deshabilitada"));
+
+        // Now enable env gate
+        crate::settings::set_test_gemini_enabled(Some(true));
+
+        // Case 2: PreviewOnly valid flow
+        let result_preview = generate_gemini_chart_preview_core(
+            "fake-key",
+            &temp_ssc_path.to_string_lossy(),
+            &test_audio_path.to_string_lossy(),
+            PlayMode::Single,
+            10,
+            "preview_section",
+            "AI Previewer",
+            GeminiWriteMode::PreviewOnly,
+            &client,
+        )
+        .await
+        .expect("PreviewOnly flow failed");
+
+        mock_post.assert_async().await;
+        assert!(!result_preview.written);
+        assert_eq!(
+            result_preview.message,
+            "Preview content generated and validated successfully without writing to disk."
+        );
+
+        // Case 3: Mismatch section_id
+        let mock_post_mismatch = server.mock("POST", "/v1beta/models/gemini-3.5-flash:generateContent")
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(r#"{
+                "candidates": [
+                    {
+                        "content": {
+                            "parts": [
+                                {
+                                    "text": "{\n  \"section_id\": \"different_section\",\n  \"difficulty_level\": 10,\n  \"play_mode\": \"Single\",\n  \"biomechanical_state\": {\n    \"current_twist_debt\": 0.0,\n    \"current_stamina_debt\": 0.1\n  },\n  \"measures\": [\n    {\n      \"measure_index\": 0,\n      \"subdivision\": 4,\n      \"rows\": [\n        \"10000\",\n        \"00100\",\n        \"00001\",\n        \"00100\"\n      ]\n    }\n  ]\n}"
+                                }
+                            ]
+                        }
+                    }
+                ]
+            }"#)
+            .create_async()
+            .await;
+
+        let result_mismatch = generate_gemini_chart_preview_core(
+            "fake-key",
+            &temp_ssc_path.to_string_lossy(),
+            &test_audio_path.to_string_lossy(),
+            PlayMode::Single,
+            10,
+            "preview_section", // requested
+            "AI Previewer",
+            GeminiWriteMode::PreviewOnly,
+            &client,
+        )
+        .await
+        .expect("Core preview mismatch section_id failed");
+
+        mock_post_mismatch.assert_async().await;
+        assert!(!result_mismatch.written);
+        assert!(result_mismatch
+            .validation
+            .issues
+            .iter()
+            .any(|i| i.message.contains("ID de sección")));
+
+        // Case 4: Mismatch play_mode
+        let mock_post_mismatch_pm = server.mock("POST", "/v1beta/models/gemini-3.5-flash:generateContent")
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(r#"{
+                "candidates": [
+                    {
+                        "content": {
+                            "parts": [
+                                {
+                                    "text": "{\n  \"section_id\": \"preview_section\",\n  \"difficulty_level\": 10,\n  \"play_mode\": \"Double\",\n  \"biomechanical_state\": {\n    \"current_twist_debt\": 0.0,\n    \"current_stamina_debt\": 0.1\n  },\n  \"measures\": [\n    {\n      \"measure_index\": 0,\n      \"subdivision\": 4,\n      \"rows\": [\n        \"1000000000\",\n        \"0000010000\",\n        \"0000000001\",\n        \"0000010000\"\n      ]\n    }\n  ]\n}"
+                                }
+                            ]
+                        }
+                    }
+                ]
+            }"#)
+            .create_async()
+            .await;
+
+        let result_mismatch_pm = generate_gemini_chart_preview_core(
+            "fake-key",
+            &temp_ssc_path.to_string_lossy(),
+            &test_audio_path.to_string_lossy(),
+            PlayMode::Single, // requested Single
+            10,
+            "preview_section",
+            "AI Previewer",
+            GeminiWriteMode::PreviewOnly,
+            &client,
+        )
+        .await
+        .expect("Core preview mismatch play_mode failed");
+
+        mock_post_mismatch_pm.assert_async().await;
+        assert!(!result_mismatch_pm.written);
+        assert!(result_mismatch_pm
+            .validation
+            .issues
+            .iter()
+            .any(|i| i.message.contains("modo de juego")));
+
+        // Case 5: Mismatch difficulty_level
+        let mock_post_mismatch_diff = server.mock("POST", "/v1beta/models/gemini-3.5-flash:generateContent")
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(r#"{
+                "candidates": [
+                    {
+                        "content": {
+                            "parts": [
+                                {
+                                    "text": "{\n  \"section_id\": \"preview_section\",\n  \"difficulty_level\": 12,\n  \"play_mode\": \"Single\",\n  \"biomechanical_state\": {\n    \"current_twist_debt\": 0.0,\n    \"current_stamina_debt\": 0.1\n  },\n  \"measures\": [\n    {\n      \"measure_index\": 0,\n      \"subdivision\": 4,\n      \"rows\": [\n        \"10000\",\n        \"00100\",\n        \"00001\",\n        \"00100\"\n      ]\n    }\n  ]\n}"
+                                }
+                            ]
+                        }
+                    }
+                ]
+            }"#)
+            .create_async()
+            .await;
+
+        let result_mismatch_diff = generate_gemini_chart_preview_core(
+            "fake-key",
+            &temp_ssc_path.to_string_lossy(),
+            &test_audio_path.to_string_lossy(),
+            PlayMode::Single,
+            10, // requested 10
+            "preview_section",
+            "AI Previewer",
+            GeminiWriteMode::PreviewOnly,
+            &client,
+        )
+        .await
+        .expect("Core preview mismatch diff failed");
+
+        mock_post_mismatch_diff.assert_async().await;
+        assert!(!result_mismatch_diff.written);
+        assert!(result_mismatch_diff
+            .validation
+            .issues
+            .iter()
+            .any(|i| i.message.contains("nivel de dificultad")));
+
+        // Case 6: PreviewOnly with warning severity issue (Consecutive Jumps warning)
+        let mock_post_warning = server.mock("POST", "/v1beta/models/gemini-3.5-flash:generateContent")
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(r#"{
+                "candidates": [
+                    {
+                        "content": {
+                            "parts": [
+                                {
+                                    "text": "{\n  \"section_id\": \"preview_section\",\n  \"difficulty_level\": 10,\n  \"play_mode\": \"Single\",\n  \"biomechanical_state\": {\n    \"current_twist_debt\": 0.0,\n    \"current_stamina_debt\": 0.1\n  },\n  \"measures\": [\n    {\n      \"measure_index\": 0,\n      \"subdivision\": 4,\n      \"rows\": [\n        \"10001\",\n        \"10100\",\n        \"00101\",\n        \"00000\"\n      ]\n    }\n  ]\n}"
+                                }
+                            ]
+                        }
+                    }
+                ]
+            }"#)
+            .create_async()
+            .await;
+
+        let result_warning = generate_gemini_chart_preview_core(
+            "fake-key",
+            &temp_ssc_path.to_string_lossy(),
+            &test_audio_path.to_string_lossy(),
+            PlayMode::Single,
+            10,
+            "preview_section",
+            "AI Previewer",
+            GeminiWriteMode::PreviewOnly,
+            &client,
+        )
+        .await
+        .expect("Core preview with warnings failed");
+
+        mock_post_warning.assert_async().await;
+        assert!(!result_warning.written);
+        assert_eq!(result_warning.message, "preview generado con advertencias");
+
+        // Case 7: PreviewOnly with error severity issue (Mina detected)
+        let mock_post_error = server.mock("POST", "/v1beta/models/gemini-3.5-flash:generateContent")
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(r#"{
+                "candidates": [
+                    {
+                        "content": {
+                            "parts": [
+                                {
+                                    "text": "{\n  \"section_id\": \"preview_section\",\n  \"difficulty_level\": 10,\n  \"play_mode\": \"Single\",\n  \"biomechanical_state\": {\n    \"current_twist_debt\": 0.0,\n    \"current_stamina_debt\": 0.1\n  },\n  \"measures\": [\n    {\n      \"measure_index\": 0,\n      \"subdivision\": 4,\n      \"rows\": [\n        \"10000\",\n        \"00M00\",\n        \"00001\",\n        \"00100\"\n      ]\n    }\n  ]\n}"
+                                }
+                            ]
+                        }
+                    }
+                ]
+            }"#)
+            .create_async()
+            .await;
+
+        let result_error = generate_gemini_chart_preview_core(
+            "fake-key",
+            &temp_ssc_path.to_string_lossy(),
+            &test_audio_path.to_string_lossy(),
+            PlayMode::Single,
+            10,
+            "preview_section",
+            "AI Previewer",
+            GeminiWriteMode::PreviewOnly,
+            &client,
+        )
+        .await
+        .expect("Core preview with error failed");
+
+        mock_post_error.assert_async().await;
+        assert!(!result_error.written);
+        assert_eq!(
+            result_error.message,
+            "preview generado pero inválido; no se escribió en disco"
+        );
+
+        // Case 8: AppendIfValid writes when valid
+        let mock_post_append_ok = server.mock("POST", "/v1beta/models/gemini-3.5-flash:generateContent")
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(r#"{
+                "candidates": [
+                    {
+                        "content": {
+                            "parts": [
+                                {
+                                    "text": "{\n  \"section_id\": \"append_section\",\n  \"difficulty_level\": 10,\n  \"play_mode\": \"Single\",\n  \"biomechanical_state\": {\n    \"current_twist_debt\": 0.0,\n    \"current_stamina_debt\": 0.1\n  },\n  \"measures\": [\n    {\n      \"measure_index\": 0,\n      \"subdivision\": 4,\n      \"rows\": [\n        \"10000\",\n        \"00100\",\n        \"00001\",\n        \"00100\"\n      ]\n    }\n  ]\n}"
+                                }
+                            ]
+                        }
+                    }
+                ]
+            }"#)
+            .create_async()
+            .await;
+
+        let result_append_ok = generate_gemini_chart_preview_core(
+            "fake-key",
+            &temp_ssc_path.to_string_lossy(),
+            &test_audio_path.to_string_lossy(),
+            PlayMode::Single,
+            10,
+            "append_section",
+            "AI Previewer",
+            GeminiWriteMode::AppendIfValid,
+            &client,
+        )
+        .await
+        .expect("Core AppendIfValid flow failed");
+
+        mock_post_append_ok.assert_async().await;
+        assert!(result_append_ok.written);
+
+        let doc_after_append = SscDocument::parse(&temp_ssc_path).unwrap();
+        assert_eq!(doc_after_append.charts.len(), charts_count_before + 1);
+
+        // Case 9: AppendIfValid does NOT write when invalid
+        let mock_post_append_err = server.mock("POST", "/v1beta/models/gemini-3.5-flash:generateContent")
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(r#"{
+                "candidates": [
+                    {
+                        "content": {
+                            "parts": [
+                                {
+                                    "text": "{\n  \"section_id\": \"append_section_err\",\n  \"difficulty_level\": 10,\n  \"play_mode\": \"Single\",\n  \"biomechanical_state\": {\n    \"current_twist_debt\": 0.0,\n    \"current_stamina_debt\": 0.1\n  },\n  \"measures\": [\n    {\n      \"measure_index\": 0,\n      \"subdivision\": 4,\n      \"rows\": [\n        \"10000\",\n        \"00M00\",\n        \"00001\",\n        \"00100\"\n      ]\n    }\n  ]\n}"
+                                }
+                            ]
+                        }
+                    }
+                ]
+            }"#)
+            .create_async()
+            .await;
+
+        let result_append_err = generate_gemini_chart_preview_core(
+            "fake-key",
+            &temp_ssc_path.to_string_lossy(),
+            &test_audio_path.to_string_lossy(),
+            PlayMode::Single,
+            10,
+            "append_section_err",
+            "AI Previewer",
+            GeminiWriteMode::AppendIfValid,
+            &client,
+        )
+        .await
+        .expect("Core AppendIfValid fail-flow failed");
+
+        mock_post_append_err.assert_async().await;
+        assert!(!result_append_err.written);
+
+        // Chart count should still be before + 1 (the invalid one should not be appended)
+        let doc_after_append_err = SscDocument::parse(&temp_ssc_path).unwrap();
+        assert_eq!(doc_after_append_err.charts.len(), charts_count_before + 1);
+
+        // Case 10: JSON invalid sanitization (confirm error doesn't leak raw JSON content)
+        let mock_post_bad_json = server.mock("POST", "/v1beta/models/gemini-3.5-flash:generateContent")
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(r#"{"candidates": [{"content": {"parts": [{"text": "this is not valid json {\"sensitive_info\": \"secret\"} foo bar"}]}}]}"#)
+            .create_async()
+            .await;
+
+        let result_bad_json = generate_gemini_chart_preview_core(
+            "fake-key",
+            &temp_ssc_path.to_string_lossy(),
+            &test_audio_path.to_string_lossy(),
+            PlayMode::Single,
+            10,
+            "preview_section",
+            "AI Previewer",
+            GeminiWriteMode::PreviewOnly,
+            &client,
+        )
+        .await;
+
+        mock_post_bad_json.assert_async().await;
+        assert!(result_bad_json.is_err());
+        let err_msg = result_bad_json.unwrap_err();
+        assert!(err_msg.contains("Gemini returned invalid JSON"));
+        assert!(!err_msg.contains("sensitive_info")); // verify it was sanitized and did not leak original response content
+
+        // Clean up
+        crate::settings::set_test_gemini_enabled(None);
+        let _ = std::fs::remove_file(temp_ssc_path);
+        let _ = std::fs::remove_file(test_audio_path);
+    }
+
+    #[test]
+    fn test_append_approved_gemini_payload_valid() {
+        let original_path = get_fixture_path();
+        let temp_dir = std::env::temp_dir();
+        let temp_ssc_path = temp_dir.join("test_approved_valid.ssc");
+        std::fs::copy(&original_path, &temp_ssc_path).expect("Failed to copy");
+
+        // Valid payload JSON
+        let valid_payload = r#"{
+            "section_id": "chorus_approved",
+            "difficulty_level": 12,
+            "play_mode": "Single",
+            "biomechanical_state": {
+                "current_twist_debt": 0.0,
+                "current_stamina_debt": 0.3
+            },
+            "placeholder_unused_fields": {},
+            "measures": [
+                {
+                    "measure_index": 0,
+                    "subdivision": 4,
+                    "rows": [
+                        "10000",
+                        "00100",
+                        "00001",
+                        "00100"
+                    ]
+                }
+            ]
+        }"#;
+
+        // Call approved commit (should work even without env mode = dev)
+        crate::settings::set_test_env(None);
+        let result = append_approved_gemini_payload(
+            temp_ssc_path.to_string_lossy().to_string(),
+            valid_payload.to_string(),
+            "Approved Tester".to_string(),
+        )
+        .expect("Command should succeed");
+
+        assert!(result.written);
+        assert!(result.backup_path.is_some());
+
+        // Verify backup actually exists
+        let backup_file = std::path::Path::new(result.backup_path.as_ref().unwrap());
+        assert!(backup_file.exists());
+
+        // Verify backup contains original content (which has fewer charts than updated)
+        let backup_doc = SscDocument::parse(backup_file).unwrap();
+        let updated_doc = SscDocument::parse(&temp_ssc_path).unwrap();
+        assert_eq!(backup_doc.charts.len() + 1, updated_doc.charts.len());
+
+        // Verify description is "AI chorus_approved S12" (no "Mock")
+        assert_eq!(
+            result.charts.last().unwrap().description,
+            "AI chorus_approved S12"
+        );
+
+        // Clean up
+        let _ = std::fs::remove_file(temp_ssc_path);
+        let _ = std::fs::remove_file(backup_file);
+    }
+
+    #[test]
+    fn test_append_approved_gemini_payload_invalid_biomechanics() {
+        let original_path = get_fixture_path();
+        let temp_dir = std::env::temp_dir();
+        let temp_ssc_path = temp_dir.join("test_approved_invalid_bio.ssc");
+        std::fs::copy(&original_path, &temp_ssc_path).expect("Failed to copy");
+
+        // Payload with severe error: Mina 'M'
+        let invalid_payload = r#"{
+            "section_id": "chorus_approved_err",
+            "difficulty_level": 12,
+            "play_mode": "Single",
+            "biomechanical_state": {
+                "current_twist_debt": 0.0,
+                "current_stamina_debt": 0.3
+            },
+            "measures": [
+                {
+                    "measure_index": 0,
+                    "subdivision": 4,
+                    "rows": [
+                        "10M00",
+                        "00100",
+                        "00001",
+                        "00100"
+                    ]
+                }
+            ]
+        }"#;
+
+        let result = append_approved_gemini_payload(
+            temp_ssc_path.to_string_lossy().to_string(),
+            invalid_payload.to_string(),
+            "Approved Tester".to_string(),
+        );
+
+        // Should return Err because of the severe biomechanical structure error
+        assert!(result.is_err());
+
+        // Clean up
+        let _ = std::fs::remove_file(temp_ssc_path);
+    }
+
+    #[test]
+    fn test_dev_env_protection_for_mocks_and_stubs() {
+        let original_path = get_fixture_path();
+        let temp_dir = std::env::temp_dir();
+        let temp_ssc_path = temp_dir.join("test_dev_protection.ssc");
+        std::fs::copy(&original_path, &temp_ssc_path).expect("Failed to copy");
+
+        // Force env to production / unset
+        crate::settings::set_test_env(None);
+
+        // Calling stub should fail in prod
+        let result_stub = append_ai_chart_stub(
+            temp_ssc_path.to_string_lossy().to_string(),
+            "Single".to_string(),
+            10,
+            "Stubby".to_string(),
+        );
+        assert!(result_stub.is_err());
+        assert!(result_stub.unwrap_err().contains("development mode"));
+
+        // Calling mock payload should fail in prod
+        let result_mock = append_mock_gemini_payload(
+            temp_ssc_path.to_string_lossy().to_string(),
+            r#"{"section_id": "foo", "difficulty_level": 10, "play_mode": "Single", "biomechanical_state": {"current_twist_debt": 0.0, "current_stamina_debt": 0.0}, "measures": []}"#.to_string(),
+            "Mocker".to_string(),
+        );
+        assert!(result_mock.is_err());
+        assert!(result_mock.unwrap_err().contains("development mode"));
+
+        // Clean up
+        let _ = std::fs::remove_file(temp_ssc_path);
+    }
+}

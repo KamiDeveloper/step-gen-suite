@@ -1,0 +1,33 @@
+PERSONAL AND NON-COMMERCIAL SOURCE LICENSE & DISCLAIMER
+
+Copyright (c) 2026 The Step-Gen-Suite Contributors / Repository Owner.
+
+IMPORTANT NOTICE: This is not a standard open-source license as approved by the Open Source Initiative (OSI), as it contains strict limitations restricting use to personal and non-commercial purposes. By downloading, copying, installing, modifying, or using this Software, you agree to be bound by the terms of this License. If you do not agree, do not use the Software.
+
+1. LICENSE GRANT & PERMITTED USE
+Subject to the terms and conditions of this License, the copyright holder(s) ("Author(s)") hereby grant you a personal, non-exclusive, non-transferable, non-sublicensable, and revocable license to download, install, run, view, and modify the source code of this Software strictly for personal, recreational, and non-commercial educational use.
+
+2. RESTRICTIONS
+You may not:
+- Use this Software or any derivative works for any commercial, business, or revenue-generating purposes.
+- Distribute, sell, lease, rent, or sublicense the Software, modified or unmodified, for commercial gain.
+- Host the Software as a paid service or bundle it with any commercial product, hardware, or service.
+
+3. COPYRIGHT MUSIC & MEDIA DISCLAIMER
+- No Audio Included: The Software does not contain, bundle, distribute, or pre-load any copyrighted audio tracks, music files, stepcharts, or media files.
+- User Responsibility: The user is solely responsible for obtaining any audio tracks, music, or other media files used in connection or integration with this Software.
+- Limitation of Liability: The Author(s) of this Software make no representations regarding the legal status of any music or media files loaded or processed by the user. The Author(s) shall not be held liable, legally or otherwise, for any copyright infringement, trademark violation, or other legal issues arising from the user's importation, playback, generation, or use of copyrighted content within or alongside the Software.
+
+4. THIRD-PARTY AFFILIATIONS & TRADEMARKS
+- Andamiro & Pump It Up: This Software is an independent community project. It is not affiliated with, authorized, associated, sponsored, endorsed, or in any way officially connected with Andamiro Co., Ltd., the "Pump It Up" brand, or any of their subsidiaries, parent companies, or affiliates. All product names, logos, and brands are property of their respective owners.
+- Google & Gemini: This Software is a developer tool that utilizes Google's Gemini API/models. This Software is not affiliated with, sponsored, endorsed, or officially recognized by Google LLC, Alphabet Inc., or any of their affiliates. Gemini and Google are trademarks of Google LLC. The Gemini technology is utilized as a third-party platform API, and its use does not imply any sponsorship or partnership.
+
+5. FONT ASSETS & LICENSING
+- Waldenburg Fonts: Any "Waldenburg" font files included or referenced within this repository are trial versions. Their usage is strictly restricted to personal, non-commercial testing and evaluation. Any other use, including commercial use, requires purchasing a full license from the respective typeface creator or distributor.
+- Inter & Geist Mono: The "Inter" and "Geist Mono" fonts are open-source typefaces. They are available for free via Google Fonts and are governed under their respective open-source licenses (specifically, the SIL Open Font License, Version 1.1).
+
+6. DISCLAIMER OF WARRANTY
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
+
+7. LIMITATION OF LIABILITY
+UNDER NO CIRCUMSTANCES AND UNDER NO LEGAL THEORY (WHETHER IN CONTRACT, TORT, OR OTHERWISE) SHALL THE AUTHOR(S), CONTRIBUTORS, OR REPOSITORY OWNER BE LIABLE TO YOU OR ANY THIRD PARTY FOR ANY INDIRECT, SPECIAL, INCIDENTAL, CONSEQUENTIAL, OR PUNITIVE DAMAGES, INCLUDING BUT NOT LIMITED TO LOSS OF DATA, LOSS OF GOODWILL, WORK STOPPAGE, COMPUTER FAILURE OR MALFUNCTION, OR ANY AND ALL OTHER DAMAGES OR LOSSES ARISING OUT OF OR IN CONNECTION WITH THE USE OR INABILITY TO USE THE SOFTWARE.
