@@ -1,9 +1,10 @@
-import React, { useState, useEffect } from "react";
-import { invoke } from "@tauri-apps/api/core";
+import React, { useState, useEffect, useRef } from "react";
+import { invoke, convertFileSrc } from "@tauri-apps/api/core";
 import { useSongProjectStore } from "../store/songProjectStore";
 import { useSettingsStore } from "../store/settingsStore";
 import { ISongDetails } from "../types/song";
-import { ArrowLeft, ArrowRight, Save, AlertTriangle, CheckCircle } from "lucide-react";
+import { ArrowRight, Save, AlertTriangle, CheckCircle, Play, Pause, Music, Image, Video, Trash2 } from "lucide-react";
+import { WizardFooter } from "../components/WizardFooter";
 
 interface CreateSongWizardProps {
   onNavigate: (screen: string) => void;
@@ -48,6 +49,103 @@ export const CreateSongWizard: React.FC<CreateSongWizardProps> = ({ onNavigate }
   const [bannerFile, setBannerFile] = useState<IFileMetadata | null>(null);
   const [backgroundFile, setBackgroundFile] = useState<IFileMetadata | null>(null);
   const [videoFile, setVideoFile] = useState<IFileMetadata | null>(null);
+
+  // Step 2: Mini Player & Ambient Blur States & Refs
+  const [isPlaying, setIsPlaying] = useState(false);
+  const [currentTime, setCurrentTime] = useState(0);
+  const [duration, setDuration] = useState(0);
+
+  const audioRef = useRef<HTMLAudioElement | null>(null);
+  const bannerBlurRef = useRef<HTMLDivElement | null>(null);
+  const bgBlurRef = useRef<HTMLDivElement | null>(null);
+  const wizardBlurRef = useRef<HTMLDivElement | null>(null);
+
+  // Apply blurry Spotify ambient background in DOM using JavaScript to bypass "style=" JSX rules
+  useEffect(() => {
+    if (bannerBlurRef.current) {
+      if (bannerFile) {
+        const bannerUrl = convertFileSrc(bannerFile.path);
+        bannerBlurRef.current.style.backgroundImage = `url("${bannerUrl}")`;
+        bannerBlurRef.current.style.opacity = "0.25";
+      } else {
+        bannerBlurRef.current.style.backgroundImage = "";
+        bannerBlurRef.current.style.opacity = "0";
+      }
+    }
+  }, [bannerFile, currentStep]);
+
+  useEffect(() => {
+    if (bgBlurRef.current) {
+      if (backgroundFile) {
+        const bgUrl = convertFileSrc(backgroundFile.path);
+        bgBlurRef.current.style.backgroundImage = `url("${bgUrl}")`;
+        bgBlurRef.current.style.opacity = "0.25";
+      } else {
+        bgBlurRef.current.style.backgroundImage = "";
+        bgBlurRef.current.style.opacity = "0";
+      }
+    }
+  }, [backgroundFile, currentStep]);
+
+  // Ambient blurry background for steps >= 3 (Metadata and Review & Create)
+  useEffect(() => {
+    if (wizardBlurRef.current) {
+      const activeFile = bannerFile || backgroundFile;
+      if (activeFile && currentStep >= 3) {
+        const url = convertFileSrc(activeFile.path);
+        wizardBlurRef.current.style.backgroundImage = `url("${url}")`;
+        wizardBlurRef.current.style.opacity = "0.12"; // strategic soft opacity to guarantee contrast
+      } else {
+        wizardBlurRef.current.style.backgroundImage = "";
+        wizardBlurRef.current.style.opacity = "0";
+      }
+    }
+  }, [bannerFile, backgroundFile, currentStep]);
+
+  // Reset play state if audio file changes
+  useEffect(() => {
+    setIsPlaying(false);
+    setCurrentTime(0);
+    setDuration(0);
+  }, [audioFile]);
+
+  const togglePlay = () => {
+    if (!audioRef.current) return;
+    if (isPlaying) {
+      audioRef.current.pause();
+      setIsPlaying(false);
+    } else {
+      audioRef.current.play().catch((err) => console.error("Playback error:", err));
+      setIsPlaying(true);
+    }
+  };
+
+  const handleSeek = (e: React.ChangeEvent<HTMLInputElement>) => {
+    const val = parseFloat(e.target.value);
+    setCurrentTime(val);
+    if (audioRef.current) {
+      audioRef.current.currentTime = val;
+    }
+  };
+
+  const handleTimeUpdate = () => {
+    if (audioRef.current) {
+      setCurrentTime(audioRef.current.currentTime);
+    }
+  };
+
+  const handleLoadedMetadata = () => {
+    if (audioRef.current) {
+      setDuration(audioRef.current.duration);
+    }
+  };
+
+  const formatTime = (secs: number) => {
+    if (isNaN(secs)) return "0:00";
+    const m = Math.floor(secs / 60);
+    const s = Math.floor(secs % 60);
+    return `${m}:${s < 10 ? "0" : ""}${s}`;
+  };
 
   // Step 3: Metadata States
   const [title, setTitle] = useState("");
@@ -376,7 +474,7 @@ export const CreateSongWizard: React.FC<CreateSongWizardProps> = ({ onNavigate }
                     </div>
 
                     <button className="btn-ghost-pill btn-sm-contained btn-action-margin" onClick={handleUseDefaultSongpack}>
-                      Back to Default Songpack Target
+                      Back to Default Songpack
                     </button>
                   </>
                 )}
@@ -388,7 +486,7 @@ export const CreateSongWizard: React.FC<CreateSongWizardProps> = ({ onNavigate }
                 </p>
                 <div className="button-group-row">
                   <button className="btn-ghost-pill btn-sm-contained" onClick={handleChooseCustomFolder}>
-                    Choose Custom Folder...
+                    Choose Custom Folder
                   </button>
                   <button className="btn-ghost-pill btn-sm-contained" onClick={() => onNavigate("SETTINGS")}>
                     Go to Settings
@@ -449,6 +547,11 @@ export const CreateSongWizard: React.FC<CreateSongWizardProps> = ({ onNavigate }
           </div>
         );
       case 2:
+        const audioUrl = audioFile ? convertFileSrc(audioFile.path) : "";
+        const bannerUrl = bannerFile ? convertFileSrc(bannerFile.path) : "";
+        const backgroundUrl = backgroundFile ? convertFileSrc(backgroundFile.path) : "";
+        const videoUrl = videoFile ? convertFileSrc(videoFile.path) : "";
+
         return (
           <div className="wizard-step-body">
             <h3 className="wizard-step-title">2. Song Assets</h3>
@@ -456,96 +559,184 @@ export const CreateSongWizard: React.FC<CreateSongWizardProps> = ({ onNavigate }
               Select media assets to bundle into your song folder. The audio file is mandatory.
             </p>
 
-            <div className="assets-selection-grid">
-              {/* Audio Block (Required) */}
-              <div className={`asset-row-box ${audioFile ? "has-asset" : "missing-asset"}`}>
-                <div className="asset-meta-info">
-                  <span className="asset-meta-title">Music Audio File (.mp3 / .ogg / .flac / .wav) <span className="req-star">*</span></span>
+            <div className="bento-grid-container">
+              {/* Card 1: Audio File (Required) - spans 2 columns */}
+              <div className={`bento-card bento-card-wide bento-audio-card ${audioFile ? "has-asset" : "missing-asset"}`}>
+                <div className="bento-card-content">
+                  <div className="bento-header">
+                    <span className="bento-title">Music Audio File <span className="req-star">*</span></span>
+                    <span className="bento-desc">Mandatory track (.mp3, .ogg, .flac, .wav)</span>
+                  </div>
+
                   {audioFile ? (
-                    <div className="selected-asset-details">
-                      <span className="asset-file-name">{audioFile.name}</span>
-                      <span className="asset-file-size">{formatBytes(audioFile.size)}</span>
+                    <div className="audio-player-container">
+                      <div className="audio-meta">
+                        <span className="audio-filename">{audioFile.name}</span>
+                        <span className="audio-filesize">{formatBytes(audioFile.size)}</span>
+                      </div>
+
+                      <div className="mini-player-ui">
+                        <button className="play-pause-btn" onClick={togglePlay}>
+                          {isPlaying ? <Pause size={12} fill="currentColor" /> : <Play size={12} fill="currentColor" />}
+                        </button>
+
+                        <div className="player-timeline-wrapper">
+                          <span className="time-text">{formatTime(currentTime)}</span>
+                          <input
+                            type="range"
+                            className="player-slider"
+                            min="0"
+                            max={duration || 100}
+                            value={currentTime}
+                            onChange={handleSeek}
+                          />
+                          <span className="time-text">{formatTime(duration)}</span>
+                        </div>
+                      </div>
+
+                      {/* Gemini voice spectrum / EQ waves animated indicator */}
+                      <div className={`gemini-waves-container ${isPlaying ? "animating" : ""}`}>
+                        <div className="gemini-wave wave1"></div>
+                        <div className="gemini-wave wave2"></div>
+                        <div className="gemini-wave wave3"></div>
+                        <div className="gemini-wave wave4"></div>
+                      </div>
+
+                      <div className="player-actions">
+                        <button className="btn-ghost-pill btn-sm-contained" onClick={() => handleSelectAsset("audio")}>
+                          Replace Audio
+                        </button>
+                      </div>
+
+                      {/* Hidden HTML audio element */}
+                      <audio
+                        ref={audioRef}
+                        src={audioUrl}
+                        onTimeUpdate={handleTimeUpdate}
+                        onLoadedMetadata={handleLoadedMetadata}
+                        onEnded={() => setIsPlaying(false)}
+                      />
                     </div>
                   ) : (
-                    <span className="no-asset-label">No audio selected (Required)</span>
+                    <div className="bento-upload-placeholder" onClick={() => handleSelectAsset("audio")}>
+                      <div className="upload-icon-wrapper">
+                        <Music size={18} />
+                      </div>
+                      <span>Select Audio File</span>
+                    </div>
                   )}
                 </div>
-                <button className="btn-ghost-pill btn-sm-contained" onClick={() => handleSelectAsset("audio")}>
-                  {audioFile ? "Replace Audio" : "Choose Audio"}
-                </button>
               </div>
 
-              {/* Banner Block (Optional) */}
-              <div className={`asset-row-box ${bannerFile ? "has-asset" : ""}`}>
-                <div className="asset-meta-info">
-                  <span className="asset-meta-title">Pack Banner Image (.png / .jpg / .jpeg)</span>
+              {/* Card 2: Banner Image (Optional) - spans 1 column */}
+              <div className={`bento-card bento-banner-card ${bannerFile ? "has-asset" : ""}`}>
+                <div className="bento-card-blur-bg" ref={bannerBlurRef}></div>
+                <div className="bento-card-content">
+                  <div className="bento-header">
+                    <span className="bento-title">Banner Image</span>
+                    <span className="bento-desc">Pack cover (.png, .jpg, .jpeg)</span>
+                  </div>
+
                   {bannerFile ? (
-                    <div className="selected-asset-details">
-                      <span className="asset-file-name">{bannerFile.name}</span>
-                      <span className="asset-file-size">{formatBytes(bannerFile.size)}</span>
+                    <div className="preview-container">
+                      <div className="preview-image-wrapper">
+                        <img src={bannerUrl} alt="Banner Preview" className="preview-img" />
+                      </div>
+                      <div className="preview-meta">
+                        <span className="preview-filename">{bannerFile.name}</span>
+                        <span className="preview-filesize">{formatBytes(bannerFile.size)}</span>
+                      </div>
+                      <div className="preview-actions">
+                        <button className="btn-ghost-pill btn-sm-contained" onClick={() => handleSelectAsset("banner")}>
+                          Replace
+                        </button>
+                        <button className="btn-ghost-pill btn-sm-contained btn-danger-text" onClick={() => handleClearAsset("banner")}>
+                          <Trash2 size={12} className="icon-mr" /> Clear
+                        </button>
+                      </div>
                     </div>
                   ) : (
-                    <span className="no-asset-label">Optional Banner</span>
-                  )}
-                </div>
-                <div className="button-group-row">
-                  <button className="btn-ghost-pill btn-sm-contained" onClick={() => handleSelectAsset("banner")}>
-                    {bannerFile ? "Replace" : "Choose Banner"}
-                  </button>
-                  {bannerFile && (
-                    <button className="btn-ghost-pill btn-sm-contained btn-danger-text" onClick={() => handleClearAsset("banner")}>
-                      Clear
-                    </button>
+                    <div className="bento-upload-placeholder" onClick={() => handleSelectAsset("banner")}>
+                      <div className="upload-icon-wrapper">
+                        <Image size={18} />
+                      </div>
+                      <span>Select Banner</span>
+                    </div>
                   )}
                 </div>
               </div>
 
-              {/* Background Block (Optional) */}
-              <div className={`asset-row-box ${backgroundFile ? "has-asset" : ""}`}>
-                <div className="asset-meta-info">
-                  <span className="asset-meta-title">Background Image (.png / .jpg / .jpeg)</span>
+              {/* Card 3: Background Image (Optional) - spans 1 column */}
+              <div className={`bento-card bento-bg-card ${backgroundFile ? "has-asset" : ""}`}>
+                <div className="bento-card-blur-bg" ref={bgBlurRef}></div>
+                <div className="bento-card-content">
+                  <div className="bento-header">
+                    <span className="bento-title">Background Image</span>
+                    <span className="bento-desc">Song backdrop (.png, .jpg, .jpeg)</span>
+                  </div>
+
                   {backgroundFile ? (
-                    <div className="selected-asset-details">
-                      <span className="asset-file-name">{backgroundFile.name}</span>
-                      <span className="asset-file-size">{formatBytes(backgroundFile.size)}</span>
+                    <div className="preview-container">
+                      <div className="preview-image-wrapper">
+                        <img src={backgroundUrl} alt="Background Preview" className="preview-img" />
+                      </div>
+                      <div className="preview-meta">
+                        <span className="preview-filename">{backgroundFile.name}</span>
+                        <span className="preview-filesize">{formatBytes(backgroundFile.size)}</span>
+                      </div>
+                      <div className="preview-actions">
+                        <button className="btn-ghost-pill btn-sm-contained" onClick={() => handleSelectAsset("background")}>
+                          Replace
+                        </button>
+                        <button className="btn-ghost-pill btn-sm-contained btn-danger-text" onClick={() => handleClearAsset("background")}>
+                          <Trash2 size={12} className="icon-mr" /> Clear
+                        </button>
+                      </div>
                     </div>
                   ) : (
-                    <span className="no-asset-label">Optional Background</span>
-                  )}
-                </div>
-                <div className="button-group-row">
-                  <button className="btn-ghost-pill btn-sm-contained" onClick={() => handleSelectAsset("background")}>
-                    {backgroundFile ? "Replace" : "Choose Background"}
-                  </button>
-                  {backgroundFile && (
-                    <button className="btn-ghost-pill btn-sm-contained btn-danger-text" onClick={() => handleClearAsset("background")}>
-                      Clear
-                    </button>
+                    <div className="bento-upload-placeholder" onClick={() => handleSelectAsset("background")}>
+                      <div className="upload-icon-wrapper">
+                        <Image size={18} />
+                      </div>
+                      <span>Select Background</span>
+                    </div>
                   )}
                 </div>
               </div>
 
-              {/* Video Block (Optional) */}
-              <div className={`asset-row-box ${videoFile ? "has-asset" : ""}`}>
-                <div className="asset-meta-info">
-                  <span className="asset-meta-title">Background Video Overlay (.mp4 / .mov / .avi / .mpg)</span>
+              {/* Card 4: Video Overlay (Optional) - spans 2 columns */}
+              <div className={`bento-card bento-card-wide bento-video-card ${videoFile ? "has-asset" : ""}`}>
+                <div className="bento-card-content">
+                  <div className="bento-header">
+                    <span className="bento-title">Background Video Overlay</span>
+                    <span className="bento-desc">Optional BGA video (.mp4, .mov, .avi, .mpg)</span>
+                  </div>
+
                   {videoFile ? (
-                    <div className="selected-asset-details">
-                      <span className="asset-file-name">{videoFile.name}</span>
-                      <span className="asset-file-size">{formatBytes(videoFile.size)}</span>
+                    <div className="preview-container">
+                      <div className="preview-video-wrapper">
+                        <video src={videoUrl} className="preview-video" autoPlay muted loop playsInline />
+                      </div>
+                      <div className="preview-meta">
+                        <span className="preview-filename">{videoFile.name}</span>
+                        <span className="preview-filesize">{formatBytes(videoFile.size)}</span>
+                      </div>
+                      <div className="preview-actions">
+                        <button className="btn-ghost-pill btn-sm-contained" onClick={() => handleSelectAsset("video")}>
+                          Replace
+                        </button>
+                        <button className="btn-ghost-pill btn-sm-contained btn-danger-text" onClick={() => handleClearAsset("video")}>
+                          <Trash2 size={12} className="icon-mr" /> Clear
+                        </button>
+                      </div>
                     </div>
                   ) : (
-                    <span className="no-asset-label">Optional Video Overlay</span>
-                  )}
-                </div>
-                <div className="button-group-row">
-                  <button className="btn-ghost-pill btn-sm-contained" onClick={() => handleSelectAsset("video")}>
-                    {videoFile ? "Replace" : "Choose Video"}
-                  </button>
-                  {videoFile && (
-                    <button className="btn-ghost-pill btn-sm-contained btn-danger-text" onClick={() => handleClearAsset("video")}>
-                      Clear
-                    </button>
+                    <div className="bento-upload-placeholder" onClick={() => handleSelectAsset("video")}>
+                      <div className="upload-icon-wrapper">
+                        <Video size={18} />
+                      </div>
+                      <span>Select Video</span>
+                    </div>
                   )}
                 </div>
               </div>
@@ -561,102 +752,104 @@ export const CreateSongWizard: React.FC<CreateSongWizardProps> = ({ onNavigate }
             </p>
 
             <div className="metadata-input-form">
-              <div className="form-group-contained">
-                <label className="form-label-dark">Song Title <span className="req-star">*</span></label>
-                <input
-                  type="text"
-                  className="input-contained"
-                  value={title}
-                  onChange={(e) => setTitle(e.target.value)}
-                  placeholder="e.g. Poseidon"
-                />
-              </div>
+              <div className="metadata-form-grid">
+                {/* Left Column: Creative Fields */}
+                <div className="metadata-form-column">
+                  <div className="form-group-contained">
+                    <label className="form-label-dark">Song Title <span className="req-star">*</span></label>
+                    <input
+                      type="text"
+                      className="input-contained"
+                      value={title}
+                      onChange={(e) => setTitle(e.target.value)}
+                      placeholder="e.g. Poseidon"
+                    />
+                  </div>
 
-              <div className="form-group-contained">
-                <label className="form-label-dark">Artist / Group</label>
-                <input
-                  type="text"
-                  className="input-contained"
-                  value={artist}
-                  onChange={(e) => setArtist(e.target.value)}
-                  placeholder="e.g. Banya"
-                />
-              </div>
+                  <div className="form-group-contained">
+                    <label className="form-label-dark">Artist / Group</label>
+                    <input
+                      type="text"
+                      className="input-contained"
+                      value={artist}
+                      onChange={(e) => setArtist(e.target.value)}
+                      placeholder="e.g. Banya"
+                    />
+                  </div>
 
-              <div className="metadata-form-row">
-                <div className="form-group-contained">
-                  <label className="form-label-dark">Genre</label>
-                  <input
-                    type="text"
-                    className="input-contained"
-                    value={genre}
-                    onChange={(e) => setGenre(e.target.value)}
-                    placeholder="e.g. Original"
-                  />
+                  <div className="form-group-contained">
+                    <label className="form-label-dark">Genre</label>
+                    <input
+                      type="text"
+                      className="input-contained"
+                      value={genre}
+                      onChange={(e) => setGenre(e.target.value)}
+                      placeholder="e.g. Original"
+                    />
+                  </div>
+
+                  <div className="form-group-contained">
+                    <label className="form-label-dark">Credit / Author</label>
+                    <input
+                      type="text"
+                      className="input-contained"
+                      value={credit}
+                      onChange={(e) => setCredit(e.target.value)}
+                      placeholder="Stepmaker Credit"
+                    />
+                  </div>
                 </div>
 
-                <div className="form-group-contained">
-                  <label className="form-label-dark">Credit / Author</label>
-                  <input
-                    type="text"
-                    className="input-contained"
-                    value={credit}
-                    onChange={(e) => setCredit(e.target.value)}
-                    placeholder="Stepmaker Credit"
-                  />
-                </div>
-              </div>
+                {/* Right Column: System / Timing Fields */}
+                <div className="metadata-form-column">
+                  <div className="form-group-contained">
+                    <label className="form-label-dark">Song Type</label>
+                    <select
+                      className="input-contained"
+                      value={songType}
+                      onChange={(e) => setSongType(e.target.value)}
+                    >
+                      <option value="ARCADE">ARCADE (Standard length)</option>
+                      <option value="SHORTCUT">SHORTCUT (Intro/Cut version)</option>
+                      <option value="REMIX">REMIX (Longer mashup)</option>
+                      <option value="FULLSONG">FULLSONG (Full track)</option>
+                    </select>
+                  </div>
 
-              <div className="metadata-form-row">
-                <div className="form-group-contained">
-                  <label className="form-label-dark">Song Type</label>
-                  <select
-                    className="input-contained"
-                    value={songType}
-                    onChange={(e) => setSongType(e.target.value)}
-                  >
-                    <option value="ARCADE">ARCADE (Standard length)</option>
-                    <option value="SHORTCUT">SHORTCUT (Intro/Cut version)</option>
-                    <option value="REMIX">REMIX (Longer mashup)</option>
-                    <option value="FULLSONG">FULLSONG (Full track)</option>
-                  </select>
-                </div>
+                  <div className="form-group-contained">
+                    <label className="form-label-dark">Display BPM (Interface value)</label>
+                    <input
+                      type="text"
+                      className="input-contained"
+                      value={displayBpm}
+                      onChange={(e) => setDisplayBpm(e.target.value)}
+                      placeholder="e.g. 120.000 or *"
+                    />
+                  </div>
 
-                <div className="form-group-contained">
-                  <label className="form-label-dark">Display BPM (Interface value)</label>
-                  <input
-                    type="text"
-                    className="input-contained"
-                    value={displayBpm}
-                    onChange={(e) => setDisplayBpm(e.target.value)}
-                    placeholder="e.g. 120.000 or *"
-                  />
-                </div>
-              </div>
+                  <div className="form-group-contained">
+                    <label className="form-label-dark">Timing BPM (Default tempo)</label>
+                    <input
+                      type="number"
+                      step="0.001"
+                      className="input-contained"
+                      value={timingBpm}
+                      onChange={(e) => setTimingBpm(e.target.value)}
+                      placeholder="e.g. 120.000"
+                    />
+                  </div>
 
-              <div className="metadata-form-row">
-                <div className="form-group-contained">
-                  <label className="form-label-dark">Timing BPM (Default tempo)</label>
-                  <input
-                    type="number"
-                    step="0.001"
-                    className="input-contained"
-                    value={timingBpm}
-                    onChange={(e) => setTimingBpm(e.target.value)}
-                    placeholder="e.g. 120.000"
-                  />
-                </div>
-
-                <div className="form-group-contained">
-                  <label className="form-label-dark">Global Offset (Seconds)</label>
-                  <input
-                    type="number"
-                    step="0.000001"
-                    className="input-contained"
-                    value={offset}
-                    onChange={(e) => setOffset(e.target.value)}
-                    placeholder="e.g. 0.000000"
-                  />
+                  <div className="form-group-contained">
+                    <label className="form-label-dark">Global Offset (Seconds)</label>
+                    <input
+                      type="number"
+                      step="0.000001"
+                      className="input-contained"
+                      value={offset}
+                      onChange={(e) => setOffset(e.target.value)}
+                      placeholder="e.g. 0.000000"
+                    />
+                  </div>
                 </div>
               </div>
             </div>
@@ -749,6 +942,7 @@ export const CreateSongWizard: React.FC<CreateSongWizardProps> = ({ onNavigate }
       </div>
 
       <div className="wizard-main">
+        <div className="wizard-blur-bg" ref={wizardBlurRef}></div>
         <div className="wizard-header">
           <span className="wizard-progress-info">
             Step {currentStep} of {WIZARD_STEPS.length}
@@ -771,28 +965,21 @@ export const CreateSongWizard: React.FC<CreateSongWizardProps> = ({ onNavigate }
           {renderStepContent()}
         </div>
 
-        <div className="wizard-footer">
-          <button
-            className="btn-ghost-pill"
-            onClick={currentStep === 1 ? () => onNavigate("START_MENU") : handleBack}
-            disabled={isSubmitting}
-          >
-            <ArrowLeft className="icon-mr" size={16} />
-            {currentStep === 1 ? "Exit Wizard" : "Back"}
-          </button>
-
-          {currentStep === WIZARD_STEPS.length ? (
-            <button className="btn-primary-pill" onClick={handleCreateProject} disabled={isSubmitting}>
-              {isSubmitting ? "Creating..." : "Create Song Project"}
+        <WizardFooter
+          onBack={currentStep === 1 ? () => onNavigate("START_MENU") : handleBack}
+          backLabel={currentStep === 1 ? "Exit Wizard" : "Back"}
+          onNext={currentStep === WIZARD_STEPS.length ? handleCreateProject : handleNext}
+          nextLabel={currentStep === WIZARD_STEPS.length ? "Create Song Project" : "Next"}
+          isNextDisabled={currentStep === 1 && !isFolderReady}
+          isSubmitting={isSubmitting}
+          nextIcon={
+            currentStep === WIZARD_STEPS.length ? (
               <Save className="icon-ml" size={16} />
-            </button>
-          ) : (
-            <button className="btn-primary-pill" onClick={handleNext} disabled={currentStep === 1 && !isFolderReady}>
-              Next
+            ) : (
               <ArrowRight className="icon-ml" size={16} />
-            </button>
-          )}
-        </div>
+            )
+          }
+        />
       </div>
     </div>
   );

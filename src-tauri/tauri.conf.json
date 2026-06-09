@@ -21,7 +21,11 @@
       }
     ],
     "security": {
-      "csp": "default-src 'self'; connect-src 'self' https://generativelanguage.googleapis.com"
+      "csp": "default-src 'self'; connect-src 'self' https://generativelanguage.googleapis.com; img-src 'self' data: asset: https://asset.localhost http://asset.localhost; media-src 'self' asset: https://asset.localhost http://asset.localhost; style-src 'self' 'unsafe-inline';",
+      "assetProtocol": {
+        "enable": true,
+        "scope": ["**/*"]
+      }
     }
   },
   "bundle": {

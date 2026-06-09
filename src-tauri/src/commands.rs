@@ -671,8 +671,8 @@ pub async fn create_song_project(payload: CreateSongPayload) -> Result<SongDetai
     }
 
     // Validate BPMs
-    if payload.timing_bpm <= 0.0 {
-        return Err("Timing BPM must be a positive number.".to_string());
+    if payload.timing_bpm < 10.0 || payload.timing_bpm > 1000.0 {
+        return Err("Timing BPM must be a reasonable number between 10.0 and 1000.0.".to_string());
     }
 
     // Validate Song Type
@@ -2748,6 +2748,62 @@ mod tests {
 
         let _ = std::fs::remove_file(dummy_audio);
         let _ = std::fs::remove_file(invalid_banner);
+    }
+
+    #[tokio::test]
+    async fn test_create_song_project_bpm_range_validation() {
+        let temp_dir = std::env::temp_dir();
+        let target_folder = temp_dir.join("test_create_song_bpm_dir");
+        let _ = std::fs::remove_dir_all(&target_folder);
+
+        let dummy_audio = temp_dir.join("bpm_audio.mp3");
+        std::fs::write(&dummy_audio, b"audio").unwrap();
+
+        // 1. BPM too low (9.9)
+        let payload_low = CreateSongPayload {
+            target_folder_path: target_folder.to_string_lossy().to_string(),
+            title: "Low BPM".to_string(),
+            artist: "Artist".to_string(),
+            genre: "Genre".to_string(),
+            credit: "Credit".to_string(),
+            song_type: "ARCADE".to_string(),
+            display_bpm: "9.9".to_string(),
+            timing_bpm: 9.9,
+            offset: 0.0,
+            audio_path: dummy_audio.to_string_lossy().to_string(),
+            banner_path: None,
+            background_path: None,
+            video_path: None,
+        };
+        let result_low = create_song_project(payload_low).await;
+        assert!(result_low.is_err());
+        assert!(result_low
+            .unwrap_err()
+            .contains("must be a reasonable number between 10.0 and 1000.0"));
+
+        // 2. BPM too high (1000.1)
+        let payload_high = CreateSongPayload {
+            target_folder_path: target_folder.to_string_lossy().to_string(),
+            title: "High BPM".to_string(),
+            artist: "Artist".to_string(),
+            genre: "Genre".to_string(),
+            credit: "Credit".to_string(),
+            song_type: "ARCADE".to_string(),
+            display_bpm: "1000.1".to_string(),
+            timing_bpm: 1000.1,
+            offset: 0.0,
+            audio_path: dummy_audio.to_string_lossy().to_string(),
+            banner_path: None,
+            background_path: None,
+            video_path: None,
+        };
+        let result_high = create_song_project(payload_high).await;
+        assert!(result_high.is_err());
+        assert!(result_high
+            .unwrap_err()
+            .contains("must be a reasonable number between 10.0 and 1000.0"));
+
+        let _ = std::fs::remove_file(dummy_audio);
     }
 
     #[test]
