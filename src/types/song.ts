@@ -6,6 +6,20 @@ export interface IChartDetails {
   credit: string;
 }
 
+export interface IAssetStatus {
+  key: string;
+  status_type: "DeclaredAndFound" | "DeclaredButMissing" | "FoundButNotDeclared" | "NotDeclared";
+  file_name: string | null;
+  file_path: string | null;
+}
+
+export interface ISongAssetsStatus {
+  audio: IAssetStatus;
+  banner: IAssetStatus;
+  background: IAssetStatus;
+  video: IAssetStatus;
+}
+
 export interface ISongDetails {
   song_id: string;
   song_name: string;
@@ -18,6 +32,7 @@ export interface ISongDetails {
   background_path: string | null;
   video_path: string | null;
   charts: IChartDetails[];
+  asset_statuses: ISongAssetsStatus;
 }
 
 export type PlayMode = "Single" | "Double";

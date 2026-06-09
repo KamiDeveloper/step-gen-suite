@@ -5,7 +5,6 @@ use std::path::Path;
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum GeminiWriteMode {
     PreviewOnly,
-    AppendIfValid,
 }
 
 #[derive(Debug, Clone)]

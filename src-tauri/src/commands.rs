@@ -18,6 +18,22 @@ pub struct ChartDetails {
     pub credit: String,
 }
 
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct AssetStatus {
+    pub key: String,         // "audio", "banner", "background", "video"
+    pub status_type: String, // "DeclaredAndFound", "DeclaredButMissing", "FoundButNotDeclared", "NotDeclared"
+    pub file_name: Option<String>,
+    pub file_path: Option<String>,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct SongAssetsStatus {
+    pub audio: AssetStatus,
+    pub banner: AssetStatus,
+    pub background: AssetStatus,
+    pub video: AssetStatus,
+}
+
 #[derive(Debug, Serialize, Deserialize)]
 pub struct SongDetails {
     pub song_id: String,
@@ -31,6 +47,24 @@ pub struct SongDetails {
     pub background_path: Option<String>,
     pub video_path: Option<String>,
     pub charts: Vec<ChartDetails>,
+    pub asset_statuses: SongAssetsStatus,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct CreateSongPayload {
+    pub target_folder_path: String,
+    pub title: String,
+    pub artist: String,
+    pub genre: String,
+    pub credit: String,
+    pub song_type: String,
+    pub display_bpm: String,
+    pub timing_bpm: f64,
+    pub offset: f64,
+    pub audio_path: String,
+    pub banner_path: Option<String>,
+    pub background_path: Option<String>,
+    pub video_path: Option<String>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -59,6 +93,15 @@ pub fn get_file_fingerprint(path: String) -> Result<FileFingerprint, String> {
             "El archivo especificado no existe o no es un archivo válido: {}",
             path
         ));
+    }
+
+    if file_path
+        .extension()
+        .map_or(true, |ext| !ext.eq_ignore_ascii_case("ssc"))
+    {
+        return Err(
+            "Solo se permite calcular el fingerprint de archivos con extensión .ssc".to_string(),
+        );
     }
 
     let metadata = fs::metadata(file_path)
@@ -271,6 +314,568 @@ pub fn append_chart_to_ssc_atomic(
     })
 }
 
+use tauri::{AppHandle, Runtime};
+
+pub fn sanitize_name(name: &str) -> Result<String, String> {
+    let trimmed = name.trim();
+    if trimmed.is_empty() {
+        return Err("Folder name cannot be empty.".to_string());
+    }
+
+    // Windows prohibited characters
+    let prohibited = ['<', '>', ':', '"', '/', '\\', '|', '?', '*'];
+    if trimmed.chars().any(|c| prohibited.contains(&c)) {
+        return Err("Folder name contains invalid characters: < > : \" / \\ | ? *".to_string());
+    }
+
+    // Control characters (0..31)
+    if trimmed.chars().any(|c| c.is_control()) {
+        return Err("Folder name contains control characters.".to_string());
+    }
+
+    // Windows reserved names
+    let reserved = [
+        "CON", "PRN", "AUX", "NUL", "COM1", "COM2", "COM3", "COM4", "COM5", "COM6", "COM7", "COM8",
+        "COM9", "LPT1", "LPT2", "LPT3", "LPT4", "LPT5", "LPT6", "LPT7", "LPT8", "LPT9",
+    ];
+    let upper = trimmed.to_uppercase();
+    if reserved.contains(&upper.as_str()) {
+        return Err(format!(
+            "Folder name '{}' is a Windows reserved name.",
+            trimmed
+        ));
+    }
+
+    // Trailing dot or space
+    if trimmed.ends_with('.') || trimmed.ends_with(' ') {
+        return Err("Folder name cannot end with a dot or space.".to_string());
+    }
+
+    Ok(trimmed.to_string())
+}
+
+pub fn determine_asset_status(
+    folder: &Path,
+    declared_name: Option<&str>,
+    kind: &str,
+    files_in_folder: &[(String, PathBuf)],
+) -> AssetStatus {
+    let declared_val = declared_name.filter(|v| !v.trim().is_empty());
+
+    if let Some(val) = declared_val {
+        let resolved_path = folder.join(val);
+        if resolved_path.exists() && resolved_path.is_file() {
+            AssetStatus {
+                key: kind.to_string(),
+                status_type: "DeclaredAndFound".to_string(),
+                file_name: Some(val.to_string()),
+                file_path: Some(resolved_path.to_string_lossy().to_string()),
+            }
+        } else {
+            AssetStatus {
+                key: kind.to_string(),
+                status_type: "DeclaredButMissing".to_string(),
+                file_name: Some(val.to_string()),
+                file_path: None,
+            }
+        }
+    } else {
+        // Look for a candidate
+        let candidate = match kind {
+            "audio" => files_in_folder.iter().find(|(name, _)| {
+                name.ends_with(".mp3")
+                    || name.ends_with(".ogg")
+                    || name.ends_with(".flac")
+                    || name.ends_with(".wav")
+            }),
+            "banner" => files_in_folder.iter().find(|(name, _)| {
+                (name.contains("banner")
+                    || name.ends_with("bn.png")
+                    || name.ends_with("bn.jpg")
+                    || name.ends_with("bn.jpeg"))
+                    && (name.ends_with(".png") || name.ends_with(".jpg") || name.ends_with(".jpeg"))
+            }),
+            "background" => files_in_folder.iter().find(|(name, _)| {
+                (name.contains("bg") || name.contains("background") || name.contains("back"))
+                    && (name.ends_with(".png") || name.ends_with(".jpg") || name.ends_with(".jpeg"))
+            }),
+            "video" => files_in_folder.iter().find(|(name, _)| {
+                name.ends_with(".mp4")
+                    || name.ends_with(".mov")
+                    || name.ends_with(".avi")
+                    || name.ends_with(".mpg")
+                    || name.ends_with(".mpeg")
+            }),
+            _ => None,
+        };
+
+        if let Some((name, path)) = candidate {
+            AssetStatus {
+                key: kind.to_string(),
+                status_type: "FoundButNotDeclared".to_string(),
+                file_name: Some(name.clone()),
+                file_path: Some(path.to_string_lossy().to_string()),
+            }
+        } else {
+            AssetStatus {
+                key: kind.to_string(),
+                status_type: "NotDeclared".to_string(),
+                file_name: None,
+                file_path: None,
+            }
+        }
+    }
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct FileMetadata {
+    pub name: String,
+    pub extension: String,
+    pub size: u64,
+}
+
+#[tauri::command]
+pub fn get_file_metadata(path: String) -> Result<FileMetadata, String> {
+    let p = Path::new(&path);
+    if !p.exists() || !p.is_file() {
+        return Err("File does not exist or is not a file.".to_string());
+    }
+    let name = p
+        .file_name()
+        .and_then(|n| n.to_str())
+        .ok_or_else(|| "Failed to get file name.".to_string())?
+        .to_string();
+    let extension = p
+        .extension()
+        .and_then(|e| e.to_str())
+        .unwrap_or("")
+        .to_string();
+    let size = fs::metadata(p)
+        .map(|m| m.len())
+        .map_err(|e| format!("Failed to read file size: {}", e))?;
+
+    Ok(FileMetadata {
+        name,
+        extension,
+        size,
+    })
+}
+
+#[tauri::command]
+pub fn sanitize_folder_name(name: String) -> Result<String, String> {
+    sanitize_name(&name)
+}
+
+#[tauri::command]
+pub fn check_destination_folder(path: String) -> Result<String, String> {
+    let p = Path::new(&path);
+    if !p.exists() {
+        return Ok("NotExist".to_string());
+    }
+    if !p.is_dir() {
+        return Err("The specified path exists but is not a directory.".to_string());
+    }
+    // Check if empty
+    let is_empty = match fs::read_dir(p) {
+        Ok(mut entries) => entries.next().is_none(),
+        Err(_) => true,
+    };
+    if is_empty {
+        Ok("ExistEmpty".to_string())
+    } else {
+        // Check if has ssc
+        let has_ssc = fs::read_dir(p).map_or(false, |entries| {
+            entries.flatten().any(|e| {
+                e.path().is_file()
+                    && e.path()
+                        .extension()
+                        .map_or(false, |ext| ext.eq_ignore_ascii_case("ssc"))
+            })
+        });
+        if has_ssc {
+            Ok("ExistWithSsc".to_string())
+        } else {
+            Ok("ExistNotEmpty".to_string())
+        }
+    }
+}
+
+#[tauri::command]
+pub fn create_destination_folder(path: String) -> Result<(), String> {
+    let p = Path::new(&path);
+    if !p.exists() {
+        fs::create_dir_all(p).map_err(|e| format!("Failed to create folder: {}", e))?;
+    }
+    Ok(())
+}
+
+#[tauri::command]
+pub async fn select_song_asset_file<R: Runtime>(
+    app_handle: AppHandle<R>,
+    kind: String,
+) -> Result<Option<String>, String> {
+    use tauri_plugin_dialog::DialogExt;
+    let mut picker = app_handle.dialog().file();
+
+    picker = match kind.as_str() {
+        "audio" => picker.add_filter("Audio Files", &["mp3", "ogg", "flac", "wav"]),
+        "banner" | "background" => picker.add_filter("Image Files", &["png", "jpg", "jpeg"]),
+        "video" => picker.add_filter("Video Files", &["mp4", "mov", "avi", "mpg", "mpeg"]),
+        _ => return Err(format!("Unsupported asset kind: {}", kind)),
+    };
+
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    picker.pick_file(move |file| {
+        if let Some(f) = file {
+            let path_result = f.into_path().map(|p| p.to_string_lossy().to_string()).ok();
+            let _ = tx.send(path_result);
+        } else {
+            let _ = tx.send(None);
+        }
+    });
+    rx.await.map_err(|e| format!("Failed to pick file: {}", e))
+}
+
+#[tauri::command]
+pub async fn select_song_destination_folder<R: Runtime>(
+    app_handle: AppHandle<R>,
+) -> Result<Option<String>, String> {
+    use tauri_plugin_dialog::DialogExt;
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    app_handle.dialog().file().pick_folder(move |folder| {
+        if let Some(f) = folder {
+            let path_result = f.into_path().map(|p| p.to_string_lossy().to_string()).ok();
+            let _ = tx.send(path_result);
+        } else {
+            let _ = tx.send(None);
+        }
+    });
+    rx.await
+        .map_err(|e| format!("Failed to pick folder: {}", e))
+}
+
+#[tauri::command]
+pub async fn create_song_project(payload: CreateSongPayload) -> Result<SongDetails, String> {
+    let folder_path = Path::new(&payload.target_folder_path);
+
+    // Validate folder name sanitization
+    let folder_name = folder_path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .ok_or_else(|| "Invalid target folder path".to_string())?;
+
+    let _sanitized_name = sanitize_name(folder_name)?;
+
+    // Validate audio file
+    let audio_src = Path::new(&payload.audio_path);
+    if !audio_src.exists() || !audio_src.is_file() {
+        return Err("Audio file does not exist or is not a file.".to_string());
+    }
+    let audio_ext = audio_src
+        .extension()
+        .and_then(|ext| ext.to_str())
+        .ok_or_else(|| "Audio file has no extension.".to_string())?
+        .to_lowercase();
+    if !["mp3", "ogg", "flac", "wav"].contains(&audio_ext.as_str()) {
+        return Err("Unsupported audio format. Allowed: .mp3, .ogg, .flac, .wav".to_string());
+    }
+
+    // Validate BPMs
+    if payload.timing_bpm <= 0.0 {
+        return Err("Timing BPM must be a positive number.".to_string());
+    }
+
+    // Validate Song Type
+    if !["ARCADE", "SHORTCUT", "REMIX", "FULLSONG"].contains(&payload.song_type.as_str()) {
+        return Err(
+            "Unsupported song type. Allowed: ARCADE, SHORTCUT, REMIX, FULLSONG".to_string(),
+        );
+    }
+
+    // Check directory existence and overwrite rules
+    if folder_path.exists() {
+        let has_ssc = if folder_path.is_dir() {
+            fs::read_dir(folder_path).map_or(false, |entries| {
+                entries.flatten().any(|e| {
+                    e.path().is_file()
+                        && e.path()
+                            .extension()
+                            .map_or(false, |ext| ext.eq_ignore_ascii_case("ssc"))
+                })
+            })
+        } else {
+            false
+        };
+        if has_ssc {
+            return Err(
+                "A .ssc file already exists in the destination folder. Overwrite blocked."
+                    .to_string(),
+            );
+        }
+    } else {
+        fs::create_dir_all(folder_path)
+            .map_err(|e| format!("Failed to create destination folder: {}", e))?;
+    }
+
+    // Copy files safely
+    let copy_safe = |src_path: &Path, dest_path: &Path| -> Result<(), String> {
+        if src_path == dest_path {
+            return Ok(());
+        }
+        fs::copy(src_path, dest_path).map(|_| ()).map_err(|e| {
+            format!(
+                "Failed to copy file from {:?} to {:?}: {}",
+                src_path, dest_path, e
+            )
+        })
+    };
+
+    let audio_dest = folder_path.join(format!("audio.{}", audio_ext));
+    copy_safe(audio_src, &audio_dest)?;
+
+    let banner_dest = if let Some(ref bp) = payload.banner_path {
+        let bp_path = Path::new(bp);
+        if bp_path.exists() && bp_path.is_file() {
+            let ext = bp_path
+                .extension()
+                .and_then(|e| e.to_str())
+                .unwrap_or("png")
+                .to_lowercase();
+            let dest = folder_path.join(format!("banner.{}", ext));
+            copy_safe(bp_path, &dest)?;
+            Some(dest)
+        } else {
+            None
+        }
+    } else {
+        None
+    };
+
+    let background_dest = if let Some(ref bgp) = payload.background_path {
+        let bgp_path = Path::new(bgp);
+        if bgp_path.exists() && bgp_path.is_file() {
+            let ext = bgp_path
+                .extension()
+                .and_then(|e| e.to_str())
+                .unwrap_or("png")
+                .to_lowercase();
+            let dest = folder_path.join(format!("background.{}", ext));
+            copy_safe(bgp_path, &dest)?;
+            Some(dest)
+        } else {
+            None
+        }
+    } else {
+        None
+    };
+
+    let video_dest = if let Some(ref vp) = payload.video_path {
+        let vp_path = Path::new(vp);
+        if vp_path.exists() && vp_path.is_file() {
+            let ext = vp_path
+                .extension()
+                .and_then(|e| e.to_str())
+                .unwrap_or("mp4")
+                .to_lowercase();
+            let dest = folder_path.join(format!("video.{}", ext));
+            copy_safe(vp_path, &dest)?;
+            Some(dest)
+        } else {
+            None
+        }
+    } else {
+        None
+    };
+
+    // Create base SSC document
+    let audio_filename = audio_dest
+        .file_name()
+        .unwrap()
+        .to_string_lossy()
+        .to_string();
+    let banner_filename = banner_dest.map(|p| p.file_name().unwrap().to_string_lossy().to_string());
+    let background_filename =
+        background_dest.map(|p| p.file_name().unwrap().to_string_lossy().to_string());
+    let video_filename = video_dest.map(|p| p.file_name().unwrap().to_string_lossy().to_string());
+
+    let ssc_name = format!("{}.ssc", folder_name);
+    let ssc_path = folder_path.join(&ssc_name);
+
+    let doc = SscDocument {
+        global_tags: vec![
+            SscTag {
+                key: Some("VERSION".to_string()),
+                value: "0.81".to_string(),
+                is_comment: false,
+            },
+            SscTag {
+                key: Some("TITLE".to_string()),
+                value: payload.title.clone(),
+                is_comment: false,
+            },
+            SscTag {
+                key: Some("SUBTITLE".to_string()),
+                value: "".to_string(),
+                is_comment: false,
+            },
+            SscTag {
+                key: Some("ARTIST".to_string()),
+                value: payload.artist.clone(),
+                is_comment: false,
+            },
+            SscTag {
+                key: Some("TITLETRANSLIT".to_string()),
+                value: "".to_string(),
+                is_comment: false,
+            },
+            SscTag {
+                key: Some("SUBTITLETRANSLIT".to_string()),
+                value: "".to_string(),
+                is_comment: false,
+            },
+            SscTag {
+                key: Some("ARTISTTRANSLIT".to_string()),
+                value: "".to_string(),
+                is_comment: false,
+            },
+            SscTag {
+                key: Some("GENRE".to_string()),
+                value: payload.genre.clone(),
+                is_comment: false,
+            },
+            SscTag {
+                key: Some("ORIGIN".to_string()),
+                value: "AI_SUITE".to_string(),
+                is_comment: false,
+            },
+            SscTag {
+                key: Some("CREDIT".to_string()),
+                value: payload.credit.clone(),
+                is_comment: false,
+            },
+            SscTag {
+                key: Some("BANNER".to_string()),
+                value: banner_filename.unwrap_or_default(),
+                is_comment: false,
+            },
+            SscTag {
+                key: Some("BACKGROUND".to_string()),
+                value: background_filename.unwrap_or_default(),
+                is_comment: false,
+            },
+            SscTag {
+                key: Some("PREVIEWVID".to_string()),
+                value: video_filename.unwrap_or_default(),
+                is_comment: false,
+            },
+            SscTag {
+                key: Some("CDTITLE".to_string()),
+                value: "".to_string(),
+                is_comment: false,
+            },
+            SscTag {
+                key: Some("MUSIC".to_string()),
+                value: audio_filename,
+                is_comment: false,
+            },
+            SscTag {
+                key: Some("OFFSET".to_string()),
+                value: format!("{:.6}", payload.offset),
+                is_comment: false,
+            },
+            SscTag {
+                key: Some("SAMPLESTART".to_string()),
+                value: "30.000000".to_string(),
+                is_comment: false,
+            },
+            SscTag {
+                key: Some("SAMPLELENGTH".to_string()),
+                value: "10.000000".to_string(),
+                is_comment: false,
+            },
+            SscTag {
+                key: Some("SELECTABLE".to_string()),
+                value: "YES".to_string(),
+                is_comment: false,
+            },
+            SscTag {
+                key: Some("SONGTYPE".to_string()),
+                value: payload.song_type.clone(),
+                is_comment: false,
+            },
+            SscTag {
+                key: Some("SONGCATEGORY".to_string()),
+                value: "WORLD MUSIC".to_string(),
+                is_comment: false,
+            },
+            SscTag {
+                key: Some("VOLUME".to_string()),
+                value: "100".to_string(),
+                is_comment: false,
+            },
+            SscTag {
+                key: Some("DISPLAYBPM".to_string()),
+                value: payload.display_bpm.clone(),
+                is_comment: false,
+            },
+            SscTag {
+                key: Some("BPMS".to_string()),
+                value: format!("0.000={:.3}", payload.timing_bpm),
+                is_comment: false,
+            },
+            SscTag {
+                key: Some("TIMESIGNATURES".to_string()),
+                value: "0.000=4=4".to_string(),
+                is_comment: false,
+            },
+            SscTag {
+                key: Some("TICKCOUNTS".to_string()),
+                value: "0.000=4".to_string(),
+                is_comment: false,
+            },
+            SscTag {
+                key: Some("COMBOS".to_string()),
+                value: "0.000=1".to_string(),
+                is_comment: false,
+            },
+            SscTag {
+                key: Some("SPEEDS".to_string()),
+                value: "0.000=1.000=0.000=0".to_string(),
+                is_comment: false,
+            },
+            SscTag {
+                key: Some("SCROLLS".to_string()),
+                value: "0.000=1.000".to_string(),
+                is_comment: false,
+            },
+            SscTag {
+                key: Some("LABELS".to_string()),
+                value: "0.000=Song Start".to_string(),
+                is_comment: false,
+            },
+        ],
+        charts: vec![],
+        trailing_comments: vec![],
+    };
+
+    let temp_ssc_path = ssc_path.with_extension("ssc.tmp");
+    let serialized_doc = doc.serialize_to_string();
+    {
+        let mut temp_file = fs::File::create(&temp_ssc_path)
+            .map_err(|e| format!("Error creating temporary SSC file: {}", e))?;
+        temp_file
+            .write_all(serialized_doc.as_bytes())
+            .map_err(|e| format!("Error writing temporary SSC file: {}", e))?;
+        temp_file
+            .sync_all()
+            .map_err(|e| format!("Error syncing temporary SSC file: {}", e))?;
+    }
+    fs::rename(&temp_ssc_path, &ssc_path)
+        .map_err(|e| format!("Error replacing SSC file: {}", e))?;
+
+    import_song_folder(payload.target_folder_path)
+}
+
 #[tauri::command]
 pub fn import_song_folder(folder_path: String) -> Result<SongDetails, String> {
     let folder = Path::new(&folder_path);
@@ -344,39 +949,40 @@ pub fn import_song_folder(folder_path: String) -> Result<SongDetails, String> {
         }
     }
 
+    // Scan physical files in folder for candidate matching
+    let mut files_in_folder: Vec<(String, PathBuf)> = Vec::new();
+    if let Ok(entries) = fs::read_dir(folder) {
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_file() {
+                if let Some(name) = path.file_name().and_then(|n| n.to_str()) {
+                    files_in_folder.push((name.to_lowercase(), path));
+                }
+            }
+        }
+    }
+
+    let audio_status =
+        determine_asset_status(folder, music_file.as_deref(), "audio", &files_in_folder);
+    let banner_status =
+        determine_asset_status(folder, banner_file.as_deref(), "banner", &files_in_folder);
+    let background_status =
+        determine_asset_status(folder, bg_file.as_deref(), "background", &files_in_folder);
+    let video_status =
+        determine_asset_status(folder, video_file.as_deref(), "video", &files_in_folder);
+
+    let asset_statuses = SongAssetsStatus {
+        audio: audio_status,
+        banner: banner_status,
+        background: background_status,
+        video: video_status,
+    };
+
     // Resolve file paths
-    let audio_path = music_file.and_then(|f| {
-        let p = folder.join(&f);
-        if p.exists() {
-            Some(p.to_string_lossy().to_string())
-        } else {
-            None
-        }
-    });
-    let banner_path = banner_file.and_then(|f| {
-        let p = folder.join(&f);
-        if p.exists() {
-            Some(p.to_string_lossy().to_string())
-        } else {
-            None
-        }
-    });
-    let background_path = bg_file.and_then(|f| {
-        let p = folder.join(&f);
-        if p.exists() {
-            Some(p.to_string_lossy().to_string())
-        } else {
-            None
-        }
-    });
-    let video_path = video_file.and_then(|f| {
-        let p = folder.join(&f);
-        if p.exists() {
-            Some(p.to_string_lossy().to_string())
-        } else {
-            None
-        }
-    });
+    let audio_path = asset_statuses.audio.file_path.clone();
+    let banner_path = asset_statuses.banner.file_path.clone();
+    let background_path = asset_statuses.background.file_path.clone();
+    let video_path = asset_statuses.video.file_path.clone();
 
     // Extract charts
     let charts = doc
@@ -434,6 +1040,7 @@ pub fn import_song_folder(folder_path: String) -> Result<SongDetails, String> {
         background_path,
         video_path,
         charts,
+        asset_statuses,
     })
 }
 
@@ -644,6 +1251,7 @@ pub fn append_approved_gemini_payload(
     ssc_path: String,
     payload_json: String,
     author: String,
+    expected_sha256: String,
 ) -> Result<AppendChartResult, String> {
     let path = Path::new(&ssc_path);
     if !path.exists() || !path.is_file() {
@@ -686,7 +1294,17 @@ pub fn append_approved_gemini_payload(
         }
     );
 
-    // 5. Append to SSC (which will automatically handle backups)
+    // 5. Fingerprint verification right before writing
+    let current_fp = get_file_fingerprint(ssc_path.clone())
+        .map_err(|e| format!("Error al calcular el fingerprint del archivo: {}", e))?;
+    if current_fp.sha256 != expected_sha256 {
+        return Err(format!(
+            "El fingerprint del archivo .ssc ha cambiado desde el preview. Esperado: {}, Actual: {}",
+            expected_sha256, current_fp.sha256
+        ));
+    }
+
+    // 6. Append to SSC (which will automatically handle backups)
     append_chart_to_ssc_atomic(
         path,
         payload.play_mode,
@@ -704,8 +1322,7 @@ pub async fn generate_gemini_chart_preview_core(
     play_mode: PlayMode,
     target_level: u32,
     section_id: &str,
-    author: &str,
-    w_mode: GeminiWriteMode,
+    _author: &str,
     client: &GeminiClient,
 ) -> Result<AppendChartResult, String> {
     // 1. Check environment variable gate
@@ -806,29 +1423,7 @@ pub async fn generate_gemini_chart_preview_core(
             // Convert to SSC notes
             let notes_raw = payload.to_ssc_notes();
 
-            let description = format!(
-                "AI Mock {} {}",
-                payload.section_id,
-                match payload.play_mode {
-                    PlayMode::Single => format!("S{}", payload.difficulty_level),
-                    PlayMode::Double => format!("D{}", payload.difficulty_level),
-                }
-            );
-
-            // If AppendIfValid, try to write chart using the helper
-            if w_mode == GeminiWriteMode::AppendIfValid {
-                let ssc_file_path = Path::new(ssc_path);
-                return append_chart_to_ssc_atomic(
-                    ssc_file_path,
-                    payload.play_mode,
-                    payload.difficulty_level,
-                    &notes_raw,
-                    description,
-                    author.to_string(),
-                );
-            }
-
-            // Otherwise, validate and return preview only
+            // Validate and return preview only
             validate_chart(payload.play_mode, payload.difficulty_level, &notes_raw)
         }
         Err(err_msg) => {
@@ -860,17 +1455,12 @@ pub async fn generate_gemini_chart_preview_core(
         .iter()
         .any(|i| i.severity == ValidationSeverity::Warning);
 
-    let message = if w_mode == GeminiWriteMode::PreviewOnly {
-        if has_errors {
-            "preview generado pero inválido; no se escribió en disco".to_string()
-        } else if has_warnings {
-            "preview generado con advertencias".to_string()
-        } else {
-            "Preview content generated and validated successfully without writing to disk."
-                .to_string()
-        }
+    let message = if has_errors {
+        "preview generado pero inválido; no se escribió en disco".to_string()
+    } else if has_warnings {
+        "preview generado con advertencias".to_string()
     } else {
-        "Aborted: Gemini payload has errors and was not written to disk.".to_string()
+        "Preview content generated and validated successfully without writing to disk.".to_string()
     };
 
     Ok(AppendChartResult {
@@ -882,6 +1472,16 @@ pub async fn generate_gemini_chart_preview_core(
         raw_payload: Some(raw_response),
         backup_path: None,
     })
+}
+
+fn validate_preview_write_mode(write_mode: &str) -> Result<GeminiWriteMode, String> {
+    match write_mode {
+        "PreviewOnly" => Ok(GeminiWriteMode::PreviewOnly),
+        _ => Err(format!(
+            "generate_gemini_chart_preview only supports 'PreviewOnly' write mode. Got: {}",
+            write_mode
+        )),
+    }
 }
 
 #[tauri::command]
@@ -902,11 +1502,7 @@ pub async fn generate_gemini_chart_preview<R: tauri::Runtime>(
         _ => return Err(format!("Unsupported play mode: {}", play_mode)),
     };
 
-    let w_mode = match write_mode.as_str() {
-        "PreviewOnly" => GeminiWriteMode::PreviewOnly,
-        "AppendIfValid" => GeminiWriteMode::AppendIfValid,
-        _ => return Err(format!("Unsupported write mode: {}", write_mode)),
-    };
+    let _w_mode = validate_preview_write_mode(&write_mode)?;
 
     // 2. Decrypt stored API key
     let api_key =
@@ -934,7 +1530,6 @@ pub async fn generate_gemini_chart_preview<R: tauri::Runtime>(
         target_level,
         &section_id,
         &author,
-        w_mode,
         &client,
     )
     .await
@@ -1241,9 +1836,6 @@ mod tests {
             file.write_all(b"audio content").unwrap();
         }
 
-        let doc_before = SscDocument::parse(&temp_ssc_path).unwrap();
-        let charts_count_before = doc_before.charts.len();
-
         let client = GeminiClient::new(Some(server.url()));
 
         // Case 1: Env gate is NOT enabled -> should return error and NOT call Mock server
@@ -1256,7 +1848,6 @@ mod tests {
             10,
             "preview_section",
             "AI Previewer",
-            GeminiWriteMode::PreviewOnly,
             &client,
         )
         .await;
@@ -1275,7 +1866,6 @@ mod tests {
             10,
             "preview_section",
             "AI Previewer",
-            GeminiWriteMode::PreviewOnly,
             &client,
         )
         .await
@@ -1316,7 +1906,6 @@ mod tests {
             10,
             "preview_section", // requested
             "AI Previewer",
-            GeminiWriteMode::PreviewOnly,
             &client,
         )
         .await
@@ -1358,7 +1947,6 @@ mod tests {
             10,
             "preview_section",
             "AI Previewer",
-            GeminiWriteMode::PreviewOnly,
             &client,
         )
         .await
@@ -1400,7 +1988,6 @@ mod tests {
             10, // requested 10
             "preview_section",
             "AI Previewer",
-            GeminiWriteMode::PreviewOnly,
             &client,
         )
         .await
@@ -1442,7 +2029,6 @@ mod tests {
             10,
             "preview_section",
             "AI Previewer",
-            GeminiWriteMode::PreviewOnly,
             &client,
         )
         .await
@@ -1480,7 +2066,6 @@ mod tests {
             10,
             "preview_section",
             "AI Previewer",
-            GeminiWriteMode::PreviewOnly,
             &client,
         )
         .await
@@ -1493,88 +2078,7 @@ mod tests {
             "preview generado pero inválido; no se escribió en disco"
         );
 
-        // Case 8: AppendIfValid writes when valid
-        let mock_post_append_ok = server.mock("POST", "/v1beta/models/gemini-3.5-flash:generateContent")
-            .with_status(200)
-            .with_header("content-type", "application/json")
-            .with_body(r#"{
-                "candidates": [
-                    {
-                        "content": {
-                            "parts": [
-                                {
-                                    "text": "{\n  \"section_id\": \"append_section\",\n  \"difficulty_level\": 10,\n  \"play_mode\": \"Single\",\n  \"biomechanical_state\": {\n    \"current_twist_debt\": 0.0,\n    \"current_stamina_debt\": 0.1\n  },\n  \"measures\": [\n    {\n      \"measure_index\": 0,\n      \"subdivision\": 4,\n      \"rows\": [\n        \"10000\",\n        \"00100\",\n        \"00001\",\n        \"00100\"\n      ]\n    }\n  ]\n}"
-                                }
-                            ]
-                        }
-                    }
-                ]
-            }"#)
-            .create_async()
-            .await;
-
-        let result_append_ok = generate_gemini_chart_preview_core(
-            "fake-key",
-            &temp_ssc_path.to_string_lossy(),
-            &test_audio_path.to_string_lossy(),
-            PlayMode::Single,
-            10,
-            "append_section",
-            "AI Previewer",
-            GeminiWriteMode::AppendIfValid,
-            &client,
-        )
-        .await
-        .expect("Core AppendIfValid flow failed");
-
-        mock_post_append_ok.assert_async().await;
-        assert!(result_append_ok.written);
-
-        let doc_after_append = SscDocument::parse(&temp_ssc_path).unwrap();
-        assert_eq!(doc_after_append.charts.len(), charts_count_before + 1);
-
-        // Case 9: AppendIfValid does NOT write when invalid
-        let mock_post_append_err = server.mock("POST", "/v1beta/models/gemini-3.5-flash:generateContent")
-            .with_status(200)
-            .with_header("content-type", "application/json")
-            .with_body(r#"{
-                "candidates": [
-                    {
-                        "content": {
-                            "parts": [
-                                {
-                                    "text": "{\n  \"section_id\": \"append_section_err\",\n  \"difficulty_level\": 10,\n  \"play_mode\": \"Single\",\n  \"biomechanical_state\": {\n    \"current_twist_debt\": 0.0,\n    \"current_stamina_debt\": 0.1\n  },\n  \"measures\": [\n    {\n      \"measure_index\": 0,\n      \"subdivision\": 4,\n      \"rows\": [\n        \"10000\",\n        \"00M00\",\n        \"00001\",\n        \"00100\"\n      ]\n    }\n  ]\n}"
-                                }
-                            ]
-                        }
-                    }
-                ]
-            }"#)
-            .create_async()
-            .await;
-
-        let result_append_err = generate_gemini_chart_preview_core(
-            "fake-key",
-            &temp_ssc_path.to_string_lossy(),
-            &test_audio_path.to_string_lossy(),
-            PlayMode::Single,
-            10,
-            "append_section_err",
-            "AI Previewer",
-            GeminiWriteMode::AppendIfValid,
-            &client,
-        )
-        .await
-        .expect("Core AppendIfValid fail-flow failed");
-
-        mock_post_append_err.assert_async().await;
-        assert!(!result_append_err.written);
-
-        // Chart count should still be before + 1 (the invalid one should not be appended)
-        let doc_after_append_err = SscDocument::parse(&temp_ssc_path).unwrap();
-        assert_eq!(doc_after_append_err.charts.len(), charts_count_before + 1);
-
-        // Case 10: JSON invalid sanitization (confirm error doesn't leak raw JSON content)
+        // Case 8: JSON invalid sanitization (confirm error doesn't leak raw JSON content)
         let mock_post_bad_json = server.mock("POST", "/v1beta/models/gemini-3.5-flash:generateContent")
             .with_status(200)
             .with_header("content-type", "application/json")
@@ -1590,7 +2094,6 @@ mod tests {
             10,
             "preview_section",
             "AI Previewer",
-            GeminiWriteMode::PreviewOnly,
             &client,
         )
         .await;
@@ -1640,10 +2143,12 @@ mod tests {
 
         // Call approved commit (should work even without env mode = dev)
         crate::settings::set_test_env(None);
+        let fp = get_file_fingerprint(temp_ssc_path.to_string_lossy().to_string()).unwrap();
         let result = append_approved_gemini_payload(
             temp_ssc_path.to_string_lossy().to_string(),
             valid_payload.to_string(),
             "Approved Tester".to_string(),
+            fp.sha256,
         )
         .expect("Command should succeed");
 
@@ -1700,10 +2205,12 @@ mod tests {
             ]
         }"#;
 
+        let fp = get_file_fingerprint(temp_ssc_path.to_string_lossy().to_string()).unwrap();
         let result = append_approved_gemini_payload(
             temp_ssc_path.to_string_lossy().to_string(),
             invalid_payload.to_string(),
             "Approved Tester".to_string(),
+            fp.sha256,
         );
 
         // Should return Err because of the severe biomechanical structure error
@@ -1744,5 +2251,272 @@ mod tests {
 
         // Clean up
         let _ = std::fs::remove_file(temp_ssc_path);
+    }
+
+    #[test]
+    fn test_validate_preview_write_mode() {
+        let result_ok = validate_preview_write_mode("PreviewOnly");
+        assert!(result_ok.is_ok());
+        assert_eq!(result_ok.unwrap(), GeminiWriteMode::PreviewOnly);
+
+        let result_err1 = validate_preview_write_mode("AppendIfValid");
+        assert!(result_err1.is_err());
+        assert!(result_err1
+            .unwrap_err()
+            .contains("only supports 'PreviewOnly'"));
+
+        let result_err2 = validate_preview_write_mode("SomeOtherMode");
+        assert!(result_err2.is_err());
+        assert!(result_err2
+            .unwrap_err()
+            .contains("only supports 'PreviewOnly'"));
+    }
+
+    #[test]
+    fn test_append_approved_gemini_payload_fingerprint_mismatch() {
+        let original_path = get_fixture_path();
+        let temp_dir = std::env::temp_dir();
+        let temp_ssc_path = temp_dir.join("test_fingerprint_mismatch.ssc");
+        std::fs::copy(&original_path, &temp_ssc_path).expect("Failed to copy");
+
+        let valid_payload = r#"{
+            "section_id": "chorus_approved",
+            "difficulty_level": 12,
+            "play_mode": "Single",
+            "biomechanical_state": {
+                "current_twist_debt": 0.0,
+                "current_stamina_debt": 0.3
+            },
+            "measures": [
+                {
+                    "measure_index": 0,
+                    "subdivision": 4,
+                    "rows": ["10000", "00100", "00001", "00100"]
+                }
+            ]
+        }"#;
+
+        let result = append_approved_gemini_payload(
+            temp_ssc_path.to_string_lossy().to_string(),
+            valid_payload.to_string(),
+            "Approved Tester".to_string(),
+            "incorrect_sha256_hash_value_here".to_string(),
+        );
+
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert!(err.contains("fingerprint del archivo .ssc ha cambiado"));
+
+        let _ = std::fs::remove_file(temp_ssc_path);
+    }
+
+    #[test]
+    fn test_get_file_fingerprint_invalid_extension() {
+        let temp_dir = std::env::temp_dir();
+        let temp_txt_path = temp_dir.join("test_invalid_ext.txt");
+        std::fs::write(&temp_txt_path, "some content").unwrap();
+
+        let result = get_file_fingerprint(temp_txt_path.to_string_lossy().to_string());
+        assert!(result.is_err());
+        assert!(result
+            .unwrap_err()
+            .contains("Solo se permite calcular el fingerprint"));
+
+        let _ = std::fs::remove_file(temp_txt_path);
+    }
+
+    #[test]
+    fn test_sanitize_folder_name_rules() {
+        assert!(sanitize_name("My New Song").is_ok());
+        assert_eq!(sanitize_name("  Trimmed Song  ").unwrap(), "Trimmed Song");
+
+        // Windows invalid chars
+        assert!(sanitize_name("Song?").is_err());
+        assert!(sanitize_name("Song*").is_err());
+        assert!(sanitize_name("Song/Backslash").is_err());
+        assert!(sanitize_name("Song\\Backslash").is_err());
+
+        // Windows reserved names
+        assert!(sanitize_name("con").is_err());
+        assert!(sanitize_name("PRN").is_err());
+        assert!(sanitize_name("LPT3").is_err());
+
+        // Trailing dot or space
+        assert!(sanitize_name("Song.").is_err());
+        assert!(sanitize_name("Song. ").is_err());
+        assert!(sanitize_name("").is_err());
+    }
+
+    #[tokio::test]
+    async fn test_create_song_project_flow() {
+        let temp_dir = std::env::temp_dir();
+        let target_folder = temp_dir.join("test_create_song_project_dir");
+        let _ = std::fs::remove_dir_all(&target_folder); // cleanup
+
+        // Create dummy audio file
+        let dummy_audio = temp_dir.join("dummy_audio.mp3");
+        std::fs::write(&dummy_audio, b"audio data").unwrap();
+
+        // Create dummy banner file
+        let dummy_banner = temp_dir.join("dummy_banner.png");
+        std::fs::write(&dummy_banner, b"banner data").unwrap();
+
+        // 1. Failure: missing audio
+        let payload_no_audio = CreateSongPayload {
+            target_folder_path: target_folder.to_string_lossy().to_string(),
+            title: "Test Song".to_string(),
+            artist: "Test Artist".to_string(),
+            genre: "Original".to_string(),
+            credit: "Author".to_string(),
+            song_type: "ARCADE".to_string(),
+            display_bpm: "135.000".to_string(),
+            timing_bpm: 135.0,
+            offset: -0.15,
+            audio_path: temp_dir
+                .join("nonexistent_audio.mp3")
+                .to_string_lossy()
+                .to_string(),
+            banner_path: None,
+            background_path: None,
+            video_path: None,
+        };
+        let result_err = create_song_project(payload_no_audio).await;
+        assert!(result_err.is_err());
+        assert!(result_err
+            .unwrap_err()
+            .contains("Audio file does not exist"));
+
+        // 2. Success: base creation
+        let payload = CreateSongPayload {
+            target_folder_path: target_folder.to_string_lossy().to_string(),
+            title: "Test Song".to_string(),
+            artist: "Test Artist".to_string(),
+            genre: "Original".to_string(),
+            credit: "Author".to_string(),
+            song_type: "ARCADE".to_string(),
+            display_bpm: "135.000".to_string(),
+            timing_bpm: 135.0,
+            offset: -0.15,
+            audio_path: dummy_audio.to_string_lossy().to_string(),
+            banner_path: Some(dummy_banner.to_string_lossy().to_string()),
+            background_path: None,
+            video_path: None,
+        };
+        let details = create_song_project(payload)
+            .await
+            .expect("Failed to create song project");
+        assert_eq!(details.song_name, "Test Song");
+        assert_eq!(details.artist, "Test Artist");
+        assert_eq!(details.bpm, 135.0);
+        assert_eq!(details.offset, -0.15);
+
+        let expected_ssc = target_folder.join("test_create_song_project_dir.ssc");
+        assert!(expected_ssc.exists());
+
+        // Verify copied assets
+        assert!(target_folder.join("audio.mp3").exists());
+        assert!(target_folder.join("banner.png").exists());
+
+        // Verify asset statuses
+        assert_eq!(details.asset_statuses.audio.status_type, "DeclaredAndFound");
+        assert_eq!(
+            details.asset_statuses.banner.status_type,
+            "DeclaredAndFound"
+        );
+        assert_eq!(details.asset_statuses.background.status_type, "NotDeclared");
+
+        // 3. Failure: overwrite blocked
+        let payload_overwrite = CreateSongPayload {
+            target_folder_path: target_folder.to_string_lossy().to_string(),
+            title: "Overwrite Song".to_string(),
+            artist: "Test Artist".to_string(),
+            genre: "Original".to_string(),
+            credit: "Author".to_string(),
+            song_type: "ARCADE".to_string(),
+            display_bpm: "135.000".to_string(),
+            timing_bpm: 135.0,
+            offset: -0.15,
+            audio_path: dummy_audio.to_string_lossy().to_string(),
+            banner_path: None,
+            background_path: None,
+            video_path: None,
+        };
+        let result_overwrite = create_song_project(payload_overwrite).await;
+        assert!(result_overwrite.is_err());
+        assert!(result_overwrite.unwrap_err().contains("Overwrite blocked"));
+
+        // Clean up
+        let _ = std::fs::remove_dir_all(&target_folder);
+        let _ = std::fs::remove_file(dummy_audio);
+        let _ = std::fs::remove_file(dummy_banner);
+    }
+
+    #[test]
+    fn test_determine_asset_statuses() {
+        let temp_dir = std::env::temp_dir();
+        let folder = temp_dir.join("test_asset_statuses_dir");
+        let _ = std::fs::remove_dir_all(&folder);
+        std::fs::create_dir_all(&folder).unwrap();
+
+        // Write some dummy files in the directory
+        let audio_file = folder.join("my_track.mp3");
+        std::fs::write(&audio_file, b"").unwrap();
+        let banner_file = folder.join("cool_banner.png");
+        std::fs::write(&banner_file, b"").unwrap();
+
+        // Scan folder files
+        let mut files_in_folder = Vec::new();
+        for entry in std::fs::read_dir(&folder).unwrap().flatten() {
+            let path = entry.path();
+            if path.is_file() {
+                let name = path.file_name().unwrap().to_str().unwrap().to_lowercase();
+                files_in_folder.push((name, path));
+            }
+        }
+
+        // Case 1: Declared and found
+        let audio_status =
+            determine_asset_status(&folder, Some("my_track.mp3"), "audio", &files_in_folder);
+        assert_eq!(audio_status.status_type, "DeclaredAndFound");
+        assert_eq!(audio_status.file_name.unwrap(), "my_track.mp3");
+        assert!(audio_status.file_path.is_some());
+
+        // Case 2: Declared but missing
+        let banner_status = determine_asset_status(
+            &folder,
+            Some("missing_banner.png"),
+            "banner",
+            &files_in_folder,
+        );
+        assert_eq!(banner_status.status_type, "DeclaredButMissing");
+        assert_eq!(banner_status.file_name.unwrap(), "missing_banner.png");
+        assert!(banner_status.file_path.is_none());
+
+        // Case 3: Found but not declared (declared_name is None/empty)
+        let found_banner_status = determine_asset_status(&folder, None, "banner", &files_in_folder);
+        assert_eq!(found_banner_status.status_type, "FoundButNotDeclared");
+        assert_eq!(found_banner_status.file_name.unwrap(), "cool_banner.png");
+
+        // Case 4: Not declared and not found (background)
+        let background_status =
+            determine_asset_status(&folder, None, "background", &files_in_folder);
+        assert_eq!(background_status.status_type, "NotDeclared");
+        assert!(background_status.file_name.is_none());
+
+        let _ = std::fs::remove_dir_all(&folder);
+    }
+
+    #[test]
+    fn test_get_file_metadata() {
+        let temp_dir = std::env::temp_dir();
+        let temp_file = temp_dir.join("test_metadata.mp3");
+        std::fs::write(&temp_file, b"12345").unwrap();
+
+        let meta = get_file_metadata(temp_file.to_string_lossy().to_string()).unwrap();
+        assert_eq!(meta.name, "test_metadata.mp3");
+        assert_eq!(meta.extension, "mp3");
+        assert_eq!(meta.size, 5);
+
+        let _ = std::fs::remove_file(temp_file);
     }
 }

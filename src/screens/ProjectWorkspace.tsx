@@ -13,8 +13,57 @@ import {
   Sparkles,
   FileJson
 } from "lucide-react";
-import { IAppendChartResult, IFileFingerprint } from "../types/song";
+import { IAppendChartResult, IFileFingerprint, IAssetStatus } from "../types/song";
 import { SongAnalysisReport, AnalysisCommandResult } from "../types/musicAnalysis";
+
+const getAssetUI = (key: "audio" | "banner" | "background" | "video", status: IAssetStatus | undefined) => {
+  const isRequired = key === "audio";
+  const reqText = isRequired ? "Required" : "Optional";
+  
+  if (!status) {
+    return {
+      color: isRequired ? "red" : "gray",
+      statusText: "Not declared",
+      reqText,
+      filePath: isRequired ? "Missing / Not configured" : "Optional (Missing)",
+    };
+  }
+
+  let color = "gray";
+  let statusText = "Not declared";
+
+  switch (status.status_type) {
+    case "DeclaredAndFound":
+      color = "green";
+      statusText = "Declared and found";
+      break;
+    case "DeclaredButMissing":
+      color = isRequired ? "red" : "yellow";
+      statusText = "Declared but missing";
+      break;
+    case "FoundButNotDeclared":
+      color = "yellow";
+      statusText = "Found in folder, not declared";
+      break;
+    case "NotDeclared":
+    default:
+      color = isRequired ? "red" : "gray";
+      statusText = "Not declared";
+      break;
+  }
+
+  let filePath = status.file_path || status.file_name || "";
+  if (!filePath) {
+    filePath = isRequired ? "Missing / Not configured" : "Optional (Missing)";
+  }
+
+  return {
+    color,
+    statusText,
+    reqText,
+    filePath,
+  };
+};
 
 interface ProjectWorkspaceProps {
   onNavigate: (screen: string) => void;
@@ -166,6 +215,7 @@ export const ProjectWorkspace: React.FC<ProjectWorkspaceProps> = ({ onNavigate }
         sscPath: currentSong.ssc_path,
         payloadJson: previewResult.raw_payload,
         author: author.trim() || "Gemini Approved",
+        expectedSha256: fingerprintAfter?.sha256 || "",
       });
 
       if (result.written) {
@@ -497,37 +547,42 @@ export const ProjectWorkspace: React.FC<ProjectWorkspaceProps> = ({ onNavigate }
             <p className="section-subtitle-gravel">Simulator asset completeness and folder inspection.</p>
 
             <div className="assets-status-grid">
-              <div className="asset-status-item">
-                <div className={`status-light ${currentSong.audio_path ? "green" : "red"}`} />
-                <div className="asset-status-meta">
-                  <span className="asset-status-name">Music Audio (.mp3/.ogg)</span>
-                  <span className="asset-status-path">{currentSong.audio_path || "Missing / Not configured"}</span>
-                </div>
-              </div>
+              {(() => {
+                const renderRow = (key: "audio" | "banner" | "background" | "video", label: string) => {
+                  const status = currentSong.asset_statuses?.[key];
+                  const ui = getAssetUI(key, status);
+                  return (
+                    <div className="asset-status-item">
+                      <div className={`status-light ${ui.color}`} />
+                      <div className="asset-status-meta">
+                        <div className="asset-status-row-header">
+                          <span className="asset-status-name">{label}</span>
+                          <div>
+                            <span className={`asset-status-badge ${ui.color}`}>
+                              {ui.statusText}
+                            </span>
+                            <span className="asset-status-req-label">
+                              {ui.reqText}
+                            </span>
+                          </div>
+                        </div>
+                        <span className="asset-status-path">
+                          {ui.filePath}
+                        </span>
+                      </div>
+                    </div>
+                  );
+                };
 
-              <div className="asset-status-item">
-                <div className={`status-light ${currentSong.banner_path ? "green" : "gray"}`} />
-                <div className="asset-status-meta">
-                  <span className="asset-status-name">Pack Banner (.png)</span>
-                  <span className="asset-status-path">{currentSong.banner_path || "Optional (Missing)"}</span>
-                </div>
-              </div>
-
-              <div className="asset-status-item">
-                <div className={`status-light ${currentSong.background_path ? "green" : "gray"}`} />
-                <div className="asset-status-meta">
-                  <span className="asset-status-name">Background Image (.png)</span>
-                  <span className="asset-status-path">{currentSong.background_path || "Optional (Missing)"}</span>
-                </div>
-              </div>
-
-              <div className="asset-status-item">
-                <div className={`status-light ${currentSong.video_path ? "green" : "gray"}`} />
-                <div className="asset-status-meta">
-                  <span className="asset-status-name">Video Overlay (.mp4/.mpg)</span>
-                  <span className="asset-status-path">{currentSong.video_path || "Optional (Missing)"}</span>
-                </div>
-              </div>
+                return (
+                  <>
+                    {renderRow("audio", "Music Audio (.mp3/.ogg/.flac/.wav)")}
+                    {renderRow("banner", "Pack Banner Image (.png/.jpg/.jpeg)")}
+                    {renderRow("background", "Background Image (.png/.jpg/.jpeg)")}
+                    {renderRow("video", "Video Overlay (.mp4/.mov/.avi/.mpg)")}
+                  </>
+                );
+              })()}
             </div>
           </div>
         )}
@@ -799,7 +854,11 @@ export const ProjectWorkspace: React.FC<ProjectWorkspaceProps> = ({ onNavigate }
                       <p className="caption-text-gravel text-missing">
                         * Committing blocked: Resolve severe biomechanical errors first.
                       </p>
-                    ) : fingerprintBefore && fingerprintAfter && fingerprintBefore.sha256 !== fingerprintAfter.sha256 ? (
+                    ) : !fingerprintBefore || !fingerprintAfter ? (
+                      <p className="caption-text-gravel text-missing">
+                        * Committing blocked: SSC fingerprint is unavailable or unverified.
+                      </p>
+                    ) : fingerprintBefore.sha256 !== fingerprintAfter.sha256 ? (
                       <p className="caption-text-gravel text-missing">
                         * Committing blocked: SSC fingerprint mismatch.
                       </p>
@@ -815,7 +874,9 @@ export const ProjectWorkspace: React.FC<ProjectWorkspaceProps> = ({ onNavigate }
                     onClick={handleCommitChart}
                     disabled={
                       previewResult.validation.issues.some(i => i.severity === "Error") ||
-                      (fingerprintBefore && fingerprintAfter && fingerprintBefore.sha256 !== fingerprintAfter.sha256) ||
+                      !fingerprintBefore ||
+                      !fingerprintAfter ||
+                      fingerprintBefore.sha256 !== fingerprintAfter.sha256 ||
                       isLoading
                     }
                   >
