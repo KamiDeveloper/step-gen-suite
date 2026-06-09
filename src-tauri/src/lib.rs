@@ -21,7 +21,7 @@ pub fn run() {
             commands::append_approved_gemini_payload,
             commands::generate_gemini_chart_preview,
             commands::get_file_fingerprint,
-            commands::sanitize_folder_name,
+            commands::validate_folder_name,
             commands::check_destination_folder,
             commands::create_destination_folder,
             commands::select_song_asset_file,

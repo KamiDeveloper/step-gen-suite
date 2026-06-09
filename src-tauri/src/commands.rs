@@ -193,6 +193,10 @@ pub fn append_chart_to_ssc_atomic(
     description: String,
     author: String,
 ) -> Result<AppendChartResult, String> {
+    // Validate metadata fields to prevent tag injection
+    validate_metadata_field(&author, "Author/Credit")?;
+    validate_metadata_field(&description, "Description")?;
+
     // 1. Biomechanical validation
     let validation_result = validate_chart(play_mode, target_level, notes_raw);
     let has_errors = validation_result
@@ -316,7 +320,26 @@ pub fn append_chart_to_ssc_atomic(
 
 use tauri::{AppHandle, Runtime};
 
-pub fn sanitize_name(name: &str) -> Result<String, String> {
+pub fn validate_metadata_field(value: &str, field_name: &str) -> Result<(), String> {
+    if value.contains(';') {
+        return Err(format!(
+            "Field '{}' cannot contain semicolons (';').",
+            field_name
+        ));
+    }
+    if value.contains('\n') || value.contains('\r') {
+        return Err(format!("Field '{}' cannot contain newlines.", field_name));
+    }
+    if value.chars().any(|c| c.is_control()) {
+        return Err(format!(
+            "Field '{}' cannot contain control characters.",
+            field_name
+        ));
+    }
+    Ok(())
+}
+
+pub fn validate_folder_name_rules(name: &str) -> Result<String, String> {
     let trimmed = name.trim();
     if trimmed.is_empty() {
         return Err("Folder name cannot be empty.".to_string());
@@ -364,7 +387,16 @@ pub fn determine_asset_status(
 
     if let Some(val) = declared_val {
         let resolved_path = folder.join(val);
-        if resolved_path.exists() && resolved_path.is_file() {
+
+        let is_safe = if let (Ok(canonical_folder), Ok(canonical_resolved)) =
+            (fs::canonicalize(folder), fs::canonicalize(&resolved_path))
+        {
+            canonical_resolved.starts_with(&canonical_folder)
+        } else {
+            false
+        };
+
+        if is_safe && resolved_path.exists() && resolved_path.is_file() {
             AssetStatus {
                 key: kind.to_string(),
                 status_type: "DeclaredAndFound".to_string(),
@@ -462,8 +494,8 @@ pub fn get_file_metadata(path: String) -> Result<FileMetadata, String> {
 }
 
 #[tauri::command]
-pub fn sanitize_folder_name(name: String) -> Result<String, String> {
-    sanitize_name(&name)
+pub fn validate_folder_name(name: String) -> Result<String, String> {
+    validate_folder_name_rules(&name)
 }
 
 #[tauri::command]
@@ -478,7 +510,12 @@ pub fn check_destination_folder(path: String) -> Result<String, String> {
     // Check if empty
     let is_empty = match fs::read_dir(p) {
         Ok(mut entries) => entries.next().is_none(),
-        Err(_) => true,
+        Err(e) => {
+            return Err(format!(
+                "Failed to read directory: {}. (Check permissions)",
+                e
+            ))
+        }
     };
     if is_empty {
         Ok("ExistEmpty".to_string())
@@ -564,7 +601,14 @@ pub async fn create_song_project(payload: CreateSongPayload) -> Result<SongDetai
         .and_then(|n| n.to_str())
         .ok_or_else(|| "Invalid target folder path".to_string())?;
 
-    let _sanitized_name = sanitize_name(folder_name)?;
+    let _sanitized_name = validate_folder_name_rules(folder_name)?;
+
+    // Validate metadata fields to reject unsafe characters (semicolons, newlines, control characters)
+    validate_metadata_field(&payload.title, "Title")?;
+    validate_metadata_field(&payload.artist, "Artist")?;
+    validate_metadata_field(&payload.genre, "Genre")?;
+    validate_metadata_field(&payload.credit, "Credit")?;
+    validate_metadata_field(&payload.display_bpm, "Display BPM")?;
 
     // Validate audio file
     let audio_src = Path::new(&payload.audio_path);
@@ -580,6 +624,52 @@ pub async fn create_song_project(payload: CreateSongPayload) -> Result<SongDetai
         return Err("Unsupported audio format. Allowed: .mp3, .ogg, .flac, .wav".to_string());
     }
 
+    // Validate optional assets extensions and physical existence
+    if let Some(ref bp) = payload.banner_path {
+        let bp_path = Path::new(bp);
+        if !bp_path.exists() || !bp_path.is_file() {
+            return Err("Banner file does not exist or is not a file.".to_string());
+        }
+        let ext = bp_path
+            .extension()
+            .and_then(|e| e.to_str())
+            .unwrap_or("")
+            .to_lowercase();
+        if !["png", "jpg", "jpeg"].contains(&ext.as_str()) {
+            return Err("Unsupported banner format. Allowed: .png, .jpg, .jpeg".to_string());
+        }
+    }
+    if let Some(ref bgp) = payload.background_path {
+        let bgp_path = Path::new(bgp);
+        if !bgp_path.exists() || !bgp_path.is_file() {
+            return Err("Background file does not exist or is not a file.".to_string());
+        }
+        let ext = bgp_path
+            .extension()
+            .and_then(|e| e.to_str())
+            .unwrap_or("")
+            .to_lowercase();
+        if !["png", "jpg", "jpeg"].contains(&ext.as_str()) {
+            return Err("Unsupported background format. Allowed: .png, .jpg, .jpeg".to_string());
+        }
+    }
+    if let Some(ref vp) = payload.video_path {
+        let vp_path = Path::new(vp);
+        if !vp_path.exists() || !vp_path.is_file() {
+            return Err("Video file does not exist or is not a file.".to_string());
+        }
+        let ext = vp_path
+            .extension()
+            .and_then(|e| e.to_str())
+            .unwrap_or("")
+            .to_lowercase();
+        if !["mp4", "mov", "avi", "mpg", "mpeg"].contains(&ext.as_str()) {
+            return Err(
+                "Unsupported video format. Allowed: .mp4, .mov, .avi, .mpg, .mpeg".to_string(),
+            );
+        }
+    }
+
     // Validate BPMs
     if payload.timing_bpm <= 0.0 {
         return Err("Timing BPM must be a positive number.".to_string());
@@ -592,25 +682,81 @@ pub async fn create_song_project(payload: CreateSongPayload) -> Result<SongDetai
         );
     }
 
-    // Check directory existence and overwrite rules
+    // Pre-calculate target destinations for collision check
+    let audio_dest = folder_path.join(format!("audio.{}", audio_ext));
+
+    let banner_dest = if let Some(ref bp) = payload.banner_path {
+        let bp_path = Path::new(bp);
+        let ext = bp_path
+            .extension()
+            .and_then(|e| e.to_str())
+            .unwrap_or("png")
+            .to_lowercase();
+        Some(folder_path.join(format!("banner.{}", ext)))
+    } else {
+        None
+    };
+
+    let background_dest = if let Some(ref bgp) = payload.background_path {
+        let bgp_path = Path::new(bgp);
+        let ext = bgp_path
+            .extension()
+            .and_then(|e| e.to_str())
+            .unwrap_or("png")
+            .to_lowercase();
+        Some(folder_path.join(format!("background.{}", ext)))
+    } else {
+        None
+    };
+
+    let video_dest = if let Some(ref vp) = payload.video_path {
+        let vp_path = Path::new(vp);
+        let ext = vp_path
+            .extension()
+            .and_then(|e| e.to_str())
+            .unwrap_or("mp4")
+            .to_lowercase();
+        Some(folder_path.join(format!("video.{}", ext)))
+    } else {
+        None
+    };
+
+    let ssc_name = format!("{}.ssc", folder_name);
+    let ssc_path = folder_path.join(&ssc_name);
+
+    // Check directory existence and preflight collision check
     if folder_path.exists() {
-        let has_ssc = if folder_path.is_dir() {
-            fs::read_dir(folder_path).map_or(false, |entries| {
-                entries.flatten().any(|e| {
-                    e.path().is_file()
-                        && e.path()
-                            .extension()
-                            .map_or(false, |ext| ext.eq_ignore_ascii_case("ssc"))
-                })
-            })
-        } else {
-            false
-        };
-        if has_ssc {
-            return Err(
-                "A .ssc file already exists in the destination folder. Overwrite blocked."
-                    .to_string(),
-            );
+        let mut collisions = Vec::new();
+        if audio_dest.exists() && audio_src != audio_dest {
+            collisions.push(format!("audio.{}", audio_ext));
+        }
+        if let Some(ref bd) = banner_dest {
+            let bp_src = Path::new(payload.banner_path.as_ref().unwrap());
+            if bd.exists() && bp_src != bd {
+                collisions.push(bd.file_name().unwrap().to_string_lossy().to_string());
+            }
+        }
+        if let Some(ref bgd) = background_dest {
+            let bgp_src = Path::new(payload.background_path.as_ref().unwrap());
+            if bgd.exists() && bgp_src != bgd {
+                collisions.push(bgd.file_name().unwrap().to_string_lossy().to_string());
+            }
+        }
+        if let Some(ref vd) = video_dest {
+            let vp_src = Path::new(payload.video_path.as_ref().unwrap());
+            if vd.exists() && vp_src != vd {
+                collisions.push(vd.file_name().unwrap().to_string_lossy().to_string());
+            }
+        }
+        if ssc_path.exists() {
+            collisions.push(ssc_name.clone());
+        }
+
+        if !collisions.is_empty() {
+            return Err(format!(
+                "File collision detected. The following destination files already exist: {}. Overwrite blocked.",
+                collisions.join(", ")
+            ));
         }
     } else {
         fs::create_dir_all(folder_path)
@@ -630,62 +776,17 @@ pub async fn create_song_project(payload: CreateSongPayload) -> Result<SongDetai
         })
     };
 
-    let audio_dest = folder_path.join(format!("audio.{}", audio_ext));
     copy_safe(audio_src, &audio_dest)?;
 
-    let banner_dest = if let Some(ref bp) = payload.banner_path {
-        let bp_path = Path::new(bp);
-        if bp_path.exists() && bp_path.is_file() {
-            let ext = bp_path
-                .extension()
-                .and_then(|e| e.to_str())
-                .unwrap_or("png")
-                .to_lowercase();
-            let dest = folder_path.join(format!("banner.{}", ext));
-            copy_safe(bp_path, &dest)?;
-            Some(dest)
-        } else {
-            None
-        }
-    } else {
-        None
-    };
-
-    let background_dest = if let Some(ref bgp) = payload.background_path {
-        let bgp_path = Path::new(bgp);
-        if bgp_path.exists() && bgp_path.is_file() {
-            let ext = bgp_path
-                .extension()
-                .and_then(|e| e.to_str())
-                .unwrap_or("png")
-                .to_lowercase();
-            let dest = folder_path.join(format!("background.{}", ext));
-            copy_safe(bgp_path, &dest)?;
-            Some(dest)
-        } else {
-            None
-        }
-    } else {
-        None
-    };
-
-    let video_dest = if let Some(ref vp) = payload.video_path {
-        let vp_path = Path::new(vp);
-        if vp_path.exists() && vp_path.is_file() {
-            let ext = vp_path
-                .extension()
-                .and_then(|e| e.to_str())
-                .unwrap_or("mp4")
-                .to_lowercase();
-            let dest = folder_path.join(format!("video.{}", ext));
-            copy_safe(vp_path, &dest)?;
-            Some(dest)
-        } else {
-            None
-        }
-    } else {
-        None
-    };
+    if let Some(ref bd) = banner_dest {
+        copy_safe(Path::new(payload.banner_path.as_ref().unwrap()), bd)?;
+    }
+    if let Some(ref bgd) = background_dest {
+        copy_safe(Path::new(payload.background_path.as_ref().unwrap()), bgd)?;
+    }
+    if let Some(ref vd) = video_dest {
+        copy_safe(Path::new(payload.video_path.as_ref().unwrap()), vd)?;
+    }
 
     // Create base SSC document
     let audio_filename = audio_dest
@@ -2326,25 +2427,28 @@ mod tests {
     }
 
     #[test]
-    fn test_sanitize_folder_name_rules() {
-        assert!(sanitize_name("My New Song").is_ok());
-        assert_eq!(sanitize_name("  Trimmed Song  ").unwrap(), "Trimmed Song");
+    fn test_validate_folder_name_rules() {
+        assert!(validate_folder_name_rules("My New Song").is_ok());
+        assert_eq!(
+            validate_folder_name_rules("  Trimmed Song  ").unwrap(),
+            "Trimmed Song"
+        );
 
         // Windows invalid chars
-        assert!(sanitize_name("Song?").is_err());
-        assert!(sanitize_name("Song*").is_err());
-        assert!(sanitize_name("Song/Backslash").is_err());
-        assert!(sanitize_name("Song\\Backslash").is_err());
+        assert!(validate_folder_name_rules("Song?").is_err());
+        assert!(validate_folder_name_rules("Song*").is_err());
+        assert!(validate_folder_name_rules("Song/Backslash").is_err());
+        assert!(validate_folder_name_rules("Song\\Backslash").is_err());
 
         // Windows reserved names
-        assert!(sanitize_name("con").is_err());
-        assert!(sanitize_name("PRN").is_err());
-        assert!(sanitize_name("LPT3").is_err());
+        assert!(validate_folder_name_rules("con").is_err());
+        assert!(validate_folder_name_rules("PRN").is_err());
+        assert!(validate_folder_name_rules("LPT3").is_err());
 
         // Trailing dot or space
-        assert!(sanitize_name("Song.").is_err());
-        assert!(sanitize_name("Song. ").is_err());
-        assert!(sanitize_name("").is_err());
+        assert!(validate_folder_name_rules("Song.").is_err());
+        assert!(validate_folder_name_rules("Song. ").is_err());
+        assert!(validate_folder_name_rules("").is_err());
     }
 
     #[tokio::test]
@@ -2518,5 +2622,175 @@ mod tests {
         assert_eq!(meta.size, 5);
 
         let _ = std::fs::remove_file(temp_file);
+    }
+
+    #[tokio::test]
+    async fn test_create_song_project_collisions() {
+        let temp_dir = std::env::temp_dir();
+        let target_folder = temp_dir.join("test_create_song_collisions_dir");
+        let _ = std::fs::remove_dir_all(&target_folder);
+        std::fs::create_dir_all(&target_folder).unwrap();
+
+        // Write pre-existing audio.mp3 in the directory to trigger collision
+        let existing_audio = target_folder.join("audio.mp3");
+        std::fs::write(&existing_audio, b"existing audio data").unwrap();
+
+        let dummy_audio = temp_dir.join("colliding_audio.mp3");
+        std::fs::write(&dummy_audio, b"new audio data").unwrap();
+
+        let payload = CreateSongPayload {
+            target_folder_path: target_folder.to_string_lossy().to_string(),
+            title: "Collision Song".to_string(),
+            artist: "Artist".to_string(),
+            genre: "Genre".to_string(),
+            credit: "Credit".to_string(),
+            song_type: "ARCADE".to_string(),
+            display_bpm: "120".to_string(),
+            timing_bpm: 120.0,
+            offset: 0.0,
+            audio_path: dummy_audio.to_string_lossy().to_string(),
+            banner_path: None,
+            background_path: None,
+            video_path: None,
+        };
+
+        let result = create_song_project(payload).await;
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("File collision detected"));
+
+        let _ = std::fs::remove_dir_all(&target_folder);
+        let _ = std::fs::remove_file(dummy_audio);
+    }
+
+    #[tokio::test]
+    async fn test_create_song_project_dangerous_metadata() {
+        let temp_dir = std::env::temp_dir();
+        let target_folder = temp_dir.join("test_create_song_dangerous_dir");
+        let _ = std::fs::remove_dir_all(&target_folder);
+
+        let dummy_audio = temp_dir.join("dangerous_metadata_audio.mp3");
+        std::fs::write(&dummy_audio, b"audio data").unwrap();
+
+        // 1. Semicolon
+        let payload_semicolon = CreateSongPayload {
+            target_folder_path: target_folder.to_string_lossy().to_string(),
+            title: "Dangerous; Title".to_string(),
+            artist: "Artist".to_string(),
+            genre: "Genre".to_string(),
+            credit: "Credit".to_string(),
+            song_type: "ARCADE".to_string(),
+            display_bpm: "120".to_string(),
+            timing_bpm: 120.0,
+            offset: 0.0,
+            audio_path: dummy_audio.to_string_lossy().to_string(),
+            banner_path: None,
+            background_path: None,
+            video_path: None,
+        };
+        let result = create_song_project(payload_semicolon).await;
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("cannot contain semicolons"));
+
+        // 2. Newline
+        let payload_newline = CreateSongPayload {
+            target_folder_path: target_folder.to_string_lossy().to_string(),
+            title: "Dangerous\nTitle".to_string(),
+            artist: "Artist".to_string(),
+            genre: "Genre".to_string(),
+            credit: "Credit".to_string(),
+            song_type: "ARCADE".to_string(),
+            display_bpm: "120".to_string(),
+            timing_bpm: 120.0,
+            offset: 0.0,
+            audio_path: dummy_audio.to_string_lossy().to_string(),
+            banner_path: None,
+            background_path: None,
+            video_path: None,
+        };
+        let result = create_song_project(payload_newline).await;
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("cannot contain newlines"));
+
+        let _ = std::fs::remove_file(dummy_audio);
+    }
+
+    #[tokio::test]
+    async fn test_create_song_project_invalid_optional_extensions() {
+        let temp_dir = std::env::temp_dir();
+        let target_folder = temp_dir.join("test_create_song_extensions_dir");
+        let _ = std::fs::remove_dir_all(&target_folder);
+
+        let dummy_audio = temp_dir.join("ext_audio.mp3");
+        std::fs::write(&dummy_audio, b"audio").unwrap();
+
+        let invalid_banner = temp_dir.join("banner.txt");
+        std::fs::write(&invalid_banner, b"text data").unwrap();
+
+        let payload = CreateSongPayload {
+            target_folder_path: target_folder.to_string_lossy().to_string(),
+            title: "Invalid Extension Song".to_string(),
+            artist: "Artist".to_string(),
+            genre: "Genre".to_string(),
+            credit: "Credit".to_string(),
+            song_type: "ARCADE".to_string(),
+            display_bpm: "120".to_string(),
+            timing_bpm: 120.0,
+            offset: 0.0,
+            audio_path: dummy_audio.to_string_lossy().to_string(),
+            banner_path: Some(invalid_banner.to_string_lossy().to_string()),
+            background_path: None,
+            video_path: None,
+        };
+
+        let result = create_song_project(payload).await;
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("Unsupported banner format"));
+
+        let _ = std::fs::remove_file(dummy_audio);
+        let _ = std::fs::remove_file(invalid_banner);
+    }
+
+    #[test]
+    fn test_determine_asset_status_path_traversal() {
+        let temp_dir = std::env::temp_dir();
+        let folder = temp_dir.join("test_traversal_folder");
+        let _ = std::fs::remove_dir_all(&folder);
+        std::fs::create_dir_all(&folder).unwrap();
+
+        // Write a file inside the folder
+        let inside_file = folder.join("inside.mp3");
+        std::fs::write(&inside_file, b"inside").unwrap();
+
+        // Write a file outside the folder
+        let outside_file = temp_dir.join("outside_traversal.mp3");
+        std::fs::write(&outside_file, b"outside").unwrap();
+
+        // Scan folder files
+        let mut files = Vec::new();
+        for entry in std::fs::read_dir(&folder).unwrap().flatten() {
+            let path = entry.path();
+            if path.is_file() {
+                let name = path.file_name().unwrap().to_str().unwrap().to_lowercase();
+                files.push((name, path));
+            }
+        }
+
+        // 1. Inside: DeclaredAndFound
+        let inside_status = determine_asset_status(&folder, Some("inside.mp3"), "audio", &files);
+        assert_eq!(inside_status.status_type, "DeclaredAndFound");
+
+        // 2. Traversal: DeclaredButMissing (since it's outside)
+        let traversal_status =
+            determine_asset_status(&folder, Some("../outside_traversal.mp3"), "audio", &files);
+        assert_eq!(traversal_status.status_type, "DeclaredButMissing");
+
+        let _ = std::fs::remove_dir_all(&folder);
+        let _ = std::fs::remove_file(outside_file);
+    }
+
+    #[test]
+    fn test_check_destination_folder_nonexistent() {
+        let result = check_destination_folder("/nonexistent/path/at/all".to_string()).unwrap();
+        assert_eq!(result, "NotExist");
     }
 }

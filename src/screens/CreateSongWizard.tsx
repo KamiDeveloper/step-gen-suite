@@ -128,7 +128,7 @@ export const CreateSongWizard: React.FC<CreateSongWizardProps> = ({ onNavigate }
       return;
     }
     try {
-      await invoke<string>("sanitize_folder_name", { name: val });
+      await invoke<string>("validate_folder_name", { name: val });
       setSanitizationError(null);
     } catch (err: any) {
       setSanitizationError(err.toString());
@@ -179,7 +179,7 @@ export const CreateSongWizard: React.FC<CreateSongWizardProps> = ({ onNavigate }
       setIsFolderReady(true);
       setSuccessMsg("Destination folder successfully validated and prepared.");
       setTimeout(() => setSuccessMsg(null), 3000);
-      handleNext();
+      setCurrentStep(2);
     } catch (err: any) {
       setErrorMsg("Failed to create destination directory: " + err.toString());
     }
@@ -333,7 +333,7 @@ export const CreateSongWizard: React.FC<CreateSongWizardProps> = ({ onNavigate }
                 {!isCustomFolder ? (
                   <>
                     <div className="form-group-contained">
-                      <label className="form-label-dark">Default Songpack Target</label>
+                      <label className="form-label-dark">Songpack</label>
                       <div className="read-only-path-container">
                         <code className="monospace-block">{songpackPath || "Loading default songpack..."}</code>
                       </div>
@@ -354,13 +354,13 @@ export const CreateSongWizard: React.FC<CreateSongWizardProps> = ({ onNavigate }
                     </div>
 
                     <button className="btn-ghost-pill btn-sm-contained btn-action-margin" onClick={handleChooseCustomFolder}>
-                      Use Custom Destination Folder...
+                      Choose Custom Folder
                     </button>
                   </>
                 ) : (
                   <>
                     <div className="form-group-contained">
-                      <label className="form-label-dark">Custom Destination Folder</label>
+                      <label className="form-label-dark">Choose Custom Folder</label>
                       <div className="input-group">
                         <input
                           type="text"
@@ -370,7 +370,7 @@ export const CreateSongWizard: React.FC<CreateSongWizardProps> = ({ onNavigate }
                           placeholder="No custom folder selected"
                         />
                         <button className="btn-ghost-pill btn-sm-contained" onClick={handleChooseCustomFolder}>
-                          Choose Folder...
+                          Choose Custom Folder
                         </button>
                       </div>
                     </div>
@@ -399,7 +399,7 @@ export const CreateSongWizard: React.FC<CreateSongWizardProps> = ({ onNavigate }
 
             {destinationPath && (
               <div className="destination-preview-card">
-                <h4 className="preview-label">Destination Path Preview:</h4>
+                <h4 className="preview-label">Destination Preview</h4>
                 <code className="monospace-block path-preview">{destinationPath}</code>
 
                 <div className="folder-status-row">
@@ -441,7 +441,7 @@ export const CreateSongWizard: React.FC<CreateSongWizardProps> = ({ onNavigate }
                       (folderStatus === "ExistNotEmpty" && !explicitConsent)
                     }
                   >
-                    Validate & Prepare Folder
+                    Create Folder
                   </button>
                 </div>
               </div>
