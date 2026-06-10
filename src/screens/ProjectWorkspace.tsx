@@ -19,6 +19,13 @@ import { analyzeBrowserBpmFromArrayBuffer } from "../features/music-analysis/bro
 import { BrowserBpmAnalysisReport } from "../features/music-analysis/browser-bpm/browserBpmTypes";
 import { reconcileBpmCandidates } from "../features/music-analysis/browser-bpm/browserBpmReconciliation";
 import { getBrowserBpmSupport } from "../features/music-analysis/browser-bpm/browserBpmSupport";
+import {
+  isAppendDisabled,
+  isPreviewStale,
+  validateMeasureRange,
+  groupValidationIssues
+} from "../utils/ProjectWorkspaceHelpers";
+import type { PreviewParams } from "../utils/ProjectWorkspaceHelpers";
 
 const getAssetUI = (key: "audio" | "banner" | "background" | "video", status: IAssetStatus | undefined) => {
   const isRequired = key === "audio";
@@ -89,6 +96,9 @@ export const ProjectWorkspace: React.FC<ProjectWorkspaceProps> = ({ onNavigate }
   const [endMeasure, setEndMeasure] = useState(7);
   const [songType, setSongType] = useState<"Shortcut" | "Arcade" | "Remix" | "Fullsong">("Arcade");
   const [selectedSectionKey, setSelectedSectionKey] = useState<string>("custom");
+  const [useMusicAnalysis, setUseMusicAnalysis] = useState(true);
+  const [useBrowserBpm, setUseBrowserBpm] = useState(true);
+  const [previewParamsSnapshot, setPreviewParamsSnapshot] = useState<PreviewParams | null>(null);
 
   // Preview result states
   const [previewResult, setPreviewResult] = useState<IAppendChartResult | null>(null);
@@ -200,7 +210,7 @@ export const ProjectWorkspace: React.FC<ProjectWorkspaceProps> = ({ onNavigate }
   useEffect(() => {
     if (settings) {
       setAuthor(settings.default_author || "AI Step Gen");
-      setPlayMode((settings.default_play_mode as "Single" | "Double") || "Single");
+      setPlayMode("Single"); // Enforced to Single play mode for Phase 3 Section Generation
       setTargetLevel(settings.default_meter || 10);
     }
   }, [settings, currentSong]);
@@ -224,6 +234,7 @@ export const ProjectWorkspace: React.FC<ProjectWorkspaceProps> = ({ onNavigate }
     setAnalysisReport(null);
     setReportPath(null);
     setPreviewResult(null);
+    setPreviewParamsSnapshot(null); // Clear snapshot
     setCommitMessage(null);
     setFingerprintBefore(null);
     setFingerprintAfter(null);
@@ -265,6 +276,35 @@ export const ProjectWorkspace: React.FC<ProjectWorkspaceProps> = ({ onNavigate }
     }
   }, [currentSong?.ssc_path]);
 
+  // Discard preview if input parameters change and become stale relative to the generated preview
+  useEffect(() => {
+    if (previewParamsSnapshot) {
+      const currentParams: PreviewParams = {
+        targetLevel,
+        sectionId: sectionId.trim() || "chorus_1",
+        startMeasure,
+        endMeasure,
+        songType,
+        useMusicAnalysis,
+        useBrowserBpm,
+        selectedSectionKey
+      };
+      if (isPreviewStale(previewParamsSnapshot, currentParams)) {
+        handleDiscardPreview();
+      }
+    }
+  }, [
+    targetLevel,
+    sectionId,
+    startMeasure,
+    endMeasure,
+    songType,
+    useMusicAnalysis,
+    useBrowserBpm,
+    selectedSectionKey,
+    previewParamsSnapshot
+  ]);
+
   if (!currentSong) {
     return (
       <div className="workspace-empty-state">
@@ -280,8 +320,15 @@ export const ProjectWorkspace: React.FC<ProjectWorkspaceProps> = ({ onNavigate }
     );
   }
 
-  // Difficulty limit logic
-  const isGeminiBlocked = (playMode === "Single" && targetLevel > 26) || (playMode === "Double" && targetLevel > 15);
+  // Difficulty limit logic - Single levels 1-26 are allowed for Generation
+  const isGeminiBlocked = targetLevel < 1 || targetLevel > 26;
+
+  // Measure range validation for the active settings
+  const matchedSection = analysisReport?.sections.find(s => s.section_id === selectedSectionKey);
+  const startMeasureVal = matchedSection ? matchedSection.start_measure : startMeasure;
+  const endMeasureVal = matchedSection ? matchedSection.end_measure : endMeasure;
+  const songTypeVal = matchedSection ? (analysisReport?.timing_grid.song_type || songType) : songType;
+  const rangeValidation = validateMeasureRange(startMeasureVal, endMeasureVal, 16);
 
   const handleGeneratePreview = async () => {
     if (!currentSong) return;
@@ -290,24 +337,9 @@ export const ProjectWorkspace: React.FC<ProjectWorkspaceProps> = ({ onNavigate }
       return;
     }
 
-    const matchedSection = analysisReport?.sections.find(s => s.section_id === selectedSectionKey);
-    const startMeasureVal = matchedSection ? matchedSection.start_measure : startMeasure;
-    const endMeasureVal = matchedSection ? matchedSection.end_measure : endMeasure;
-
-    if (selectedSectionKey === "custom") {
-      if (startMeasureVal < 0) {
-        setError("El compás de inicio no puede ser menor a 0.");
-        return;
-      }
-      if (endMeasureVal < startMeasureVal) {
-        setError("El compás de fin debe ser mayor o igual al compás de inicio.");
-        return;
-      }
-      const numMeasures = endMeasureVal - startMeasureVal + 1;
-      if (numMeasures > 64) {
-        setError(`El rango de compases solicitado (${numMeasures}) supera el límite de 64 compases permitido para MVP Alpha.`);
-        return;
-      }
+    if (!rangeValidation.isValid) {
+      setError(rangeValidation.error);
+      return;
     }
 
     const previewPath = currentSong.ssc_path;
@@ -340,27 +372,52 @@ export const ProjectWorkspace: React.FC<ProjectWorkspaceProps> = ({ onNavigate }
       }
 
       // 2. Real Gemini Preview - writeMode is "PreviewOnly"
-      const matchedSectionReal = analysisReport?.sections.find(s => s.section_id === selectedSectionKey);
-      const startMeasureValReal = matchedSectionReal ? matchedSectionReal.start_measure : startMeasure;
-      const endMeasureValReal = matchedSectionReal ? matchedSectionReal.end_measure : endMeasure;
-      const songTypeVal = matchedSectionReal ? (analysisReport?.timing_grid.song_type || songType) : songType;
+      let browserBpmReconciliationStr = "";
+      if (useBrowserBpm && workspaceBpmReport) {
+        const recon = reconcileBpmCandidates({
+          sscBpms: currentSong.ssc_bpms && currentSong.ssc_bpms.length > 0
+            ? currentSong.ssc_bpms
+            : (currentSong.bpm ? [currentSong.bpm] : []),
+          sidecarDetectedBpm: analysisReport?.diagnostics?.audio_bpm_detected || undefined,
+          browserCandidates: workspaceBpmReport.candidates,
+          toleranceBpm: 2.0,
+          minConfidence: 0.2,
+          minCount: 4,
+          isSupported: workspaceBpmReport.support.isSupported,
+        });
+        const notesStr = recon.notes && recon.notes.length > 0 ? recon.notes.join(" | ") : "None";
+        browserBpmReconciliationStr = `Status: ${recon.reconciliationStatus}, Canonical BPM: ${recon.canonicalBpm ?? "None"}, Browser BPM: ${workspaceBpmReport.stableTempo?.tempo ?? "None"}, Candidates: [${workspaceBpmReport.candidates.map(c => `${c.tempo} (${(c.confidence * 100).toFixed(0)}%)`).join(", ")}], Notes: ${notesStr}`;
+      }
 
       const result = await invoke<IAppendChartResult>("generate_gemini_chart_preview", {
         sscPath: previewPath,
         audioPath: currentSong.audio_path || "",
         passphrase: passphrase.trim(),
-        playMode,
+        playMode: "Single", // Forced to Single play mode in Phase 3
         targetLevel,
         sectionId: sectionId.trim() || "chorus_1",
         author: author.trim() || "Gemini Preview",
         writeMode: "PreviewOnly",
-        startMeasure: startMeasureValReal,
-        endMeasure: endMeasureValReal,
+        startMeasure: startMeasureVal,
+        endMeasure: endMeasureVal,
         songType: songTypeVal,
+        useMusicAnalysis,
+        useBrowserBpm,
+        browserBpmReconciliation: useBrowserBpm ? browserBpmReconciliationStr : undefined,
       });
 
       if (!isActivePreview()) return;
       setPreviewResult(result);
+      setPreviewParamsSnapshot({
+        targetLevel,
+        sectionId: sectionId.trim() || "chorus_1",
+        startMeasure: startMeasureVal,
+        endMeasure: endMeasureVal,
+        songType: songTypeVal,
+        useMusicAnalysis,
+        useBrowserBpm,
+        selectedSectionKey
+      });
 
       // 3. Get file fingerprint AFTER preview
       try {
@@ -373,8 +430,8 @@ export const ProjectWorkspace: React.FC<ProjectWorkspaceProps> = ({ onNavigate }
         console.warn("Failed to get final fingerprint:", fpErr);
       }
 
-      const hasErrors = result.validation.issues.some((i) => i.severity === "Error");
-      if (hasErrors) {
+      const { errors } = groupValidationIssues(result.validation.issues);
+      if (errors.length > 0) {
         setError("Biomechanical validation errors found. Check the report below.");
       }
     } catch (err: any) {
@@ -429,6 +486,7 @@ export const ProjectWorkspace: React.FC<ProjectWorkspaceProps> = ({ onNavigate }
           charts: result.charts,
         });
         setPreviewResult(null); // Clear preview once committed
+        setPreviewParamsSnapshot(null); // Clear snapshot
         setFingerprintBefore(null);
         setFingerprintAfter(null);
       } else {
@@ -444,6 +502,7 @@ export const ProjectWorkspace: React.FC<ProjectWorkspaceProps> = ({ onNavigate }
 
   const handleDiscardPreview = () => {
     setPreviewResult(null);
+    setPreviewParamsSnapshot(null); // Clear snapshot
     setError(null);
     setCommitMessage(null);
     setBackupPath(null);
@@ -861,12 +920,10 @@ export const ProjectWorkspace: React.FC<ProjectWorkspaceProps> = ({ onNavigate }
                   <label className="form-label-dark">Play Mode</label>
                   <select
                     className="input-contained"
-                    value={playMode}
-                    onChange={(e) => setPlayMode(e.target.value as "Single" | "Double")}
-                    disabled={isLoading}
+                    value="Single"
+                    disabled={true}
                   >
                     <option value="Single">Single (5-Key)</option>
-                    <option value="Double">Double (10-Key)</option>
                   </select>
                 </div>
 
@@ -875,7 +932,7 @@ export const ProjectWorkspace: React.FC<ProjectWorkspaceProps> = ({ onNavigate }
                   <input
                     type="number"
                     min="1"
-                    max="28"
+                    max="26"
                     className="input-contained"
                     value={targetLevel}
                     onChange={(e) => setTargetLevel(parseInt(e.target.value) || 10)}
@@ -980,9 +1037,31 @@ export const ProjectWorkspace: React.FC<ProjectWorkspaceProps> = ({ onNavigate }
 
               {selectedSectionKey === "custom" && (
                 <p className="custom-section-hint">
-                  Nota: El rango máximo de compases permitido para Custom Section es de 64 compases.
+                  Nota: El rango máximo de compases permitido para Custom Section es de 16 compases.
                 </p>
               )}
+
+              <div className="context-checkbox-row">
+                <label className={`context-checkbox-label ${!analysisReport ? "disabled" : ""}`}>
+                  <input
+                    type="checkbox"
+                    checked={useMusicAnalysis}
+                    onChange={(e) => setUseMusicAnalysis(e.target.checked)}
+                    disabled={!analysisReport || isLoading}
+                  />
+                  <span>Use Music Analysis Context {analysisReport ? "(Available)" : "(Unavailable)"}</span>
+                </label>
+
+                <label className={`context-checkbox-label ${!workspaceBpmReport ? "disabled" : ""}`}>
+                  <input
+                    type="checkbox"
+                    checked={useBrowserBpm}
+                    onChange={(e) => setUseBrowserBpm(e.target.checked)}
+                    disabled={!workspaceBpmReport || isLoading}
+                  />
+                  <span>Use Browser BPM Diagnostics {workspaceBpmReport ? "(Available)" : "(Unavailable)"}</span>
+                </label>
+              </div>
 
               {(() => {
                 const matchedIntent = analysisReport?.choreographic_intent.find(
@@ -1046,7 +1125,16 @@ export const ProjectWorkspace: React.FC<ProjectWorkspaceProps> = ({ onNavigate }
                 <div className="warning-box">
                   <AlertTriangle size={16} className="icon-mr text-warning-icon" />
                   <span>
-                    Gemini generation limits: Single up to Lv.26, Double up to Lv.15. Selection is blocked.
+                    Gemini generation limits: Single level must be between S1 and S26. Selection is blocked.
+                  </span>
+                </div>
+              )}
+
+              {!rangeValidation.isValid && (
+                <div className="warning-box">
+                  <AlertTriangle size={16} className="icon-mr text-warning-icon" />
+                  <span>
+                    {rangeValidation.error}
                   </span>
                 </div>
               )}
@@ -1062,9 +1150,9 @@ export const ProjectWorkspace: React.FC<ProjectWorkspaceProps> = ({ onNavigate }
                 <button
                   className="btn-primary-pill"
                   onClick={handleGeneratePreview}
-                  disabled={isLoading || isGeminiBlocked || !currentSong.audio_path || !passphrase}
+                  disabled={isLoading || isGeminiBlocked || !rangeValidation.isValid || !currentSong.audio_path || !passphrase}
                 >
-                  {isLoading ? "Generating..." : "Generar preview con Gemini (usa API, no escribe)"}
+                  {isLoading ? "Generating..." : "Generate Single Section Preview with Gemini (uses API, does not write)"}
                 </button>
                 <span className="caption-text-gravel">
                   * Real Gemini (uses network & API key, consumes tokens, <strong>PreviewOnly</strong> mode - does not write to disk).
@@ -1080,6 +1168,42 @@ export const ProjectWorkspace: React.FC<ProjectWorkspaceProps> = ({ onNavigate }
                   <button className="btn-ghost-pill btn-sm-contained btn-danger-text" onClick={handleDiscardPreview}>
                     Descartar preview
                   </button>
+                </div>
+
+                {/* Technical Meta Summary */}
+                <div className="metadata-table-card">
+                  <table className="workspace-table">
+                    <tbody>
+                      <tr>
+                        <td><strong>Write Mode</strong></td>
+                        <td><code className="monospace-inline">PreviewOnly</code></td>
+                      </tr>
+                      <tr>
+                        <td><strong>Requested Params</strong></td>
+                        <td>Single S{targetLevel} (Section: {sectionId.trim() || "chorus_1"})</td>
+                      </tr>
+                      <tr>
+                        <td><strong>Returned Params</strong></td>
+                        <td>{previewResult.validation.play_mode} S{previewResult.validation.difficulty_level}</td>
+                      </tr>
+                      <tr>
+                        <td><strong>Measure Range</strong></td>
+                        <td>M.{selectedSectionKey === "custom" ? startMeasure : (analysisReport?.sections.find(s => s.section_id === selectedSectionKey)?.start_measure ?? startMeasure)} – M.{selectedSectionKey === "custom" ? endMeasure : (analysisReport?.sections.find(s => s.section_id === selectedSectionKey)?.end_measure ?? endMeasure)} ({previewResult.validation.issues.some(i => i.issue_type === "InvalidLength") ? "Mismatch" : "OK"})</td>
+                      </tr>
+                      {previewResult.context_sources_used && (
+                        <tr>
+                          <td><strong>Context Sources Used</strong></td>
+                          <td>
+                            <div className="context-sources-tags">
+                              {previewResult.context_sources_used.map((source, idx) => (
+                                <span key={idx} className="context-source-tag">{source}</span>
+                              ))}
+                            </div>
+                          </td>
+                        </tr>
+                      )}
+                    </tbody>
+                  </table>
                 </div>
 
                 {/* Fingerprint Evidence Section */}
@@ -1142,24 +1266,59 @@ export const ProjectWorkspace: React.FC<ProjectWorkspaceProps> = ({ onNavigate }
                     </span>
                   </div>
 
-                  {previewResult.validation.issues.length > 0 ? (
-                    <div className="validation-issues-list">
-                      {previewResult.validation.issues.map((issue, index) => (
-                        <div key={index} className={`issue-row-item ${issue.severity.toLowerCase()}`}>
-                          <span className="issue-meta">
-                            Measure {issue.measure_index + 1}, Row {issue.row_index + 1}
-                          </span>
-                          <span className="issue-message">
-                            [{issue.issue_type}] {issue.message}
-                          </span>
-                        </div>
-                      ))}
-                    </div>
-                  ) : (
-                    <p className="clean-validation-text">
-                      ✓ Zero biomechanical or structure issues detected for this section.
-                    </p>
-                  )}
+                  {(() => {
+                    const { errors, warnings } = groupValidationIssues(previewResult.validation.issues);
+
+                    return (
+                      <div className="validation-sections-wrapper">
+                        {errors.length > 0 && (
+                          <div className="validation-group">
+                            <h5 className="validation-group-title text-danger-icon">
+                              Errors ({errors.length}) — Write Blocked:
+                            </h5>
+                            <div className="validation-issues-list">
+                              {errors.map((issue, index) => (
+                                <div key={index} className="issue-row-item error">
+                                  <span className="issue-meta-bold">
+                                    Measure {issue.measure_index + 1}, Row {issue.row_index + 1}
+                                  </span>
+                                  <span className="issue-message">
+                                    [{issue.issue_type}] {issue.message}
+                                  </span>
+                                </div>
+                              ))}
+                            </div>
+                          </div>
+                        )}
+
+                        {warnings.length > 0 && (
+                          <div className="validation-group">
+                            <h5 className="validation-group-title text-warning-icon">
+                              Warnings ({warnings.length}) — Appending allowed under human review:
+                            </h5>
+                            <div className="validation-issues-list">
+                              {warnings.map((issue, index) => (
+                                <div key={index} className="issue-row-item warning">
+                                  <span className="issue-meta-bold">
+                                    Measure {issue.measure_index + 1}, Row {issue.row_index + 1}
+                                  </span>
+                                  <span className="issue-message">
+                                    [{issue.issue_type}] {issue.message}
+                                  </span>
+                                </div>
+                              ))}
+                            </div>
+                          </div>
+                        )}
+
+                        {errors.length === 0 && warnings.length === 0 && (
+                          <p className="clean-validation-text">
+                            ✓ Zero biomechanical or structure issues detected for this section.
+                          </p>
+                        )}
+                      </div>
+                    );
+                  })()}
                 </div>
 
                 {/* Collapsible Inspectors */}
@@ -1189,35 +1348,48 @@ export const ProjectWorkspace: React.FC<ProjectWorkspaceProps> = ({ onNavigate }
                 <div className="commit-action-box">
                   <div className="commit-meta-text">
                     <h5 className="commit-box-title">Apply Generated Chart</h5>
-                    {previewResult.validation.issues.some(i => i.severity === "Error") ? (
-                      <p className="caption-text-gravel text-missing">
-                        * Committing blocked: Resolve severe biomechanical errors first.
-                      </p>
-                    ) : !fingerprintBefore || !fingerprintAfter ? (
-                      <p className="caption-text-gravel text-missing">
-                        * Committing blocked: SSC fingerprint is unavailable or unverified.
-                      </p>
-                    ) : fingerprintBefore.sha256 !== fingerprintAfter.sha256 ? (
-                      <p className="caption-text-gravel text-missing">
-                        * Committing blocked: SSC fingerprint mismatch.
-                      </p>
-                    ) : (
-                      <p className="caption-text-gravel">
-                        If the preview checks out, commit it to disk. This is a local action, does not query the API, and does not consume tokens.
-                      </p>
-                    )}
+                    {(() => {
+                      const { errors, warnings } = groupValidationIssues(previewResult.validation.issues);
+                      if (errors.length > 0) {
+                        return (
+                          <p className="caption-text-gravel text-missing">
+                            * Committing blocked: Resolve severe biomechanical errors first.
+                          </p>
+                        );
+                      }
+                      if (!fingerprintBefore || !fingerprintAfter) {
+                        return (
+                          <p className="caption-text-gravel text-missing">
+                            * Committing blocked: SSC fingerprint is unavailable or unverified.
+                          </p>
+                        );
+                      }
+                      if (fingerprintBefore.sha256 !== fingerprintAfter.sha256) {
+                        return (
+                          <p className="caption-text-gravel text-missing">
+                            * Committing blocked: SSC fingerprint mismatch.
+                          </p>
+                        );
+                      }
+                      if (warnings.length > 0) {
+                        return (
+                          <p className="caption-text-gravel text-warning-icon">
+                            ⚠ You are approving this section with active warnings. Human review is recommended.
+                          </p>
+                        );
+                      }
+                      return (
+                        <p className="caption-text-gravel">
+                          If the preview checks out, commit it to disk. This is a local action, does not query the API, and does not consume tokens.
+                        </p>
+                      );
+                    })()}
                   </div>
 
                   <button
                     className="btn-primary-pill btn-success-glow"
                     onClick={handleCommitChart}
-                    disabled={
-                      previewResult.validation.issues.some(i => i.severity === "Error") ||
-                      !fingerprintBefore ||
-                      !fingerprintAfter ||
-                      fingerprintBefore.sha256 !== fingerprintAfter.sha256 ||
-                      isLoading
-                    }
+                    disabled={isAppendDisabled(previewResult, fingerprintBefore, fingerprintAfter, isLoading)}
                   >
                     Añadir preview aprobado al SSC (escribe en disco)
                   </button>

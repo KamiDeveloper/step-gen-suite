@@ -75,7 +75,7 @@ export const CreateSongWizard: React.FC<CreateSongWizardProps> = ({ onNavigate }
   const bgBlurRef = useRef<HTMLDivElement | null>(null);
   const wizardBlurRef = useRef<HTMLDivElement | null>(null);
 
-  // Apply blurry Spotify ambient background in DOM using JavaScript to bypass "style=" JSX rules
+  // Apply blurry Spotify ambient background through DOM refs while keeping JSX free of inline style attributes
   useEffect(() => {
     if (bannerBlurRef.current) {
       if (bannerFile) {

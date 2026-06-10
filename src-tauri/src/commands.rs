@@ -119,6 +119,7 @@ pub struct AppendChartResult {
     pub generated_notes: Option<String>,
     pub raw_payload: Option<String>,
     pub backup_path: Option<String>,
+    pub context_sources_used: Option<Vec<String>>,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone, PartialEq)]
@@ -258,6 +259,7 @@ pub fn append_chart_to_ssc_atomic(
             generated_notes: None,
             raw_payload: None,
             backup_path: None,
+            context_sources_used: None,
         });
     }
 
@@ -358,6 +360,7 @@ pub fn append_chart_to_ssc_atomic(
         generated_notes: None,
         raw_payload: None,
         backup_path,
+        context_sources_used: None,
     })
 }
 
@@ -1409,6 +1412,7 @@ pub fn append_mock_gemini_payload(
                 generated_notes: None,
                 raw_payload: None,
                 backup_path: None,
+                context_sources_used: None,
             })
         }
     }
@@ -1452,6 +1456,23 @@ pub fn append_approved_gemini_payload(
     let clean_json = sanitize_gemini_json_payload(&payload_json);
     let payload: GeminiChartSectionPayload = serde_json::from_str(&clean_json)
         .map_err(|e| format!("Error parsing approved payload JSON: {}", e))?;
+
+    if payload.play_mode != PlayMode::Single {
+        return Err("Only Single play mode is supported in this phase.".to_string());
+    }
+    if payload.difficulty_level < 1 || payload.difficulty_level > 26 {
+        return Err(format!(
+            "Nivel de dificultad Single ({}) fuera de rango (1-26).",
+            payload.difficulty_level
+        ));
+    }
+    if payload.measures.len() > crate::biomechanics::MAX_SECTION_MEASURES {
+        return Err(format!(
+            "El payload de Gemini supera el límite máximo de {} medidas (recibidas: {}).",
+            crate::biomechanics::MAX_SECTION_MEASURES,
+            payload.measures.len()
+        ));
+    }
 
     // 2. Structural validation
     payload
@@ -1515,17 +1536,29 @@ pub async fn generate_gemini_chart_preview_core(
     start_measure: Option<u32>,
     end_measure: Option<u32>,
     song_type: Option<String>,
+    use_music_analysis: Option<bool>,
+    use_browser_bpm: Option<bool>,
+    browser_bpm_reconciliation: Option<String>,
 ) -> Result<AppendChartResult, String> {
     // 1. Check environment variable gate
     if !crate::settings::is_gemini_enabled() {
         return Err("La integración real con Gemini está deshabilitada en esta sesión. Configure la variable de entorno AI_STEP_GEN_ENABLE_REAL_GEMINI=1 para habilitarla.".to_string());
     }
 
+    if play_mode != PlayMode::Single {
+        return Err("Only Single play mode is supported in this phase.".to_string());
+    }
+    if target_level < 1 || target_level > 26 {
+        return Err(format!(
+            "Nivel de dificultad Single ({}) fuera de rango (1-26).",
+            target_level
+        ));
+    }
+
     let mut start_m = start_measure;
     let mut end_m = end_measure;
     let mut s_type = song_type.clone();
 
-    let mut intent_info = String::new();
     let mut report_opt = None;
     let ssc_p = Path::new(ssc_path);
     if let Some(dir) = ssc_p.parent() {
@@ -1543,7 +1576,49 @@ pub async fn generate_gemini_chart_preview_core(
         }
     }
 
+    let mut title_val = String::new();
+    let mut artist_val = String::new();
+    let mut bpms_val = String::new();
+    let mut offset_val = 0.0;
+
+    if let Ok(doc) = SscDocument::parse(ssc_p) {
+        for tag in &doc.global_tags {
+            if let Some(ref key) = tag.key {
+                if key == "TITLE" {
+                    title_val = tag.value.clone();
+                } else if key == "ARTIST" {
+                    artist_val = tag.value.clone();
+                } else if key == "BPMS" {
+                    bpms_val = tag.value.clone();
+                } else if key == "OFFSET" {
+                    if let Ok(val) = tag.value.trim().parse::<f64>() {
+                        offset_val = val;
+                    }
+                }
+            }
+        }
+    }
+
     if let Some(ref report) = report_opt {
+        if title_val.is_empty() {
+            title_val = report.title.clone();
+        }
+        if artist_val.is_empty() {
+            artist_val = report.artist.clone();
+        }
+        if bpms_val.is_empty() {
+            bpms_val = report
+                .timing_grid
+                .bpms
+                .iter()
+                .map(|(b, bpm)| format!("{}={}", b, bpm))
+                .collect::<Vec<_>>()
+                .join(",");
+        }
+        if offset_val == 0.0 {
+            offset_val = report.timing_grid.initial_offset;
+        }
+
         // If start/end measures are not specified, try to find them in the section boundaries
         if start_m.is_none() || end_m.is_none() {
             if let Some(sec) = report.sections.iter().find(|s| s.section_id == section_id) {
@@ -1559,30 +1634,6 @@ pub async fn generate_gemini_chart_preview_core(
         if s_type.is_none() {
             s_type = Some(report.timing_grid.song_type.clone());
         }
-
-        // Find matching intent map by section_id
-        let matched_intent = report
-            .choreographic_intent
-            .iter()
-            .find(|intent| intent.section_id == section_id);
-
-        if let Some(intent) = matched_intent {
-            intent_info = format!(
-                "\n[INFORMACIÓN COREOGRÁFICA DE LA CANCIÓN (Music Analysis Engine)]\n\
-                 - Objetivo de Densidad: {}\n\
-                 - Presupuesto de Dificultad (Difficulty Budget): {}\n\
-                 - Familias de Patrones Recomendados: {:?}\n\
-                 - Familias de Patrones a Evitar: {:?}\n\
-                 - Estrategia de Motivos: {}\n\
-                 - Evidencia de Análisis: {:?}\n",
-                intent.density_target,
-                intent.difficulty_budget,
-                intent.recommended_pattern_families,
-                intent.avoid_pattern_families,
-                intent.motif_strategy,
-                intent.evidence
-            );
-        }
     }
 
     let start_m_val = start_m.unwrap_or(0);
@@ -1597,12 +1648,93 @@ pub async fn generate_gemini_chart_preview_core(
         .checked_sub(start_m_val)
         .and_then(|d| d.checked_add(1))
         .ok_or_else(|| "Measure range calculation overflowed".to_string())?;
+    if num_measures > crate::biomechanics::MAX_SECTION_MEASURES as u32 {
+        return Err(format!(
+            "El rango solicitado de {} compases supera el límite máximo permitido de {} compases.",
+            num_measures,
+            crate::biomechanics::MAX_SECTION_MEASURES
+        ));
+    }
     let s_type_val = s_type.unwrap_or_else(|| "Arcade".to_string());
 
-    let play_mode_name = match play_mode {
-        PlayMode::Single => "Single (5 flechas)",
-        PlayMode::Double => "Double (10 flechas)",
-    };
+    let play_mode_name = "Single (5 flechas)";
+
+    // Construct prompt context hierarchy
+    let mut context_summary = String::new();
+    let mut context_sources_used = vec!["SSC timing".to_string()];
+
+    // Add SSC timing to context
+    context_summary
+        .push_str("\n[CONTRATO DE TIEMPO Y METADATOS (Ground Truth del archivo .ssc)]\n");
+    context_summary.push_str(&format!("- Título de la Canción: {}\n", title_val));
+    context_summary.push_str(&format!("- Artista: {}\n", artist_val));
+    context_summary.push_str(&format!("- BPM de timing (#BPMS): {}\n", bpms_val));
+    context_summary.push_str(&format!("- Offset (#OFFSET): {} (Nota: Este offset es solo para contexto de sincronización, NO debe ser modificado por Gemini)\n", offset_val));
+
+    // 2. Music Analysis Engine
+    let use_ma = use_music_analysis.unwrap_or(true);
+    if use_ma {
+        if let Some(ref report) = report_opt {
+            context_sources_used.push("Music Analysis".to_string());
+            context_summary.push_str("\n[CONTEXTO DE ANÁLISIS MUSICAL (Music Analysis Engine)]\n");
+            context_summary.push_str(&format!(
+                "- Duración: {} segundos\n",
+                report.duration_seconds
+            ));
+            if let Some(sec) = report.sections.iter().find(|s| s.section_id == section_id) {
+                context_summary.push_str(&format!(
+                    "- Rol de la Sección Rítmica: {} (Rol PIU: {})\n",
+                    sec.music_role, sec.piu_role
+                ));
+                context_summary.push_str(&format!("- Perfil de Energía: {}\n", sec.energy_profile));
+            }
+            if let Some(intent) = report
+                .choreographic_intent
+                .iter()
+                .find(|i| i.section_id == section_id)
+            {
+                context_summary.push_str(&format!(
+                    "- Objetivo de Densidad: {}\n",
+                    intent.density_target
+                ));
+                context_summary.push_str(&format!(
+                    "- Presupuesto de Dificultad (Difficulty Budget): {}\n",
+                    intent.difficulty_budget
+                ));
+                context_summary.push_str(&format!(
+                    "- Patrones Recomendados: {:?}\n",
+                    intent.recommended_pattern_families
+                ));
+                context_summary.push_str(&format!(
+                    "- Patrones a Evitar: {:?}\n",
+                    intent.avoid_pattern_families
+                ));
+                context_summary.push_str(&format!(
+                    "- Estrategia de Motivos: {}\n",
+                    intent.motif_strategy
+                ));
+            }
+        } else {
+            context_sources_used.push("Manual user inputs".to_string());
+        }
+    } else {
+        context_sources_used.push("Manual user inputs".to_string());
+    }
+
+    // 3. Browser BPM
+    let use_bb = use_browser_bpm.unwrap_or(true);
+    if use_bb {
+        if let Some(ref recon) = browser_bpm_reconciliation {
+            if !recon.trim().is_empty() {
+                context_sources_used.push("Browser BPM".to_string());
+                context_summary.push_str("\n[DIAGNÓSTICOS AUXILIARES DE BPM EN NAVEGADOR]\n");
+                context_summary.push_str(&format!(
+                    "- Reconciliación de BPM del Navegador: {}\n",
+                    recon
+                ));
+            }
+        }
+    }
 
     // 4. Construct prompt
     let prompt_text = format!(
@@ -1636,15 +1768,21 @@ pub async fn generate_gemini_chart_preview_core(
          \n\
          [REGLAS BIOMECÁNICAS Y TÉCNICAS]\n\
          1. Caracteres permitidos: Solo '0' (vacío), '1' (tap), '2' (inicio de hold/congelador), '3' (fin de hold/congelador). Queda ESTRICTAMENTE PROHIBIDO el uso de minas ('M').\n\
-         2. Longitud de fila: Para Single, cada fila debe medir exactamente 5 caracteres (esquina inferior-izquierda, esquina superior-izquierda, centro-amarillo, esquina superior-derecha, esquina inferior-derecha). Para Double, debe medir exactamente 10 caracteres.\n\
+         2. Longitud de fila: Para Single, cada fila debe medir exactamente 5 caracteres (esquina inferior-izquierda, esquina superior-izquierda, centro-amarillo, esquina superior-derecha, esquina inferior-derecha).\n\
          3. Subdivisiones: Solo se permiten subdivisiones de 4, 8, 16 o 32 filas por compás. La cantidad de filas en 'rows' debe coincidir EXACTAMENTE con el valor de 'subdivision'.\n\
          4. Jumps (Saltos): Un jump es presionar 2 o más flechas a la vez. No coloques jumps consecutivos a alta velocidad.\n\
          5. Triple Taps: En niveles < 16, evita triples. En niveles 16+ se permiten como Brackets (puntero-talón).\n\
          6. Alternancia de pies: Evita double-steps rápidos (Jack rápido) en la misma flecha consecutivamente en streams de subdivision 16+.\n\
-         7. Giros y torso (Twists): Si el chart exige cruces que rotan el torso, asegúrate de proveer un contra-giro (untwist) de retorno inmediato para neutralizar la cadera.\n\
+         7. Giros y torso (Twists): Si el chart exige cruces que rotan el torso, asegúrate de proveer un contra-giro (untwist) de retorno inmediato para neutralizar la cadera. Evita giros de espaldas (180°) en compases rápidos a menos de que terminen con una flecha neutral como el centro amarillo.\n\
+         8. GIMMICK RESTRICTION: No generes ni incluyas marcas de tiempo, etiquetas de metadatos ni gimmicks (#SPEEDS, #SCROLLS, #STOPS, #DELAYS, #WARPS, #FAKES) en las filas ni en el payload JSON. El output debe constar únicamente de las filas de notas limpias con caracteres permitidos.\n\
+         9. GUIAS DE DIFICULTAD POR NIVELES:\n\
+            - Niveles 1-7: Patrones muy dispersos, simples, sin cruces ni giros complicados, principalmente negras y corcheas.\n\
+            - Niveles 8-13: Streams y jumps básicos, crossovers sencillos, velocidad moderada.\n\
+            - Niveles 14-22: Giros de torso controlados (twists), streams continuos en semicorcheas, y uso moderado de brackets.\n\
+            - Niveles 23-26: Alta demanda física y técnica, giros intensos, brackets y bracket-jumps rápidos.\n\
          \n\
          Genera el array de 'measures' de tamaño exactamente {} (una por cada compás desde {} hasta {}).",
-        section_id, play_mode_name, target_level, start_m_val, end_m_val, s_type_val, intent_info,
+        section_id, play_mode_name, target_level, start_m_val, end_m_val, s_type_val, context_summary,
         section_id, target_level, play_mode, start_m_val,
         num_measures, start_m_val, end_m_val
     );
@@ -1761,6 +1899,7 @@ pub async fn generate_gemini_chart_preview_core(
             generated_notes: None,
             raw_payload: Some(clean_response),
             backup_path: None,
+            context_sources_used: Some(context_sources_used.clone()),
         });
     }
 
@@ -1818,6 +1957,7 @@ pub async fn generate_gemini_chart_preview_core(
         generated_notes: Some(payload.to_ssc_notes()),
         raw_payload: Some(clean_response),
         backup_path: None,
+        context_sources_used: Some(context_sources_used),
     })
 }
 
@@ -1845,12 +1985,40 @@ pub async fn generate_gemini_chart_preview<R: tauri::Runtime>(
     start_measure: Option<u32>,
     end_measure: Option<u32>,
     song_type: Option<String>,
+    use_music_analysis: Option<bool>,
+    use_browser_bpm: Option<bool>,
+    browser_bpm_reconciliation: Option<String>,
 ) -> Result<AppendChartResult, String> {
     let play_mode_enum = match play_mode.as_str() {
         "Single" => PlayMode::Single,
-        "Double" => PlayMode::Double,
-        _ => return Err(format!("Unsupported play mode: {}", play_mode)),
+        _ => {
+            return Err(format!(
+                "Unsupported play mode: {}. Only Single is supported in this phase.",
+                play_mode
+            ))
+        }
     };
+
+    if target_level < 1 || target_level > 26 {
+        return Err(format!(
+            "Nivel de dificultad Single ({}) fuera de rango (1-26).",
+            target_level
+        ));
+    }
+
+    if let (Some(start), Some(end)) = (start_measure, end_measure) {
+        if start > end {
+            return Err("El compás de inicio no puede ser mayor que el compás de fin.".to_string());
+        }
+        let requested_len = end - start + 1;
+        if requested_len > crate::biomechanics::MAX_SECTION_MEASURES as u32 {
+            return Err(format!(
+                "El rango solicitado de {} compases supera el límite máximo permitido de {} compases.",
+                requested_len,
+                crate::biomechanics::MAX_SECTION_MEASURES
+            ));
+        }
+    }
 
     let _w_mode = validate_preview_write_mode(&write_mode)?;
 
@@ -1884,6 +2052,9 @@ pub async fn generate_gemini_chart_preview<R: tauri::Runtime>(
         start_measure,
         end_measure,
         song_type,
+        use_music_analysis,
+        use_browser_bpm,
+        browser_bpm_reconciliation,
     )
     .await
 }
@@ -2408,6 +2579,9 @@ mod tests {
             None,
             None,
             None,
+            None,
+            None,
+            None,
         )
         .await;
         assert!(result_gate.is_err());
@@ -2428,6 +2602,9 @@ mod tests {
             &client,
             Some(0),
             Some(0),
+            None,
+            None,
+            None,
             None,
         )
         .await
@@ -2471,6 +2648,9 @@ mod tests {
             &client,
             Some(0),
             Some(0),
+            None,
+            None,
+            None,
             None,
         )
         .await
@@ -2516,6 +2696,9 @@ mod tests {
             Some(0),
             Some(0),
             None,
+            None,
+            None,
+            None,
         )
         .await
         .expect("Core preview mismatch play_mode failed");
@@ -2559,6 +2742,9 @@ mod tests {
             &client,
             Some(0),
             Some(0),
+            None,
+            None,
+            None,
             None,
         )
         .await
@@ -2604,6 +2790,9 @@ mod tests {
             Some(0),
             Some(0),
             None,
+            None,
+            None,
+            None,
         )
         .await
         .expect("Core preview with warnings failed");
@@ -2644,6 +2833,9 @@ mod tests {
             Some(0),
             Some(0),
             None,
+            None,
+            None,
+            None,
         )
         .await
         .expect("Core preview with error failed");
@@ -2674,6 +2866,9 @@ mod tests {
             &client,
             Some(0),
             Some(0),
+            None,
+            None,
+            None,
             None,
         )
         .await;
@@ -2715,6 +2910,9 @@ mod tests {
             &client,
             Some(32),
             Some(33),
+            None,
+            None,
+            None,
             None,
         )
         .await
@@ -2760,6 +2958,9 @@ mod tests {
             Some(32),
             Some(33),
             None,
+            None,
+            None,
+            None,
         )
         .await
         .expect("Preview core failed");
@@ -2802,6 +3003,9 @@ mod tests {
             Some(32),
             Some(33),
             None,
+            None,
+            None,
+            None,
         )
         .await
         .expect("Preview core failed");
@@ -2825,6 +3029,9 @@ mod tests {
             &client,
             Some(33),
             Some(32),
+            None,
+            None,
+            None,
             None,
         )
         .await;
@@ -2866,6 +3073,9 @@ mod tests {
             None,
             None,
             None,
+            None,
+            None,
+            None,
         )
         .await
         .expect("Fenced JSON preview failed");
@@ -2882,6 +3092,51 @@ mod tests {
         crate::settings::set_test_gemini_enabled(None);
         let _ = std::fs::remove_file(temp_ssc_path);
         let _ = std::fs::remove_file(test_audio_path);
+    }
+
+    #[tokio::test]
+    async fn test_generate_gemini_chart_preview_oversized_range_rejected() {
+        let temp_dir = std::env::temp_dir();
+        let temp_ssc_path = temp_dir.join("test_oversized_range.ssc");
+        let original_path = get_fixture_path();
+        std::fs::copy(&original_path, &temp_ssc_path).expect("Failed to copy");
+
+        let test_audio_path = temp_dir.join("test_audio_oversized.mp3");
+        {
+            let mut file = std::fs::File::create(&test_audio_path).unwrap();
+            file.write_all(b"audio content").unwrap();
+        }
+
+        crate::settings::set_test_gemini_enabled(Some(true));
+        let client = GeminiClient::new(None);
+
+        // Call with 0..17 (18 measures, which exceeds limit of 16)
+        let result = generate_gemini_chart_preview_core(
+            "fake-key",
+            &temp_ssc_path.to_string_lossy(),
+            &test_audio_path.to_string_lossy(),
+            PlayMode::Single,
+            10,
+            "preview_section",
+            "AI Previewer",
+            &client,
+            Some(0),
+            Some(17), // 18 measures
+            None,
+            None,
+            None,
+            None,
+        )
+        .await;
+
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert!(err.contains("supera el límite máximo"));
+
+        // Clean up
+        let _ = std::fs::remove_file(temp_ssc_path);
+        let _ = std::fs::remove_file(test_audio_path);
+        crate::settings::set_test_gemini_enabled(None);
     }
 
     #[test]
@@ -2954,7 +3209,6 @@ mod tests {
                 "current_twist_debt": 0.0,
                 "current_stamina_debt": 0.3
             },
-            "placeholder_unused_fields": {},
             "measures": [
                 {
                     "measure_index": 0,
@@ -3043,6 +3297,57 @@ mod tests {
 
         // Should return Err because of the severe biomechanical structure error
         assert!(result.is_err());
+
+        // Clean up
+        let _ = std::fs::remove_file(temp_ssc_path);
+    }
+
+    #[test]
+    fn test_append_approved_gemini_payload_oversized() {
+        let original_path = get_fixture_path();
+        let temp_dir = std::env::temp_dir();
+        let temp_ssc_path = temp_dir.join("test_approved_oversized.ssc");
+        std::fs::copy(&original_path, &temp_ssc_path).expect("Failed to copy");
+
+        // Construct payload with 17 measures (oversized!)
+        let mut measures = Vec::new();
+        for i in 0..17 {
+            measures.push(format!(
+                r#"{{
+                    "measure_index": {},
+                    "subdivision": 4,
+                    "rows": ["10000", "00100", "00001", "00100"]
+                }}"#,
+                i
+            ));
+        }
+
+        let oversized_payload = format!(
+            r#"{{
+                "section_id": "oversized_section",
+                "difficulty_level": 12,
+                "play_mode": "Single",
+                "biomechanical_state": {{
+                    "current_twist_debt": 0.0,
+                    "current_stamina_debt": 0.3
+                }},
+                "measures": [{}]
+            }}"#,
+            measures.join(",")
+        );
+
+        let fp = get_file_fingerprint(temp_ssc_path.to_string_lossy().to_string()).unwrap();
+        let result = append_approved_gemini_payload(
+            temp_ssc_path.to_string_lossy().to_string(),
+            oversized_payload,
+            "Approved Tester".to_string(),
+            fp.sha256,
+        );
+
+        // Should return Err because the payload exceeds MAX_SECTION_MEASURES = 16
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert!(err.contains("supera el límite máximo"));
 
         // Clean up
         let _ = std::fs::remove_file(temp_ssc_path);

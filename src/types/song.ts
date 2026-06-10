@@ -69,6 +69,7 @@ export interface IAppendChartResult {
   generated_notes?: string | null;
   raw_payload?: string | null;
   backup_path?: string | null;
+  context_sources_used?: string[] | null;
 }
 
 export interface IGeminiBiomechanicalState {

@@ -141,12 +141,12 @@ pub fn get_response_schema_json() -> serde_json::Value {
             },
             "difficulty_level": {
                 "type": "integer",
-                "description": "Difficulty level of the chart (Single: 1-26, Double: 1-15)"
+                "description": "Difficulty level of the chart (Single: 1-26)"
             },
             "play_mode": {
                 "type": "string",
-                "enum": ["Single", "Double"],
-                "description": "Play mode of the chart"
+                "enum": ["Single"],
+                "description": "Play mode of the chart (locked to Single)"
             },
             "biomechanical_state": {
                 "type": "object",
@@ -161,11 +161,11 @@ pub fn get_response_schema_json() -> serde_json::Value {
                     },
                     "last_left_foot_lane": {
                         "type": "integer",
-                        "description": "Last lane index pressed by the left foot (0-4 for Single, 0-9 for Double)"
+                        "description": "Last lane index pressed by the left foot (0-4 for Single)"
                     },
                     "last_right_foot_lane": {
                         "type": "integer",
-                        "description": "Last lane index pressed by the right foot (0-4 for Single, 0-9 for Double)"
+                        "description": "Last lane index pressed by the right foot (0-4 for Single)"
                     }
                 },
                 "required": ["current_twist_debt", "current_stamina_debt"],
@@ -188,7 +188,7 @@ pub fn get_response_schema_json() -> serde_json::Value {
                         },
                         "rows": {
                             "type": "array",
-                            "description": "Note rows matching the subdivision count. Each row must be a string of length 5 (Single) or 10 (Double), composed only of characters '0' (empty), '1' (normal step), '2' (hold start), '3' (hold release). No mines 'M' or other characters allowed.",
+                            "description": "Note rows matching the subdivision count. Each row must be a string of length exactly 5 (Single), composed only of characters '0' (empty), '1' (normal step), '2' (hold start), '3' (hold release). No mines 'M' or other characters allowed.",
                             "items": {
                                 "type": "string"
                             }

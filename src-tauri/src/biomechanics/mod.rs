@@ -41,6 +41,7 @@ pub struct ValidatedChartSection {
 
 // Structures for structured Gemini AI payloads
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct GeminiBiomechanicalState {
     pub current_twist_debt: f64,
     pub current_stamina_debt: f64,
@@ -49,13 +50,17 @@ pub struct GeminiBiomechanicalState {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct GeminiMeasure {
     pub measure_index: u32,
     pub subdivision: u32,
     pub rows: Vec<String>,
 }
 
+pub const MAX_SECTION_MEASURES: usize = 16;
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct GeminiChartSectionPayload {
     pub section_id: String,
     pub difficulty_level: u32,
@@ -77,12 +82,7 @@ impl GeminiChartSectionPayload {
                 }
             }
             PlayMode::Double => {
-                if self.difficulty_level < 1 || self.difficulty_level > 15 {
-                    return Err(format!(
-                        "Nivel de dificultad Double ({}) fuera de rango experimental para MVP (1-15). Los niveles Double 16+ quedan fuera del alcance inicial.",
-                        self.difficulty_level
-                    ));
-                }
+                return Err("Play mode Double is not supported in this phase.".to_string());
             }
         }
 
@@ -91,6 +91,15 @@ impl GeminiChartSectionPayload {
             return Err(
                 "El payload de Gemini no contiene medidas (measures está vacío).".to_string(),
             );
+        }
+
+        // 2b. Reject oversized measures list (hard backend cap)
+        if self.measures.len() > MAX_SECTION_MEASURES {
+            return Err(format!(
+                "El payload de Gemini supera el límite máximo de {} medidas (recibidas: {}).",
+                MAX_SECTION_MEASURES,
+                self.measures.len()
+            ));
         }
 
         let expected_len = match self.play_mode {
@@ -595,8 +604,8 @@ mod tests {
         };
         assert!(payload_single_err.validate_structure().is_err());
 
-        // 3. Double valid difficulty: 10
-        let payload_double_ok = GeminiChartSectionPayload {
+        // 3. Double is rejected completely in this phase
+        let payload_double_err = GeminiChartSectionPayload {
             section_id: "test".to_string(),
             difficulty_level: 10,
             play_mode: PlayMode::Double,
@@ -607,22 +616,62 @@ mod tests {
                 rows: vec!["1000000000".to_string(); 4],
             }],
         };
-        assert!(payload_double_ok.validate_structure().is_ok());
+        assert!(payload_double_err.validate_structure().is_err());
+    }
 
-        // 4. Double invalid difficulty for MVP: 16
-        let payload_double_err = GeminiChartSectionPayload {
-            section_id: "test".to_string(),
-            difficulty_level: 16,
-            play_mode: PlayMode::Double,
-            biomechanical_state: state.clone(),
-            measures: vec![GeminiMeasure {
-                measure_index: 0,
-                subdivision: 4,
-                rows: vec!["1000000000".to_string(); 4],
-            }],
+    #[test]
+    fn test_gemini_payload_rejects_timing_gimmick_tags() {
+        // If the JSON contains unknown fields like bpms or scrolls, it must fail deserialization because of deny_unknown_fields
+        let json_with_extra = r#"{
+            "section_id": "chorus_1",
+            "difficulty_level": 12,
+            "play_mode": "Single",
+            "biomechanical_state": {
+                "current_twist_debt": 0.0,
+                "current_stamina_debt": 0.0,
+                "last_left_foot_lane": 1,
+                "last_right_foot_lane": 3
+            },
+            "measures": [
+                {
+                    "measure_index": 32,
+                    "subdivision": 4,
+                    "rows": ["00000", "00000", "00000", "00000"]
+                }
+            ],
+            "bpms": [[0.0, 150.0]]
+        }"#;
+        let parsed: Result<GeminiChartSectionPayload, serde_json::Error> =
+            serde_json::from_str(json_with_extra);
+        assert!(
+            parsed.is_err(),
+            "Should fail deserialization due to unknown field 'bpms'"
+        );
+    }
+
+    #[test]
+    fn test_gemini_payload_oversized_measures_rejected() {
+        let state = GeminiBiomechanicalState {
+            current_twist_debt: 0.0,
+            current_stamina_debt: 0.0,
+            last_left_foot_lane: Some(1),
+            last_right_foot_lane: Some(3),
         };
-        let err = payload_double_err.validate_structure().unwrap_err();
-        assert!(err.contains("MVP"));
+        let measure = GeminiMeasure {
+            measure_index: 0,
+            subdivision: 4,
+            rows: vec!["10000".to_string(); 4],
+        };
+        // Create 17 measures to exceed the MAX_SECTION_MEASURES = 16 limit
+        let payload_oversized = GeminiChartSectionPayload {
+            section_id: "test".to_string(),
+            difficulty_level: 10,
+            play_mode: PlayMode::Single,
+            biomechanical_state: state.clone(),
+            measures: vec![measure.clone(); 17],
+        };
+        let err = payload_oversized.validate_structure().unwrap_err();
+        assert!(err.contains("supera el límite máximo"));
     }
 
     #[test]
