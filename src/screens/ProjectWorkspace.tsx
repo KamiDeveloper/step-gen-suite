@@ -114,6 +114,10 @@ export const ProjectWorkspace: React.FC<ProjectWorkspaceProps> = ({ onNavigate }
   const activeWorkspaceSongIdRef = useRef<string | null>(null);
   const isMountedRef = useRef(true);
   const workspaceRequestIdRef = useRef(0);
+  const activeAnalysisPathRef = useRef<string | null>(null);
+  const activeSongPathRef = useRef<string | null>(null);
+  const activePreviewRequestIdRef = useRef(0);
+  const manualAnalysisRequestIdRef = useRef(0);
 
   useEffect(() => {
     isMountedRef.current = true;
@@ -175,32 +179,63 @@ export const ProjectWorkspace: React.FC<ProjectWorkspaceProps> = ({ onNavigate }
     }
   }, [settings, currentSong]);
 
-  // Auto-load analysis report if it exists on disk
+  // Auto-load analysis report if it exists on disk, and reset preview/loading/passphrase states immediately on song change
   useEffect(() => {
-    if (currentSong?.ssc_path) {
+    const requestedPath = currentSong?.ssc_path ?? null;
+
+    // Sync active song path and increment request IDs immediately to invalidate pending in-flight queries
+    activeSongPathRef.current = requestedPath;
+    activePreviewRequestIdRef.current += 1;
+    manualAnalysisRequestIdRef.current += 1;
+    activeAnalysisPathRef.current = requestedPath;
+
+    // Reset loaders and ephemeral state immediately when song changes
+    setLoading(false);
+    setAnalysisLoading(false);
+    setPassphrase("");
+
+    // Reset analysis and preview states immediately when song changes
+    setAnalysisReport(null);
+    setReportPath(null);
+    setPreviewResult(null);
+    setCommitMessage(null);
+    setFingerprintBefore(null);
+    setFingerprintAfter(null);
+    setAnalysisError(null);
+    setError(null);
+
+    if (requestedPath) {
+      let cancelled = false;
       invoke<SongAnalysisReport | null>("load_analysis_report", {
-        sscPath: currentSong.ssc_path,
+        sscPath: requestedPath,
       })
         .then((report) => {
-          if (isMountedRef.current) {
-            setAnalysisReport(report);
-            if (report) {
-              const lastSlash = currentSong.ssc_path.lastIndexOf("/");
-              const lastBackslash = currentSong.ssc_path.lastIndexOf("\\");
-              const idx = Math.max(lastSlash, lastBackslash);
-              const parentDir = idx !== -1 ? currentSong.ssc_path.substring(0, idx) : ".";
-              setReportPath(`${parentDir}/.ai-step-gen-analysis/song-analysis-report.v1.json`);
-            } else {
-              setReportPath(null);
-            }
+          if (cancelled || activeAnalysisPathRef.current !== requestedPath || !isMountedRef.current) {
+            return;
+          }
+          setAnalysisReport(report);
+          if (report) {
+            const lastSlash = requestedPath.lastIndexOf("/");
+            const lastBackslash = requestedPath.lastIndexOf("\\");
+            const idx = Math.max(lastSlash, lastBackslash);
+            const parentDir = idx !== -1 ? requestedPath.substring(0, idx) : ".";
+            setReportPath(`${parentDir}/.ai-step-gen-analysis/song-analysis-report.v1.json`);
+          } else {
+            setReportPath(null);
           }
         })
         .catch((err) => {
+          if (cancelled || activeAnalysisPathRef.current !== requestedPath || !isMountedRef.current) {
+            return;
+          }
           console.warn("Failed to auto-load analysis report:", err);
+          setAnalysisReport(null);
+          setReportPath(null);
         });
-    } else {
-      setAnalysisReport(null);
-      setReportPath(null);
+
+      return () => {
+        cancelled = true;
+      };
     }
   }, [currentSong?.ssc_path]);
 
@@ -223,10 +258,40 @@ export const ProjectWorkspace: React.FC<ProjectWorkspaceProps> = ({ onNavigate }
   const isGeminiBlocked = (playMode === "Single" && targetLevel > 26) || (playMode === "Double" && targetLevel > 15);
 
   const handleGeneratePreview = async () => {
+    if (!currentSong) return;
     if (!passphrase.trim()) {
       setError("Please enter your unlock passphrase to decrypt the API Key.");
       return;
     }
+
+    const matchedSection = analysisReport?.sections.find(s => s.section_id === selectedSectionKey);
+    const startMeasureVal = matchedSection ? matchedSection.start_measure : startMeasure;
+    const endMeasureVal = matchedSection ? matchedSection.end_measure : endMeasure;
+
+    if (selectedSectionKey === "custom") {
+      if (startMeasureVal < 0) {
+        setError("El compás de inicio no puede ser menor a 0.");
+        return;
+      }
+      if (endMeasureVal < startMeasureVal) {
+        setError("El compás de fin debe ser mayor o igual al compás de inicio.");
+        return;
+      }
+      const numMeasures = endMeasureVal - startMeasureVal + 1;
+      if (numMeasures > 64) {
+        setError(`El rango de compases solicitado (${numMeasures}) supera el límite de 64 compases permitido para MVP Alpha.`);
+        return;
+      }
+    }
+
+    const previewPath = currentSong.ssc_path;
+    const requestId = activePreviewRequestIdRef.current + 1;
+    activePreviewRequestIdRef.current = requestId;
+
+    const isActivePreview = () =>
+      isMountedRef.current &&
+      activeSongPathRef.current === previewPath &&
+      activePreviewRequestIdRef.current === requestId;
 
     setLoading(true);
     setError(null);
@@ -240,21 +305,22 @@ export const ProjectWorkspace: React.FC<ProjectWorkspaceProps> = ({ onNavigate }
       let fpBefore: IFileFingerprint | null = null;
       try {
         fpBefore = await invoke<IFileFingerprint>("get_file_fingerprint", {
-          path: currentSong.ssc_path,
+          path: previewPath,
         });
+        if (!isActivePreview()) return;
         setFingerprintBefore(fpBefore);
       } catch (fpErr: any) {
         console.warn("Failed to get initial fingerprint:", fpErr);
       }
 
       // 2. Real Gemini Preview - writeMode is "PreviewOnly"
-      const matchedSection = analysisReport?.sections.find(s => s.section_id === selectedSectionKey);
-      const startMeasureVal = matchedSection ? matchedSection.start_measure : startMeasure;
-      const endMeasureVal = matchedSection ? matchedSection.end_measure : endMeasure;
-      const songTypeVal = matchedSection ? (analysisReport?.timing_grid.song_type || songType) : songType;
+      const matchedSectionReal = analysisReport?.sections.find(s => s.section_id === selectedSectionKey);
+      const startMeasureValReal = matchedSectionReal ? matchedSectionReal.start_measure : startMeasure;
+      const endMeasureValReal = matchedSectionReal ? matchedSectionReal.end_measure : endMeasure;
+      const songTypeVal = matchedSectionReal ? (analysisReport?.timing_grid.song_type || songType) : songType;
 
       const result = await invoke<IAppendChartResult>("generate_gemini_chart_preview", {
-        sscPath: currentSong.ssc_path,
+        sscPath: previewPath,
         audioPath: currentSong.audio_path || "",
         passphrase: passphrase.trim(),
         playMode,
@@ -262,18 +328,20 @@ export const ProjectWorkspace: React.FC<ProjectWorkspaceProps> = ({ onNavigate }
         sectionId: sectionId.trim() || "chorus_1",
         author: author.trim() || "Gemini Preview",
         writeMode: "PreviewOnly",
-        startMeasure: startMeasureVal,
-        endMeasure: endMeasureVal,
+        startMeasure: startMeasureValReal,
+        endMeasure: endMeasureValReal,
         songType: songTypeVal,
       });
 
+      if (!isActivePreview()) return;
       setPreviewResult(result);
 
       // 3. Get file fingerprint AFTER preview
       try {
         const fpAfter = await invoke<IFileFingerprint>("get_file_fingerprint", {
-          path: currentSong.ssc_path,
+          path: previewPath,
         });
+        if (!isActivePreview()) return;
         setFingerprintAfter(fpAfter);
       } catch (fpErr: any) {
         console.warn("Failed to get final fingerprint:", fpErr);
@@ -284,11 +352,14 @@ export const ProjectWorkspace: React.FC<ProjectWorkspaceProps> = ({ onNavigate }
         setError("Biomechanical validation errors found. Check the report below.");
       }
     } catch (err: any) {
+      if (!isActivePreview()) return;
       console.error(err);
       setError("Preview Generation failed: " + err.toString());
     } finally {
-      setPassphrase(""); // Wipe ephemeral passphrase
-      setLoading(false);
+      if (isActivePreview()) {
+        setPassphrase(""); // Wipe ephemeral passphrase
+        setLoading(false);
+      }
     }
   };
 
@@ -465,23 +536,39 @@ export const ProjectWorkspace: React.FC<ProjectWorkspaceProps> = ({ onNavigate }
 
   const handleRunOfflineAnalysis = async () => {
     if (!currentSong) return;
+
+    const analysisPath = currentSong.ssc_path;
+    const requestId = manualAnalysisRequestIdRef.current + 1;
+    manualAnalysisRequestIdRef.current = requestId;
+
+    const isActiveAnalysis = () =>
+      isMountedRef.current &&
+      activeSongPathRef.current === analysisPath &&
+      manualAnalysisRequestIdRef.current === requestId;
+
     setAnalysisLoading(true);
     setAnalysisError(null);
     setAnalysisReport(null);
     setReportPath(null);
+
     try {
       const result = await invoke<AnalysisCommandResult>("analyze_song_offline", {
-        sscPath: currentSong.ssc_path,
+        sscPath: analysisPath,
         audioPath: currentSong.audio_path || "",
         writeReport: writeReportFile,
       });
+
+      if (!isActiveAnalysis()) return;
       setAnalysisReport(result.report);
       setReportPath(result.report_path);
     } catch (err: any) {
+      if (!isActiveAnalysis()) return;
       console.error(err);
       setAnalysisError(err.toString());
     } finally {
-      setAnalysisLoading(false);
+      if (isActiveAnalysis()) {
+        setAnalysisLoading(false);
+      }
     }
   };
 
@@ -864,6 +951,12 @@ export const ProjectWorkspace: React.FC<ProjectWorkspaceProps> = ({ onNavigate }
                   />
                 </div>
               </div>
+
+              {selectedSectionKey === "custom" && (
+                <p className="custom-section-hint">
+                  Nota: El rango máximo de compases permitido para Custom Section es de 64 compases.
+                </p>
+              )}
 
               {(() => {
                 const matchedIntent = analysisReport?.choreographic_intent.find(

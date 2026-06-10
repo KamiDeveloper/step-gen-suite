@@ -1359,6 +1359,25 @@ pub fn append_mock_gemini_payload(
     }
 }
 
+pub fn sanitize_gemini_json_payload(raw: &str) -> String {
+    let raw_trimmed = raw.trim();
+
+    // Check if the response contains markdown code block fences
+    if let Some(json_start) = raw_trimmed.find("```json") {
+        let after_fence = &raw_trimmed[json_start + 7..];
+        if let Some(fence_end) = after_fence.find("```") {
+            return after_fence[..fence_end].trim().to_string();
+        }
+    } else if let Some(code_start) = raw_trimmed.find("```") {
+        let after_fence = &raw_trimmed[code_start + 3..];
+        if let Some(fence_end) = after_fence.find("```") {
+            return after_fence[..fence_end].trim().to_string();
+        }
+    }
+
+    raw_trimmed.to_string()
+}
+
 #[tauri::command]
 pub fn append_approved_gemini_payload(
     ssc_path: String,
@@ -1375,7 +1394,8 @@ pub fn append_approved_gemini_payload(
     }
 
     // 1. Parse payload JSON
-    let payload: GeminiChartSectionPayload = serde_json::from_str(&payload_json)
+    let clean_json = sanitize_gemini_json_payload(&payload_json);
+    let payload: GeminiChartSectionPayload = serde_json::from_str(&clean_json)
         .map_err(|e| format!("Error parsing approved payload JSON: {}", e))?;
 
     // 2. Structural validation
@@ -1512,12 +1532,17 @@ pub async fn generate_gemini_chart_preview_core(
 
     let start_m_val = start_m.unwrap_or(0);
     let end_m_val = end_m.unwrap_or(7);
+    if end_m_val < start_m_val {
+        return Err(format!(
+            "El compás de fin ({}) no puede ser menor que el compás de inicio ({})",
+            end_m_val, start_m_val
+        ));
+    }
+    let num_measures = end_m_val
+        .checked_sub(start_m_val)
+        .and_then(|d| d.checked_add(1))
+        .ok_or_else(|| "Measure range calculation overflowed".to_string())?;
     let s_type_val = s_type.unwrap_or_else(|| "Arcade".to_string());
-    let num_measures = if end_m_val >= start_m_val {
-        end_m_val - start_m_val + 1
-    } else {
-        1
-    };
 
     let play_mode_name = match play_mode {
         PlayMode::Single => "Single (5 flechas)",
@@ -1583,26 +1608,18 @@ pub async fn generate_gemini_chart_preview_core(
         .await?;
 
     // Strip markdown formatting if Gemini included it
-    let mut clean_response = raw_response.trim();
-    if clean_response.starts_with("```") {
-        if let Some(first_newline) = clean_response.find('\n') {
-            clean_response = &clean_response[first_newline..];
-        }
-        if clean_response.ends_with("```") {
-            clean_response = &clean_response[..clean_response.len() - 3];
-        }
-        clean_response = clean_response.trim();
-    }
+    let clean_response = sanitize_gemini_json_payload(&raw_response);
 
     // 6. Parse response JSON
-    let payload: GeminiChartSectionPayload = serde_json::from_str(clean_response).map_err(|e| {
-        let error_summary = e.to_string();
-        let length = clean_response.len();
-        format!(
-            "Gemini returned invalid JSON: {}. Response length: {} bytes.",
-            error_summary, length
-        )
-    })?;
+    let payload: GeminiChartSectionPayload =
+        serde_json::from_str(&clean_response).map_err(|e| {
+            let error_summary = e.to_string();
+            let length = clean_response.len();
+            format!(
+                "Gemini returned invalid JSON: {}. Response length: {} bytes.",
+                error_summary, length
+            )
+        })?;
 
     // Validate that the response matches the requested parameters
     let mut mismatch_issues = Vec::new();
@@ -1643,6 +1660,37 @@ pub async fn generate_gemini_chart_preview_core(
         });
     }
 
+    let actual_count = payload.measures.len();
+    if actual_count != num_measures as usize {
+        mismatch_issues.push(ValidationIssue {
+            measure_index: 0,
+            row_index: 0,
+            severity: ValidationSeverity::Error,
+            issue_type: ValidationIssueType::InvalidGeminiStructure,
+            message: format!(
+                "Gemini returned {} measures, expected {} for requested range {}-{}.",
+                actual_count, num_measures, start_m_val, end_m_val
+            ),
+        });
+    }
+
+    // Validate that each measure index matches the expected absolute index in sequence
+    for (i, measure) in payload.measures.iter().enumerate() {
+        let expected_index = start_m_val + i as u32;
+        if measure.measure_index != expected_index {
+            mismatch_issues.push(ValidationIssue {
+                measure_index: measure.measure_index as usize,
+                row_index: 0,
+                severity: ValidationSeverity::Error,
+                issue_type: ValidationIssueType::InvalidGeminiStructure,
+                message: format!(
+                    "La medida en la posición {} tiene un índice de compás incorrecto ({}). Se esperaba el índice absoluto {}.",
+                    i, measure.measure_index, expected_index
+                ),
+            });
+        }
+    }
+
     if !mismatch_issues.is_empty() {
         let validation_result = ValidatedChartSection {
             play_mode,
@@ -1656,7 +1704,7 @@ pub async fn generate_gemini_chart_preview_core(
             written: false,
             message: "Aborted: Gemini payload mismatch with requested parameters.".to_string(),
             generated_notes: None,
-            raw_payload: Some(raw_response.clone()),
+            raw_payload: Some(clean_response),
             backup_path: None,
         });
     }
@@ -1713,7 +1761,7 @@ pub async fn generate_gemini_chart_preview_core(
         written,
         message,
         generated_notes: Some(payload.to_ssc_notes()),
-        raw_payload: Some(raw_response),
+        raw_payload: Some(clean_response),
         backup_path: None,
     })
 }
@@ -2219,8 +2267,8 @@ mod tests {
             "preview_section",
             "AI Previewer",
             &client,
-            None,
-            None,
+            Some(0),
+            Some(0),
             None,
         )
         .await
@@ -2262,8 +2310,8 @@ mod tests {
             "preview_section", // requested
             "AI Previewer",
             &client,
-            None,
-            None,
+            Some(0),
+            Some(0),
             None,
         )
         .await
@@ -2306,8 +2354,8 @@ mod tests {
             "preview_section",
             "AI Previewer",
             &client,
-            None,
-            None,
+            Some(0),
+            Some(0),
             None,
         )
         .await
@@ -2350,8 +2398,8 @@ mod tests {
             "preview_section",
             "AI Previewer",
             &client,
-            None,
-            None,
+            Some(0),
+            Some(0),
             None,
         )
         .await
@@ -2394,8 +2442,8 @@ mod tests {
             "preview_section",
             "AI Previewer",
             &client,
-            None,
-            None,
+            Some(0),
+            Some(0),
             None,
         )
         .await
@@ -2434,8 +2482,8 @@ mod tests {
             "preview_section",
             "AI Previewer",
             &client,
-            None,
-            None,
+            Some(0),
+            Some(0),
             None,
         )
         .await
@@ -2465,8 +2513,8 @@ mod tests {
             "preview_section",
             "AI Previewer",
             &client,
-            None,
-            None,
+            Some(0),
+            Some(0),
             None,
         )
         .await;
@@ -2477,10 +2525,258 @@ mod tests {
         assert!(err_msg.contains("Gemini returned invalid JSON"));
         assert!(!err_msg.contains("sensitive_info")); // verify it was sanitized and did not leak original response content
 
+        // Case 9: Valid preview with start_measure=32, end_measure=33 and Gemini mock returning measure_index 32 and 33
+        let mock_post_valid_range = server.mock("POST", "/v1beta/models/gemini-3.5-flash:generateContent")
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(r#"{
+                "candidates": [
+                    {
+                        "content": {
+                            "parts": [
+                                {
+                                    "text": "{\n  \"section_id\": \"preview_section\",\n  \"difficulty_level\": 10,\n  \"play_mode\": \"Single\",\n  \"biomechanical_state\": {\n    \"current_twist_debt\": 0.0,\n    \"current_stamina_debt\": 0.1\n  },\n  \"measures\": [\n    {\n      \"measure_index\": 32,\n      \"subdivision\": 4,\n      \"rows\": [\"10000\", \"00100\", \"00001\", \"00100\"]\n    },\n    {\n      \"measure_index\": 33,\n      \"subdivision\": 4,\n      \"rows\": [\"10000\", \"00100\", \"00001\", \"00100\"]\n    }\n  ]\n}"
+                                }
+                            ]
+                        }
+                    }
+                ]
+            }"#)
+            .create_async()
+            .await;
+
+        let result_valid_range = generate_gemini_chart_preview_core(
+            "fake-key",
+            &temp_ssc_path.to_string_lossy(),
+            &test_audio_path.to_string_lossy(),
+            PlayMode::Single,
+            10,
+            "preview_section",
+            "AI Previewer",
+            &client,
+            Some(32),
+            Some(33),
+            None,
+        )
+        .await
+        .expect("Valid range preview failed");
+
+        mock_post_valid_range.assert_async().await;
+        assert!(!result_valid_range.written);
+        assert!(!result_valid_range
+            .validation
+            .issues
+            .iter()
+            .any(|i| i.severity == ValidationSeverity::Error));
+
+        // Case 10: Range 32-33 but Gemini returning only 1 measure -> should block
+        let mock_post_missing_measures = server.mock("POST", "/v1beta/models/gemini-3.5-flash:generateContent")
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(r#"{
+                "candidates": [
+                    {
+                        "content": {
+                            "parts": [
+                                {
+                                    "text": "{\n  \"section_id\": \"preview_section\",\n  \"difficulty_level\": 10,\n  \"play_mode\": \"Single\",\n  \"biomechanical_state\": {\n    \"current_twist_debt\": 0.0,\n    \"current_stamina_debt\": 0.1\n  },\n  \"measures\": [\n    {\n      \"measure_index\": 32,\n      \"subdivision\": 4,\n      \"rows\": [\"10000\", \"00100\", \"00001\", \"00100\"]\n    }\n  ]\n}"
+                                }
+                            ]
+                        }
+                    }
+                ]
+            }"#)
+            .create_async()
+            .await;
+
+        let result_missing_measures = generate_gemini_chart_preview_core(
+            "fake-key",
+            &temp_ssc_path.to_string_lossy(),
+            &test_audio_path.to_string_lossy(),
+            PlayMode::Single,
+            10,
+            "preview_section",
+            "AI Previewer",
+            &client,
+            Some(32),
+            Some(33),
+            None,
+        )
+        .await
+        .expect("Preview core failed");
+
+        mock_post_missing_measures.assert_async().await;
+        assert!(!result_missing_measures.written);
+        assert!(result_missing_measures.validation.issues.iter().any(|i| {
+            i.severity == ValidationSeverity::Error && i.message.contains("expected 2")
+        }));
+
+        // Case 11: Range 32-33 but Gemini returning out-of-range/incorrect indices -> should block
+        let mock_post_incorrect_indices = server.mock("POST", "/v1beta/models/gemini-3.5-flash:generateContent")
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(r#"{
+                "candidates": [
+                    {
+                        "content": {
+                            "parts": [
+                                {
+                                    "text": "{\n  \"section_id\": \"preview_section\",\n  \"difficulty_level\": 10,\n  \"play_mode\": \"Single\",\n  \"biomechanical_state\": {\n    \"current_twist_debt\": 0.0,\n    \"current_stamina_debt\": 0.1\n  },\n  \"measures\": [\n    {\n      \"measure_index\": 32,\n      \"subdivision\": 4,\n      \"rows\": [\"10000\", \"00100\", \"00001\", \"00100\"]\n    },\n    {\n      \"measure_index\": 34,\n      \"subdivision\": 4,\n      \"rows\": [\"10000\", \"00100\", \"00001\", \"00100\"]\n    }\n  ]\n}"
+                                }
+                            ]
+                        }
+                    }
+                ]
+            }"#)
+            .create_async()
+            .await;
+
+        let result_incorrect_indices = generate_gemini_chart_preview_core(
+            "fake-key",
+            &temp_ssc_path.to_string_lossy(),
+            &test_audio_path.to_string_lossy(),
+            PlayMode::Single,
+            10,
+            "preview_section",
+            "AI Previewer",
+            &client,
+            Some(32),
+            Some(33),
+            None,
+        )
+        .await
+        .expect("Preview core failed");
+
+        mock_post_incorrect_indices.assert_async().await;
+        assert!(!result_incorrect_indices.written);
+        assert!(result_incorrect_indices.validation.issues.iter().any(|i| {
+            i.severity == ValidationSeverity::Error
+                && i.message.contains("índice de compás incorrecto")
+        }));
+
+        // Case 12: end_measure < start_measure -> should return error before calling Gemini
+        let result_invalid_range_pre = generate_gemini_chart_preview_core(
+            "fake-key",
+            &temp_ssc_path.to_string_lossy(),
+            &test_audio_path.to_string_lossy(),
+            PlayMode::Single,
+            10,
+            "preview_section",
+            "AI Previewer",
+            &client,
+            Some(33),
+            Some(32),
+            None,
+        )
+        .await;
+
+        assert!(result_invalid_range_pre.is_err());
+        assert!(result_invalid_range_pre
+            .unwrap_err()
+            .contains("menor que el compás de inicio"));
+
+        // Case 13: Fenced ```json markdown wrapper response in preview -> should parse and return cleaned json in raw_payload
+        let mock_post_fenced = server.mock("POST", "/v1beta/models/gemini-3.5-flash:generateContent")
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(r#"{
+                "candidates": [
+                    {
+                        "content": {
+                            "parts": [
+                                {
+                                    "text": "```json\n{\n  \"section_id\": \"preview_section\",\n  \"difficulty_level\": 10,\n  \"play_mode\": \"Single\",\n  \"biomechanical_state\": {\n    \"current_twist_debt\": 0.0,\n    \"current_stamina_debt\": 0.1\n  },\n  \"measures\": [\n    {\n      \"measure_index\": 0,\n      \"subdivision\": 4,\n      \"rows\": [\n        \"10000\",\n        \"00100\",\n        \"00001\",\n        \"00100\"\n      ]\n    }\n  ]\n}\n```"
+                                }
+                            ]
+                        }
+                    }
+                ]
+            }"#)
+            .create_async()
+            .await;
+
+        let result_fenced = generate_gemini_chart_preview_core(
+            "fake-key",
+            &temp_ssc_path.to_string_lossy(),
+            &test_audio_path.to_string_lossy(),
+            PlayMode::Single,
+            10,
+            "preview_section",
+            "AI Previewer",
+            &client,
+            None,
+            None,
+            None,
+        )
+        .await
+        .expect("Fenced JSON preview failed");
+
+        mock_post_fenced.assert_async().await;
+        assert!(!result_fenced.written);
+        let raw_payload_clean = result_fenced
+            .raw_payload
+            .expect("raw_payload should be present");
+        assert!(!raw_payload_clean.contains("```"));
+        assert!(raw_payload_clean.contains("\"section_id\""));
+
         // Clean up
         crate::settings::set_test_gemini_enabled(None);
         let _ = std::fs::remove_file(temp_ssc_path);
         let _ = std::fs::remove_file(test_audio_path);
+    }
+
+    #[test]
+    fn test_append_approved_gemini_payload_fenced() {
+        let original_path = get_fixture_path();
+        let temp_dir = std::env::temp_dir();
+        let temp_ssc_path = temp_dir.join("test_approved_fenced.ssc");
+        std::fs::copy(&original_path, &temp_ssc_path).expect("Failed to copy");
+
+        // Fenced payload JSON
+        let fenced_payload = r#"```json
+        {
+            "section_id": "chorus_fenced",
+            "difficulty_level": 12,
+            "play_mode": "Single",
+            "biomechanical_state": {
+                "current_twist_debt": 0.0,
+                "current_stamina_debt": 0.3
+            },
+            "measures": [
+                {
+                    "measure_index": 0,
+                    "subdivision": 4,
+                    "rows": [
+                        "10000",
+                        "00100",
+                        "00001",
+                        "00100"
+                    ]
+                }
+            ]
+        }
+        ```"#;
+
+        crate::settings::set_test_env(None);
+        let fp = get_file_fingerprint(temp_ssc_path.to_string_lossy().to_string()).unwrap();
+        let result = append_approved_gemini_payload(
+            temp_ssc_path.to_string_lossy().to_string(),
+            fenced_payload.to_string(),
+            "Approved Tester".to_string(),
+            fp.sha256,
+        )
+        .expect("Command with fenced payload should succeed");
+
+        assert!(result.written);
+        assert_eq!(
+            result.charts.last().unwrap().description,
+            "AI chorus_fenced S12"
+        );
+
+        let _ = std::fs::remove_file(temp_ssc_path);
+        if let Some(backup) = result.backup_path {
+            let _ = std::fs::remove_file(backup);
+        }
     }
 
     #[test]

@@ -2760,7 +2760,10 @@ details[open] .accordion-icon {
   margin-right: var(--spacing-4);
 }
 
-
-
-
-
+.custom-section-hint {
+  font-family: var(--font-inter);
+  font-size: 11px;
+  color: var(--color-gravel);
+  margin-top: -8px;
+  margin-bottom: 16px;
+}
