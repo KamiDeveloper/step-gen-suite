@@ -2607,6 +2607,160 @@ details[open] .accordion-icon {
   box-shadow: var(--shadow-subtle-7), 0 12px 40px rgba(0, 0, 0, 0.06);
 }
 
+/* Browser BPM Analysis custom classes */
+.bpm-analysis-wrapper {
+  margin-top: 24px;
+}
+
+.bpm-analysis-header-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  margin-bottom: var(--spacing-8);
+}
+
+.bpm-results-grid {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--spacing-24);
+  margin-top: var(--spacing-12);
+  margin-bottom: var(--spacing-16);
+}
+
+.bpm-stat-box {
+  display: flex;
+  flex-direction: column;
+}
+
+.bpm-stat-title {
+  font-family: var(--font-inter);
+  font-weight: var(--font-weight-medium);
+  font-size: 12px;
+  color: var(--color-obsidian);
+  margin-bottom: var(--spacing-4);
+}
+
+.bpm-stat-value {
+  font-size: 20px;
+  font-weight: var(--font-weight-bold);
+  color: var(--color-obsidian);
+}
+
+.bpm-candidates-section {
+  margin-bottom: var(--spacing-16);
+}
+
+.bpm-candidates-flex {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--spacing-8);
+  margin-top: var(--spacing-4);
+}
+
+.bpm-candidate-badge {
+  padding: 6px 12px;
+  border-radius: 16px;
+  font-size: 12px;
+  display: flex;
+  gap: 6px;
+  align-items: center;
+  background-color: var(--color-powder);
+  border: 1px solid var(--color-chalk);
+  color: var(--color-obsidian);
+}
+
+.bpm-candidate-conf {
+  opacity: 0.6;
+  font-size: 10px;
+}
+
+.bpm-actions-row {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--spacing-12);
+  align-items: center;
+  margin-top: var(--spacing-12);
+}
+
+.bpm-diagnostics-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(140px, 1fr));
+  gap: var(--spacing-16);
+  margin-top: var(--spacing-12);
+  margin-bottom: var(--spacing-16);
+}
+
+.bpm-diagnostics-card {
+  background-color: var(--surface-card-white);
+  border: 1px solid var(--color-chalk);
+  border-radius: var(--radius-cards);
+  padding: var(--spacing-12) var(--spacing-16);
+  display: flex;
+  flex-direction: column;
+  box-shadow: var(--shadow-subtle-2);
+}
+
+.bpm-diagnostics-label {
+  font-size: 11px;
+  color: var(--color-gravel);
+  text-transform: uppercase;
+  margin-bottom: 2px;
+}
+
+.bpm-diagnostics-value {
+  font-size: 14px;
+  font-weight: var(--font-weight-medium);
+  color: var(--color-obsidian);
+}
+
+.bpm-diagnostics-value.requires-review {
+  color: var(--color-ember);
+  font-weight: var(--font-weight-bold);
+}
+
+/* Phase 3 Choreographic Intent Card */
+.accent-card {
+  border-left: 3px solid var(--color-fog);
+  background-color: var(--color-powder);
+  margin-top: var(--spacing-16);
+  padding: var(--spacing-16);
+  border-radius: var(--radius-cards);
+}
+
+.intent-guide-title {
+  display: flex;
+  align-items: center;
+  gap: var(--spacing-8);
+  font-size: 14px;
+  font-weight: var(--font-weight-medium);
+  margin-bottom: var(--spacing-12);
+}
+
+.intent-guide-grid {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: var(--spacing-12);
+  font-size: 13px;
+}
+
+.intent-guide-span-2 {
+  grid-column: span 2;
+}
+
+.intent-guide-label {
+  font-weight: var(--font-weight-bold);
+  color: var(--color-gravel);
+}
+
+.intent-guide-value {
+  color: var(--color-obsidian);
+}
+
+.intent-badge {
+  margin-right: var(--spacing-4);
+}
+
+
 
 
 

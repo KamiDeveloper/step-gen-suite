@@ -48,6 +48,7 @@ pub struct SongDetails {
     pub video_path: Option<String>,
     pub charts: Vec<ChartDetails>,
     pub asset_statuses: SongAssetsStatus,
+    pub ssc_bpms: Vec<f64>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -1016,6 +1017,7 @@ pub fn import_song_folder(folder_path: String) -> Result<SongDetails, String> {
     let mut song_name = String::new();
     let mut artist = String::new();
     let mut bpm = 120.0;
+    let mut ssc_bpms = Vec::new();
     let mut offset = 0.0;
     let mut music_file = None;
     let mut banner_file = None;
@@ -1037,17 +1039,26 @@ pub fn import_song_folder(folder_path: String) -> Result<SongDetails, String> {
                     }
                 }
                 "BPMS" => {
-                    if let Some(first_bpm_part) = tag.value.split(',').next() {
-                        if let Some(val_str) = first_bpm_part.split('=').nth(1) {
-                            if let Ok(val) = val_str.parse::<f64>() {
-                                bpm = val;
+                    let mut parsed_bpms = Vec::new();
+                    for part in tag.value.split(',') {
+                        if let Some(val_str) = part.split('=').nth(1) {
+                            if let Ok(val) = val_str.trim().parse::<f64>() {
+                                parsed_bpms.push(val);
                             }
                         }
+                    }
+                    if !parsed_bpms.is_empty() {
+                        bpm = parsed_bpms[0];
+                        ssc_bpms = parsed_bpms;
                     }
                 }
                 _ => {}
             }
         }
+    }
+
+    if ssc_bpms.is_empty() {
+        ssc_bpms.push(bpm);
     }
 
     // Scan physical files in folder for candidate matching
@@ -1142,6 +1153,7 @@ pub fn import_song_folder(folder_path: String) -> Result<SongDetails, String> {
         video_path,
         charts,
         asset_statuses,
+        ssc_bpms,
     })
 }
 
@@ -1425,17 +1437,136 @@ pub async fn generate_gemini_chart_preview_core(
     section_id: &str,
     _author: &str,
     client: &GeminiClient,
+    start_measure: Option<u32>,
+    end_measure: Option<u32>,
+    song_type: Option<String>,
 ) -> Result<AppendChartResult, String> {
     // 1. Check environment variable gate
     if !crate::settings::is_gemini_enabled() {
         return Err("La integración real con Gemini está deshabilitada en esta sesión. Configure la variable de entorno AI_STEP_GEN_ENABLE_REAL_GEMINI=1 para habilitarla.".to_string());
     }
 
+    let mut start_m = start_measure;
+    let mut end_m = end_measure;
+    let mut s_type = song_type.clone();
+
+    let mut intent_info = String::new();
+    let mut report_opt = None;
+    let ssc_p = Path::new(ssc_path);
+    if let Some(dir) = ssc_p.parent() {
+        let report_file = dir
+            .join(".ai-step-gen-analysis")
+            .join("song-analysis-report.v1.json");
+        if report_file.exists() && report_file.is_file() {
+            if let Ok(report_content) = fs::read_to_string(&report_file) {
+                if let Ok(report) = serde_json::from_str::<crate::music_analysis::SongAnalysisReport>(
+                    &report_content,
+                ) {
+                    report_opt = Some(report);
+                }
+            }
+        }
+    }
+
+    if let Some(ref report) = report_opt {
+        // If start/end measures are not specified, try to find them in the section boundaries
+        if start_m.is_none() || end_m.is_none() {
+            if let Some(sec) = report.sections.iter().find(|s| s.section_id == section_id) {
+                if start_m.is_none() {
+                    start_m = Some(sec.start_measure);
+                }
+                if end_m.is_none() {
+                    end_m = Some(sec.end_measure);
+                }
+            }
+        }
+        // If song_type is not specified, get it from timing_grid
+        if s_type.is_none() {
+            s_type = Some(report.timing_grid.song_type.clone());
+        }
+
+        // Find matching intent map by section_id
+        let matched_intent = report
+            .choreographic_intent
+            .iter()
+            .find(|intent| intent.section_id == section_id);
+
+        if let Some(intent) = matched_intent {
+            intent_info = format!(
+                "\n[INFORMACIÓN COREOGRÁFICA DE LA CANCIÓN (Music Analysis Engine)]\n\
+                 - Objetivo de Densidad: {}\n\
+                 - Presupuesto de Dificultad (Difficulty Budget): {}\n\
+                 - Familias de Patrones Recomendados: {:?}\n\
+                 - Familias de Patrones a Evitar: {:?}\n\
+                 - Estrategia de Motivos: {}\n\
+                 - Evidencia de Análisis: {:?}\n",
+                intent.density_target,
+                intent.difficulty_budget,
+                intent.recommended_pattern_families,
+                intent.avoid_pattern_families,
+                intent.motif_strategy,
+                intent.evidence
+            );
+        }
+    }
+
+    let start_m_val = start_m.unwrap_or(0);
+    let end_m_val = end_m.unwrap_or(7);
+    let s_type_val = s_type.unwrap_or_else(|| "Arcade".to_string());
+    let num_measures = if end_m_val >= start_m_val {
+        end_m_val - start_m_val + 1
+    } else {
+        1
+    };
+
+    let play_mode_name = match play_mode {
+        PlayMode::Single => "Single (5 flechas)",
+        PlayMode::Double => "Double (10 flechas)",
+    };
+
     // 4. Construct prompt
     let prompt_text = format!(
-        "Genera un chart coreográfico de Pump It Up para la sección '{}' en modo {:?} con nivel de dificultad {}. \
-        Retorna la respuesta estrictamente en formato JSON que cumpla con el esquema requerido, sin bloques markdown, sin explicaciones ni texto adicional.",
-        section_id, play_mode, target_level
+        "Eres un stepmaker experto de Pump It Up. Genera un chart coreográfico de Pump It Up para la sección '{}' de la canción. \
+         Detalles de la Canción y Sección:\n\
+         - Modo de Juego: {}\n\
+         - Nivel de Dificultad Solicitado: {}\n\
+         - Rango de Compases (Measures): {} a {} (ambos inclusive)\n\
+         - Tipo de Canción: {}\n\
+         {}\n\
+         [CONTRATO Y FORMATO DE RESPUESTA]\n\
+         Debes responder EXCLUSIVAMENTE en formato JSON, sin bloques de código markdown (como ```json) y sin explicaciones. El esquema JSON debe ser exactamente:\n\
+         {{\n\
+           \"section_id\": \"{}\",\n\
+           \"difficulty_level\": {},\n\
+           \"play_mode\": \"{:?}\",\n\
+           \"biomechanical_state\": {{\n\
+             \"current_twist_debt\": 0.0,\n\
+             \"current_stamina_debt\": 0.0,\n\
+             \"last_left_foot_lane\": null,\n\
+             \"last_right_foot_lane\": null\n\
+           }},\n\
+           \"measures\": [\n\
+             {{\n\
+               \"measure_index\": {},\n\
+               \"subdivision\": 4, \n\
+               \"rows\": [\"10000\", \"01000\", \"00100\", \"00010\"]\n\
+             }}\n\
+           ]\n\
+         }}\n\
+         \n\
+         [REGLAS BIOMECÁNICAS Y TÉCNICAS]\n\
+         1. Caracteres permitidos: Solo '0' (vacío), '1' (tap), '2' (inicio de hold/congelador), '3' (fin de hold/congelador). Queda ESTRICTAMENTE PROHIBIDO el uso de minas ('M').\n\
+         2. Longitud de fila: Para Single, cada fila debe medir exactamente 5 caracteres (esquina inferior-izquierda, esquina superior-izquierda, centro-amarillo, esquina superior-derecha, esquina inferior-derecha). Para Double, debe medir exactamente 10 caracteres.\n\
+         3. Subdivisiones: Solo se permiten subdivisiones de 4, 8, 16 o 32 filas por compás. La cantidad de filas en 'rows' debe coincidir EXACTAMENTE con el valor de 'subdivision'.\n\
+         4. Jumps (Saltos): Un jump es presionar 2 o más flechas a la vez. No coloques jumps consecutivos a alta velocidad.\n\
+         5. Triple Taps: En niveles < 16, evita triples. En niveles 16+ se permiten como Brackets (puntero-talón).\n\
+         6. Alternancia de pies: Evita double-steps rápidos (Jack rápido) en la misma flecha consecutivamente en streams de subdivision 16+.\n\
+         7. Giros y torso (Twists): Si el chart exige cruces que rotan el torso, asegúrate de proveer un contra-giro (untwist) de retorno inmediato para neutralizar la cadera.\n\
+         \n\
+         Genera el array de 'measures' de tamaño exactamente {} (una por cada compás desde {} hasta {}).",
+        section_id, play_mode_name, target_level, start_m_val, end_m_val, s_type_val, intent_info,
+        section_id, target_level, play_mode, start_m_val,
+        num_measures, start_m_val, end_m_val
     );
 
     // 5. Invoke Gemini API
@@ -1451,10 +1582,22 @@ pub async fn generate_gemini_chart_preview_core(
         .process_audio_and_generate(api_key, audio_file_path, &prompt_text)
         .await?;
 
+    // Strip markdown formatting if Gemini included it
+    let mut clean_response = raw_response.trim();
+    if clean_response.starts_with("```") {
+        if let Some(first_newline) = clean_response.find('\n') {
+            clean_response = &clean_response[first_newline..];
+        }
+        if clean_response.ends_with("```") {
+            clean_response = &clean_response[..clean_response.len() - 3];
+        }
+        clean_response = clean_response.trim();
+    }
+
     // 6. Parse response JSON
-    let payload: GeminiChartSectionPayload = serde_json::from_str(&raw_response).map_err(|e| {
+    let payload: GeminiChartSectionPayload = serde_json::from_str(clean_response).map_err(|e| {
         let error_summary = e.to_string();
-        let length = raw_response.len();
+        let length = clean_response.len();
         format!(
             "Gemini returned invalid JSON: {}. Response length: {} bytes.",
             error_summary, length
@@ -1596,6 +1739,9 @@ pub async fn generate_gemini_chart_preview<R: tauri::Runtime>(
     section_id: String,
     author: String,
     write_mode: String,
+    start_measure: Option<u32>,
+    end_measure: Option<u32>,
+    song_type: Option<String>,
 ) -> Result<AppendChartResult, String> {
     let play_mode_enum = match play_mode.as_str() {
         "Single" => PlayMode::Single,
@@ -1632,8 +1778,110 @@ pub async fn generate_gemini_chart_preview<R: tauri::Runtime>(
         &section_id,
         &author,
         &client,
+        start_measure,
+        end_measure,
+        song_type,
     )
     .await
+}
+
+#[tauri::command]
+pub async fn read_audio_file(path: String) -> Result<Vec<u8>, String> {
+    use std::io::Read;
+
+    let raw_path_lower = path.to_lowercase();
+    let blocked_directories = [
+        "\\.ssh\\",
+        "\\.aws\\",
+        "\\.git\\",
+        "\\.gemini\\",
+        "\\appdata\\",
+        "\\windows\\",
+        "\\system32\\",
+        "\\etc\\",
+    ];
+    for blocked in &blocked_directories {
+        if raw_path_lower.contains(blocked) {
+            return Err(
+                "Acceso denegado: Ruta de archivo no permitida por razones de seguridad."
+                    .to_string(),
+            );
+        }
+    }
+
+    let p = std::path::Path::new(&path);
+    if !p.exists() || !p.is_file() {
+        return Err("El archivo de audio especificado no existe o no es un archivo.".to_string());
+    }
+
+    // Canonicalize path to resolve symlinks / traversal
+    let canonical = p
+        .canonicalize()
+        .map_err(|e| format!("Error de canonicalización: {}", e))?;
+    let path_str = canonical.to_string_lossy().to_lowercase();
+
+    for blocked in &blocked_directories {
+        if path_str.contains(blocked) {
+            return Err(
+                "Acceso denegado: Ruta de archivo no permitida por razones de seguridad."
+                    .to_string(),
+            );
+        }
+    }
+
+    let ext = p
+        .extension()
+        .and_then(|e| e.to_str())
+        .unwrap_or("")
+        .to_lowercase();
+    if !["mp3", "ogg", "flac", "wav"].contains(&ext.as_str()) {
+        return Err("Formato de audio no soportado por el pre-análisis.".to_string());
+    }
+
+    let metadata = std::fs::metadata(p).map_err(|e| format!("Error al leer metadatos: {}", e))?;
+    let size = metadata.len();
+    if size > 100 * 1024 * 1024 {
+        return Err("El tamaño del archivo de audio supera el límite máximo de 100 MB para el análisis en navegador.".to_string());
+    }
+
+    // Verify magic bytes / headers before reading full file
+    let mut file =
+        std::fs::File::open(p).map_err(|e| format!("Error al abrir archivo de audio: {}", e))?;
+    let mut header = [0u8; 12];
+    let bytes_read = file
+        .read(&mut header)
+        .map_err(|e| format!("Error al leer cabecera: {}", e))?;
+    if bytes_read < 4 {
+        return Err("Archivo demasiado pequeño para ser un archivo de audio válido.".to_string());
+    }
+
+    let mut valid = false;
+    // MP3 (starts with "ID3" or sync word 0xFFE0 / 0xFFF0)
+    if header.starts_with(b"ID3") {
+        valid = true;
+    } else if header[0] == 0xFF && (header[1] & 0xE0) == 0xE0 {
+        valid = true;
+    }
+    // OGG ("OggS")
+    else if &header[0..4] == b"OggS" {
+        valid = true;
+    }
+    // FLAC ("fLaC")
+    else if &header[0..4] == b"fLaC" {
+        valid = true;
+    }
+    // WAV ("RIFF" ... "WAVE")
+    else if &header[0..4] == b"RIFF" {
+        if bytes_read >= 12 && &header[8..12] == b"WAVE" {
+            valid = true;
+        }
+    }
+
+    if !valid {
+        return Err("Acceso denegado: Los bytes mágicos del archivo no corresponden a un formato de audio soportado (MP3, OGG, FLAC, WAV).".to_string());
+    }
+
+    std::fs::read(p).map_err(|e| format!("Error al leer el archivo de audio: {}", e))
 }
 
 #[cfg(test)]
@@ -1950,6 +2198,9 @@ mod tests {
             "preview_section",
             "AI Previewer",
             &client,
+            None,
+            None,
+            None,
         )
         .await;
         assert!(result_gate.is_err());
@@ -1968,6 +2219,9 @@ mod tests {
             "preview_section",
             "AI Previewer",
             &client,
+            None,
+            None,
+            None,
         )
         .await
         .expect("PreviewOnly flow failed");
@@ -2008,6 +2262,9 @@ mod tests {
             "preview_section", // requested
             "AI Previewer",
             &client,
+            None,
+            None,
+            None,
         )
         .await
         .expect("Core preview mismatch section_id failed");
@@ -2049,6 +2306,9 @@ mod tests {
             "preview_section",
             "AI Previewer",
             &client,
+            None,
+            None,
+            None,
         )
         .await
         .expect("Core preview mismatch play_mode failed");
@@ -2090,6 +2350,9 @@ mod tests {
             "preview_section",
             "AI Previewer",
             &client,
+            None,
+            None,
+            None,
         )
         .await
         .expect("Core preview mismatch diff failed");
@@ -2131,6 +2394,9 @@ mod tests {
             "preview_section",
             "AI Previewer",
             &client,
+            None,
+            None,
+            None,
         )
         .await
         .expect("Core preview with warnings failed");
@@ -2168,6 +2434,9 @@ mod tests {
             "preview_section",
             "AI Previewer",
             &client,
+            None,
+            None,
+            None,
         )
         .await
         .expect("Core preview with error failed");
@@ -2196,6 +2465,9 @@ mod tests {
             "preview_section",
             "AI Previewer",
             &client,
+            None,
+            None,
+            None,
         )
         .await;
 
@@ -2848,5 +3120,112 @@ mod tests {
     fn test_check_destination_folder_nonexistent() {
         let result = check_destination_folder("/nonexistent/path/at/all".to_string()).unwrap();
         assert_eq!(result, "NotExist");
+    }
+
+    #[tokio::test]
+    async fn test_read_audio_file_security() {
+        let manifest_dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+        let test_dir = manifest_dir.join("temp_security_test");
+        let _ = std::fs::remove_dir_all(&test_dir);
+        std::fs::create_dir_all(&test_dir).unwrap();
+
+        // Test 1: Invalid extension
+        let txt_file = test_dir.join("test_security.txt");
+        std::fs::write(&txt_file, b"some content").unwrap();
+        let res = read_audio_file(txt_file.to_string_lossy().to_string()).await;
+        assert!(res.is_err());
+        assert!(res.unwrap_err().contains("Formato de audio no soportado"));
+
+        // Test 2: Invalid magic bytes on audio extension
+        let fake_mp3 = test_dir.join("test_security.mp3");
+        std::fs::write(&fake_mp3, b"malicious binary or config content here").unwrap();
+        let res = read_audio_file(fake_mp3.to_string_lossy().to_string()).await;
+        assert!(res.is_err());
+        assert!(res
+            .unwrap_err()
+            .contains("Los bytes mágicos del archivo no corresponden"));
+
+        // Test 3: Path blocklisting (e.g. system folder path simulating traversal)
+        let res_blocked = read_audio_file("C:\\Windows\\System32\\test.mp3".to_string()).await;
+        assert!(res_blocked.is_err());
+        assert!(res_blocked.unwrap_err().contains("Acceso denegado"));
+
+        // Test 4: Valid WAV audio magic bytes
+        let valid_wav = test_dir.join("test_security_valid.wav");
+        let mut wav_bytes = vec![0u8; 12];
+        wav_bytes[0..4].copy_from_slice(b"RIFF");
+        wav_bytes[8..12].copy_from_slice(b"WAVE");
+        std::fs::write(&valid_wav, &wav_bytes).unwrap();
+        let res = read_audio_file(valid_wav.to_string_lossy().to_string()).await;
+        assert!(res.is_ok());
+        assert_eq!(res.unwrap(), wav_bytes);
+
+        // Test 5: Missing file
+        let missing_file = test_dir.join("does_not_exist.wav");
+        let res_missing = read_audio_file(missing_file.to_string_lossy().to_string()).await;
+        assert!(res_missing.is_err());
+        assert!(res_missing
+            .unwrap_err()
+            .contains("no existe o no es un archivo"));
+
+        // Test 6: Oversized file (> 100 MB) via metadata truncation (O(1) operation)
+        let oversized_file = test_dir.join("oversized.wav");
+        let file = std::fs::File::create(&oversized_file).unwrap();
+        file.set_len(100 * 1024 * 1024 + 1).unwrap();
+        drop(file);
+        let res_oversized = read_audio_file(oversized_file.to_string_lossy().to_string()).await;
+        assert!(res_oversized.is_err());
+        assert!(res_oversized
+            .unwrap_err()
+            .contains("supera el límite máximo"));
+
+        // Test 7: Case-insensitive extension
+        let case_wav = test_dir.join("test_case.WAV");
+        let mut case_bytes = vec![0u8; 12];
+        case_bytes[0..4].copy_from_slice(b"RIFF");
+        case_bytes[8..12].copy_from_slice(b"WAVE");
+        std::fs::write(&case_wav, &case_bytes).unwrap();
+        let res_case = read_audio_file(case_wav.to_string_lossy().to_string()).await;
+        assert!(res_case.is_ok());
+
+        // Test 8: Valid OGG magic bytes
+        let valid_ogg = test_dir.join("test_ogg.ogg");
+        let mut ogg_bytes = vec![0u8; 12];
+        ogg_bytes[0..4].copy_from_slice(b"OggS");
+        std::fs::write(&valid_ogg, &ogg_bytes).unwrap();
+        let res_ogg = read_audio_file(valid_ogg.to_string_lossy().to_string()).await;
+        assert!(res_ogg.is_ok());
+
+        // Test 9: Valid FLAC magic bytes
+        let valid_flac = test_dir.join("test_flac.flac");
+        let mut flac_bytes = vec![0u8; 12];
+        flac_bytes[0..4].copy_from_slice(b"fLaC");
+        std::fs::write(&valid_flac, &flac_bytes).unwrap();
+        let res_flac = read_audio_file(valid_flac.to_string_lossy().to_string()).await;
+        assert!(res_flac.is_ok());
+
+        // Test 10: Valid MP3 magic bytes (ID3 tag)
+        let valid_mp3 = test_dir.join("test_mp3.mp3");
+        let mut mp3_bytes = vec![0u8; 12];
+        mp3_bytes[0..3].copy_from_slice(b"ID3");
+        std::fs::write(&valid_mp3, &mp3_bytes).unwrap();
+        let res_mp3 = read_audio_file(valid_mp3.to_string_lossy().to_string()).await;
+        assert!(res_mp3.is_ok());
+
+        // Test 11: Valid MP3 magic bytes (raw sync word 0xFFFB)
+        let valid_mp3_raw = test_dir.join("test_mp3_raw.mp3");
+        let mut mp3_raw_bytes = vec![0u8; 12];
+        mp3_raw_bytes[0] = 0xFF;
+        mp3_raw_bytes[1] = 0xFB;
+        std::fs::write(&valid_mp3_raw, &mp3_raw_bytes).unwrap();
+        let res_mp3_raw = read_audio_file(valid_mp3_raw.to_string_lossy().to_string()).await;
+        assert!(res_mp3_raw.is_ok());
+
+        // Test 12: Blocklist path trigger
+        let res_git_blocked = read_audio_file("C:\\my_songpack\\.git\\audio.wav".to_string()).await;
+        assert!(res_git_blocked.is_err());
+        assert!(res_git_blocked.unwrap_err().contains("Acceso denegado"));
+
+        let _ = std::fs::remove_dir_all(&test_dir);
     }
 }

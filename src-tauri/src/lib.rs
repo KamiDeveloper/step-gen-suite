@@ -28,6 +28,7 @@ pub fn run() {
             commands::select_song_destination_folder,
             commands::create_song_project,
             commands::get_file_metadata,
+            commands::read_audio_file,
             credentials::save_gemini_api_key,
             credentials::has_gemini_api_key,
             credentials::delete_gemini_api_key,
@@ -35,7 +36,8 @@ pub fn run() {
             settings::save_settings,
             settings::get_app_mode,
             settings::ensure_default_songpack,
-            music_analysis::analyze_song_offline
+            music_analysis::analyze_song_offline,
+            music_analysis::load_analysis_report
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

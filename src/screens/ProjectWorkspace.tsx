@@ -1,4 +1,4 @@
-import { useState, useEffect } from "react";
+import { useState, useEffect, useRef } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { useSongProjectStore } from "../store/songProjectStore";
 import { useSettingsStore } from "../store/settingsStore";
@@ -15,6 +15,9 @@ import {
 } from "lucide-react";
 import { IAppendChartResult, IFileFingerprint, IAssetStatus } from "../types/song";
 import { SongAnalysisReport, AnalysisCommandResult } from "../types/musicAnalysis";
+import { analyzeBrowserBpmFromArrayBuffer } from "../features/music-analysis/browser-bpm/analyzeBrowserBpmFromBuffer";
+import { BrowserBpmAnalysisReport } from "../features/music-analysis/browser-bpm/browserBpmTypes";
+import { reconcileBpmCandidates } from "../features/music-analysis/browser-bpm/browserBpmReconciliation";
 
 const getAssetUI = (key: "audio" | "banner" | "background" | "video", status: IAssetStatus | undefined) => {
   const isRequired = key === "audio";
@@ -81,6 +84,10 @@ export const ProjectWorkspace: React.FC<ProjectWorkspaceProps> = ({ onNavigate }
   const [sectionId, setSectionId] = useState("chorus_1");
   const [author, setAuthor] = useState("");
   const [passphrase, setPassphrase] = useState("");
+  const [startMeasure, setStartMeasure] = useState(0);
+  const [endMeasure, setEndMeasure] = useState(7);
+  const [songType, setSongType] = useState<"Shortcut" | "Arcade" | "Remix" | "Fullsong">("Arcade");
+  const [selectedSectionKey, setSelectedSectionKey] = useState<string>("custom");
 
   // Preview result states
   const [previewResult, setPreviewResult] = useState<IAppendChartResult | null>(null);
@@ -99,6 +106,66 @@ export const ProjectWorkspace: React.FC<ProjectWorkspaceProps> = ({ onNavigate }
   const [backupPath, setBackupPath] = useState<string | null>(null);
   const [confirmModal, setConfirmModal] = useState<{ message: string; onConfirm: () => void } | null>(null);
 
+  // Browser BPM Analysis States in Workspace
+  const [workspaceBpmReport, setWorkspaceBpmReport] = useState<BrowserBpmAnalysisReport | null>(null);
+  const [isWorkspaceBpmAnalyzing, setIsWorkspaceBpmAnalyzing] = useState(false);
+  const [workspaceBpmError, setWorkspaceBpmError] = useState<string | null>(null);
+
+  const activeWorkspaceSongIdRef = useRef<string | null>(null);
+  const isMountedRef = useRef(true);
+  const workspaceRequestIdRef = useRef(0);
+
+  useEffect(() => {
+    isMountedRef.current = true;
+    return () => {
+      isMountedRef.current = false;
+    };
+  }, []);
+
+  const runWorkspaceBpmAnalysis = async (reqId: number) => {
+    if (!currentSong || !currentSong.audio_path) return;
+    const currentSongId = currentSong.song_id;
+    activeWorkspaceSongIdRef.current = currentSongId;
+    setIsWorkspaceBpmAnalyzing(true);
+    setWorkspaceBpmError(null);
+    try {
+      const bytes = await invoke<number[]>("read_audio_file", { path: currentSong.audio_path });
+      if (workspaceRequestIdRef.current !== reqId || !isMountedRef.current || activeWorkspaceSongIdRef.current !== currentSongId) return;
+      const uint8 = new Uint8Array(bytes);
+      const report = await analyzeBrowserBpmFromArrayBuffer({
+        arrayBuffer: uint8.buffer,
+        audioFileName: currentSong.audio_path.split(/[\\/]/).pop(),
+      });
+      if (workspaceRequestIdRef.current !== reqId || !isMountedRef.current || activeWorkspaceSongIdRef.current !== currentSongId) return;
+      setWorkspaceBpmReport(report);
+    } catch (err: any) {
+      if (workspaceRequestIdRef.current === reqId && isMountedRef.current && activeWorkspaceSongIdRef.current === currentSongId) {
+        console.error("Workspace BPM analysis error:", err);
+        setWorkspaceBpmError(err.toString());
+      }
+    } finally {
+      if (workspaceRequestIdRef.current === reqId && isMountedRef.current && activeWorkspaceSongIdRef.current === currentSongId) {
+        setIsWorkspaceBpmAnalyzing(false);
+      }
+    }
+  };
+
+  useEffect(() => {
+    setWorkspaceBpmReport(null);
+    setWorkspaceBpmError(null);
+    if (currentSong && currentSong.audio_path) {
+      activeWorkspaceSongIdRef.current = currentSong.song_id;
+      const nextId = ++workspaceRequestIdRef.current;
+      runWorkspaceBpmAnalysis(nextId);
+    } else {
+      activeWorkspaceSongIdRef.current = null;
+    }
+    return () => {
+      workspaceRequestIdRef.current++;
+      activeWorkspaceSongIdRef.current = null;
+    };
+  }, [currentSong?.song_id]);
+
   // Sync default generation settings on song load
   useEffect(() => {
     if (settings) {
@@ -107,6 +174,35 @@ export const ProjectWorkspace: React.FC<ProjectWorkspaceProps> = ({ onNavigate }
       setTargetLevel(settings.default_meter || 10);
     }
   }, [settings, currentSong]);
+
+  // Auto-load analysis report if it exists on disk
+  useEffect(() => {
+    if (currentSong?.ssc_path) {
+      invoke<SongAnalysisReport | null>("load_analysis_report", {
+        sscPath: currentSong.ssc_path,
+      })
+        .then((report) => {
+          if (isMountedRef.current) {
+            setAnalysisReport(report);
+            if (report) {
+              const lastSlash = currentSong.ssc_path.lastIndexOf("/");
+              const lastBackslash = currentSong.ssc_path.lastIndexOf("\\");
+              const idx = Math.max(lastSlash, lastBackslash);
+              const parentDir = idx !== -1 ? currentSong.ssc_path.substring(0, idx) : ".";
+              setReportPath(`${parentDir}/.ai-step-gen-analysis/song-analysis-report.v1.json`);
+            } else {
+              setReportPath(null);
+            }
+          }
+        })
+        .catch((err) => {
+          console.warn("Failed to auto-load analysis report:", err);
+        });
+    } else {
+      setAnalysisReport(null);
+      setReportPath(null);
+    }
+  }, [currentSong?.ssc_path]);
 
   if (!currentSong) {
     return (
@@ -152,6 +248,11 @@ export const ProjectWorkspace: React.FC<ProjectWorkspaceProps> = ({ onNavigate }
       }
 
       // 2. Real Gemini Preview - writeMode is "PreviewOnly"
+      const matchedSection = analysisReport?.sections.find(s => s.section_id === selectedSectionKey);
+      const startMeasureVal = matchedSection ? matchedSection.start_measure : startMeasure;
+      const endMeasureVal = matchedSection ? matchedSection.end_measure : endMeasure;
+      const songTypeVal = matchedSection ? (analysisReport?.timing_grid.song_type || songType) : songType;
+
       const result = await invoke<IAppendChartResult>("generate_gemini_chart_preview", {
         sscPath: currentSong.ssc_path,
         audioPath: currentSong.audio_path || "",
@@ -161,6 +262,9 @@ export const ProjectWorkspace: React.FC<ProjectWorkspaceProps> = ({ onNavigate }
         sectionId: sectionId.trim() || "chorus_1",
         author: author.trim() || "Gemini Preview",
         writeMode: "PreviewOnly",
+        startMeasure: startMeasureVal,
+        endMeasure: endMeasureVal,
+        songType: songTypeVal,
       });
 
       setPreviewResult(result);
@@ -667,15 +771,34 @@ export const ProjectWorkspace: React.FC<ProjectWorkspaceProps> = ({ onNavigate }
                 </div>
 
                 <div className="form-group-contained">
-                  <label className="form-label-dark">Section Identifier</label>
-                  <input
-                    type="text"
+                  <label className="form-label-dark">Select Section</label>
+                  <select
                     className="input-contained"
-                    value={sectionId}
-                    onChange={(e) => setSectionId(e.target.value)}
-                    placeholder="e.g. chorus_1"
+                    value={selectedSectionKey}
+                    onChange={(e) => {
+                      const val = e.target.value;
+                      setSelectedSectionKey(val);
+                      if (val !== "custom" && analysisReport) {
+                        const sec = analysisReport.sections.find((s) => s.section_id === val);
+                        if (sec) {
+                          setSectionId(sec.section_id);
+                          setStartMeasure(sec.start_measure);
+                          setEndMeasure(sec.end_measure);
+                          if (analysisReport.timing_grid.song_type) {
+                            setSongType(analysisReport.timing_grid.song_type as any);
+                          }
+                        }
+                      }
+                    }}
                     disabled={isLoading}
-                  />
+                  >
+                    <option value="custom">Custom Section / Manual Range</option>
+                    {analysisReport?.sections.map((sec) => (
+                      <option key={sec.section_id} value={sec.section_id}>
+                        {sec.section_id} (M.{sec.start_measure} – M.{sec.end_measure})
+                      </option>
+                    ))}
+                  </select>
                 </div>
 
                 <div className="form-group-contained">
@@ -689,7 +812,104 @@ export const ProjectWorkspace: React.FC<ProjectWorkspaceProps> = ({ onNavigate }
                     disabled={isLoading}
                   />
                 </div>
+
+                <div className="form-group-contained">
+                  <label className="form-label-dark">Section Identifier</label>
+                  <input
+                    type="text"
+                    className="input-contained"
+                    value={sectionId}
+                    onChange={(e) => setSectionId(e.target.value)}
+                    placeholder="e.g. chorus_1"
+                    disabled={isLoading || selectedSectionKey !== "custom"}
+                  />
+                </div>
+
+                <div className="form-group-contained">
+                  <label className="form-label-dark">Song Type</label>
+                  <select
+                    className="input-contained"
+                    value={songType}
+                    onChange={(e) => setSongType(e.target.value as any)}
+                    disabled={isLoading || selectedSectionKey !== "custom"}
+                  >
+                    <option value="Arcade">Arcade</option>
+                    <option value="Shortcut">Shortcut</option>
+                    <option value="Remix">Remix</option>
+                    <option value="Fullsong">Fullsong</option>
+                  </select>
+                </div>
+
+                <div className="form-group-contained">
+                  <label className="form-label-dark">Start Measure (Compás Inicio)</label>
+                  <input
+                    type="number"
+                    min="0"
+                    className="input-contained"
+                    value={startMeasure}
+                    onChange={(e) => setStartMeasure(parseInt(e.target.value) || 0)}
+                    disabled={isLoading || selectedSectionKey !== "custom"}
+                  />
+                </div>
+
+                <div className="form-group-contained">
+                  <label className="form-label-dark">End Measure (Compás Fin)</label>
+                  <input
+                    type="number"
+                    min="0"
+                    className="input-contained"
+                    value={endMeasure}
+                    onChange={(e) => setEndMeasure(parseInt(e.target.value) || 0)}
+                    disabled={isLoading || selectedSectionKey !== "custom"}
+                  />
+                </div>
               </div>
+
+              {(() => {
+                const matchedIntent = analysisReport?.choreographic_intent.find(
+                  (intent) => intent.section_id === selectedSectionKey
+                );
+                if (!matchedIntent || selectedSectionKey === "custom") return null;
+                return (
+                  <div className="accent-card">
+                    <h5 className="intent-guide-title">
+                      <Sparkles size={16} /> Choreographic Intent Guide for {matchedIntent.section_id}
+                    </h5>
+                    <div className="intent-guide-grid">
+                      <div>
+                        <span className="intent-guide-label">Density Target:</span>{" "}
+                        <span className="level-badge">{matchedIntent.density_target}</span>
+                      </div>
+                      <div>
+                        <span className="intent-guide-label">Difficulty Budget:</span>{" "}
+                        <span className="level-badge">{matchedIntent.difficulty_budget}</span>
+                      </div>
+                      <div className="intent-guide-span-2">
+                        <span className="intent-guide-label">Recommended Patterns:</span>{" "}
+                        {matchedIntent.recommended_pattern_families.map((p, i) => (
+                          <span key={i} className="analysis-badge-recommend intent-badge">
+                            {p.replace('_', ' ')}
+                          </span>
+                        ))}
+                      </div>
+                      {matchedIntent.avoid_pattern_families && matchedIntent.avoid_pattern_families.length > 0 && (
+                        <div className="intent-guide-span-2">
+                          <span className="intent-guide-label">Patterns to Avoid:</span>{" "}
+                          {matchedIntent.avoid_pattern_families.map((p, i) => (
+                            <span key={i} className="analysis-badge-avoid intent-badge">
+                              {p.replace('_', ' ')}
+                            </span>
+                          ))}
+                        </div>
+                      )}
+                      <div className="intent-guide-span-2">
+                        <span className="intent-guide-label">Motif Strategy:</span>{" "}
+                        <span className="intent-guide-value">{matchedIntent.motif_strategy}</span>
+                      </div>
+                    </div>
+                  </div>
+                );
+              })()}
 
               <div className="form-group-contained">
                 <label className="form-label-dark">Decryption Passphrase</label>
@@ -927,6 +1147,149 @@ export const ProjectWorkspace: React.FC<ProjectWorkspaceProps> = ({ onNavigate }
           <div className="workspace-tab">
             <h3 className="section-title-waldenburg">Music Analysis</h3>
             <p className="section-subtitle-gravel">Audio beat grid structure and phrase mapping.</p>
+
+            {/* Quick BPM Diagnostics Panel */}
+            <details className="dev-tools-collapsible" open>
+              <summary className="dev-tools-summary">
+                <ChevronRight size={14} className="accordion-icon" />
+                Quick BPM Diagnostics Panel
+              </summary>
+              <div className="dev-tools-content">
+                <p className="caption-text-gravel">
+                  Cross-checks browser-detected tempo with SSC timing data and Python Sidecar results.
+                </p>
+
+                {isWorkspaceBpmAnalyzing ? (
+                  <div className="info-banner-gray">
+                    <div className="gemini-waves-container animating">
+                      <div className="gemini-wave wave1"></div>
+                      <div className="gemini-wave wave2"></div>
+                      <div className="gemini-wave wave3"></div>
+                    </div>
+                    <span className="icon-ml">Analyzing audio buffer in browser...</span>
+                  </div>
+                ) : workspaceBpmError ? (
+                  <div className="error-box">
+                    <AlertTriangle size={16} className="icon-mr text-danger-icon" />
+                    <span>Failed browser BPM analysis: {workspaceBpmError}</span>
+                  </div>
+                ) : workspaceBpmReport ? (
+                  <div>
+                    <div className="bpm-diagnostics-grid">
+                      <div className="bpm-diagnostics-card">
+                        <span className="bpm-diagnostics-label">SSC Initial BPM</span>
+                        <span className="bpm-diagnostics-value">
+                          {currentSong.ssc_bpms && currentSong.ssc_bpms.length > 0
+                            ? currentSong.ssc_bpms.join(", ")
+                            : (currentSong.bpm || "None")}
+                        </span>
+                      </div>
+                      <div className="bpm-diagnostics-card">
+                        <span className="bpm-diagnostics-label">Sidecar DSP BPM</span>
+                        <span className="bpm-diagnostics-value">
+                          {analysisReport?.diagnostics?.audio_bpm_detected ?? "Not analyzed"}
+                        </span>
+                      </div>
+                      <div className="bpm-diagnostics-card">
+                        <span className="bpm-diagnostics-label">Browser BPM</span>
+                        <span className="bpm-diagnostics-value">
+                          {workspaceBpmReport.stableTempo?.tempo ?? "None"}
+                        </span>
+                      </div>
+                      <div className="bpm-diagnostics-card">
+                        <span className="bpm-diagnostics-label">Reconciliation</span>
+                        {(() => {
+                          const recon = reconcileBpmCandidates({
+                            sscBpms: currentSong.ssc_bpms && currentSong.ssc_bpms.length > 0
+                              ? currentSong.ssc_bpms
+                              : (currentSong.bpm ? [currentSong.bpm] : []),
+                            sidecarDetectedBpm: analysisReport?.diagnostics?.audio_bpm_detected || undefined,
+                            browserCandidates: workspaceBpmReport.candidates,
+                            toleranceBpm: 2.0,
+                            minConfidence: 0.2,
+                            minCount: 4,
+                          });
+                          return (
+                            <span className={`bpm-diagnostics-value ${recon.requiresManualTimingReview ? "requires-review" : ""}`}>
+                              {recon.requiresManualTimingReview ? "Manual Review Required" : "Agreed"}
+                            </span>
+                          );
+                        })()}
+                      </div>
+                    </div>
+
+                    {workspaceBpmReport.warnings && workspaceBpmReport.warnings.length > 0 && (
+                      <div className="warning-box">
+                        <AlertTriangle size={16} className="icon-mr text-warning-icon" />
+                        <div>
+                          {workspaceBpmReport.warnings.map((w, idx) => (
+                            <div key={idx}>{w}</div>
+                          ))}
+                        </div>
+                      </div>
+                    )}
+
+                    {(() => {
+                      const recon = reconcileBpmCandidates({
+                        sscBpms: currentSong.ssc_bpms && currentSong.ssc_bpms.length > 0
+                          ? currentSong.ssc_bpms
+                          : (currentSong.bpm ? [currentSong.bpm] : []),
+                        sidecarDetectedBpm: analysisReport?.diagnostics?.audio_bpm_detected || undefined,
+                        browserCandidates: workspaceBpmReport.candidates,
+                        toleranceBpm: 2.0,
+                        minConfidence: 0.2,
+                        minCount: 4,
+                      });
+                      return (
+                        <>
+                          {recon.notes && recon.notes.length > 0 && (
+                            <div className="warning-box">
+                              <AlertTriangle size={16} className="icon-mr text-warning-icon" />
+                              <div>
+                                {recon.notes.map((note, idx) => (
+                                  <div key={idx}>{note}</div>
+                                ))}
+                              </div>
+                            </div>
+                          )}
+                        </>
+                      );
+                    })()}
+
+                    {workspaceBpmReport.candidates && workspaceBpmReport.candidates.length > 0 && (
+                      <div className="bpm-candidates-section">
+                        <span className="bpm-stat-title">Browser Tempo Candidates</span>
+                        <div className="bpm-candidates-list">
+                          {workspaceBpmReport.candidates.map((c, i) => (
+                            <div key={i} className="bpm-candidate-row">
+                              <span className="bpm-candidate-tempo">
+                                <strong>{c.tempo}</strong> BPM
+                              </span>
+                              <span className="bpm-candidate-meta">
+                                Count: {c.count} | Confidence: {(c.confidence * 100).toFixed(0)}% | Aliases: {c.aliases.join(", ")}
+                              </span>
+                            </div>
+                          ))}
+                        </div>
+                      </div>
+                    )}
+                  </div>
+                ) : (
+                  <div>
+                    <button
+                      type="button"
+                      className="btn-ghost-pill btn-sm-contained"
+                      onClick={() => {
+                        const nextId = ++workspaceRequestIdRef.current;
+                        runWorkspaceBpmAnalysis(nextId);
+                      }}
+                    >
+                      Run Browser BPM Analysis
+                    </button>
+                  </div>
+                )}
+              </div>
+            </details>
 
             <div className="generate-form-card">
               <div className="analysis-checkbox-container">

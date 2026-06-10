@@ -33,6 +33,7 @@ export interface ISongDetails {
   video_path: string | null;
   charts: IChartDetails[];
   asset_statuses: ISongAssetsStatus;
+  ssc_bpms?: number[];
 }
 
 export type PlayMode = "Single" | "Double";

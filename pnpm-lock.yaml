@@ -29,6 +29,9 @@ importers:
       react-dom:
         specifier: ^19.2.0
         version: 19.2.7(react@19.2.7)
+      realtime-bpm-analyzer:
+        specifier: ^5.0.13
+        version: 5.0.13
       zustand:
         specifier: ^5.0.3
         version: 5.0.14(@types/react@19.2.16)(immer@10.2.0)(react@19.2.7)
@@ -682,6 +685,9 @@ packages:
     resolution: {integrity: sha512-HNe9WslTbXmFK8o8cmwgAeJFSBvt1bPdHCVKtaaV+WlAN36mpT4hcRpwbf3fY56ar2oIXzsBpOAiIRHAdY0OlQ==}
     engines: {node: '>=0.10.0'}
 
+  realtime-bpm-analyzer@5.0.13:
+    resolution: {integrity: sha512-rzwo/doqEI4dNzHQnmhJjAI1Ab8F1p+OiufazpSMSlusmu8JNL+S6fWe4RsLHM6xXg0CqJ5DNt3kQ+4FlYGikw==}
+
   rollup@4.61.0:
     resolution: {integrity: sha512-T9mWdbWfQtp0B5lv/HX+wrhYsmXRlcWnXXmJbXqKJhlRaoS6KMhq0gpyzW4UJfclcxrEdLnTgjT2NjruLONu0g==}
     engines: {node: '>=18.0.0', npm: '>=8.0.0'}
@@ -1264,6 +1270,8 @@ snapshots:
   react-refresh@0.17.0: {}
 
   react@19.2.7: {}
+
+  realtime-bpm-analyzer@5.0.13: {}
 
   rollup@4.61.0:
     dependencies:

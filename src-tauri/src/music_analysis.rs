@@ -266,6 +266,36 @@ pub fn analyze_song_offline(
     })
 }
 
+#[tauri::command]
+pub fn load_analysis_report(ssc_path: String) -> Result<Option<SongAnalysisReport>, String> {
+    let ssc_p = Path::new(&ssc_path);
+    if !ssc_p.exists() || !ssc_p.is_file() {
+        return Err(format!(
+            "SSC file path does not exist or is not a file: {}",
+            ssc_path
+        ));
+    }
+
+    let song_dir = ssc_p
+        .parent()
+        .ok_or_else(|| "Could not resolve parent directory of SSC path".to_string())?;
+    let report_file = song_dir
+        .join(".ai-step-gen-analysis")
+        .join("song-analysis-report.v1.json");
+
+    if !report_file.exists() || !report_file.is_file() {
+        return Ok(None);
+    }
+
+    let content = std::fs::read_to_string(&report_file)
+        .map_err(|e| format!("Failed to read report file: {}", e))?;
+
+    let report: SongAnalysisReport = serde_json::from_str(&content)
+        .map_err(|e| format!("Failed to parse report file as JSON: {}", e))?;
+
+    Ok(Some(report))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -433,5 +463,95 @@ mod tests {
         );
         assert!(result.is_err());
         assert!(result.unwrap_err().contains("does not exist"));
+    }
+
+    #[test]
+    fn test_load_analysis_report_nonexistent() {
+        let result_invalid = load_analysis_report("nonexistent_file.ssc".to_string());
+        assert!(result_invalid.is_err());
+
+        let temp_dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("temp_analysis_test");
+        let _ = std::fs::create_dir_all(&temp_dir);
+        let temp_ssc = temp_dir.join("test.ssc");
+        std::fs::write(&temp_ssc, "mock ssc").unwrap();
+
+        let result = load_analysis_report(temp_ssc.to_string_lossy().to_string());
+        assert!(result.is_ok());
+        assert!(result.unwrap().is_none());
+
+        let _ = std::fs::remove_file(&temp_ssc);
+        let _ = std::fs::remove_dir(&temp_dir);
+    }
+
+    #[test]
+    fn test_load_analysis_report_exists() {
+        let temp_dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("temp_analysis_exists_test");
+        let report_dir = temp_dir.join(".ai-step-gen-analysis");
+        let _ = std::fs::create_dir_all(&report_dir);
+
+        let temp_ssc = temp_dir.join("test.ssc");
+        std::fs::write(&temp_ssc, "mock ssc").unwrap();
+
+        let report_file = report_dir.join("song-analysis-report.v1.json");
+
+        let mock_report_json = r#"{
+            "schema_version": "music-analysis-report.v1",
+            "song_id": "test-id-123",
+            "title": "Mock Song Exists",
+            "artist": "Mock Artist Exists",
+            "duration_seconds": 180.0,
+            "audio_summary": {
+                "sample_rate": 44100,
+                "detected_bpm": 140.0,
+                "rms_energy_mean": 0.2,
+                "rms_energy_max": 0.4,
+                "spectral_centroid_mean": 1800.0,
+                "spectral_flatness_mean": 0.06,
+                "zero_crossing_rate_mean": 0.09,
+                "chroma_mean": null,
+                "spectral_contrast_mean": null,
+                "analysis_mode": "dsp"
+            },
+            "timing_grid": {
+                "initial_offset": 0.0,
+                "bpms": [[0.0, 140.0]],
+                "display_bpm": "140",
+                "song_type": "ARCADE"
+            },
+            "event_features": { "beats": [] },
+            "sections": [],
+            "choreographic_intent": [],
+            "diagnostics": {
+                "audio_bpm_detected": 140.0,
+                "ssc_initial_bpm": 140.0,
+                "audio_vs_ssc_tempo_agreement": true,
+                "beat_grid_error_ms_mean": 0.0,
+                "timing_confidence": 1.0,
+                "requires_manual_timing_review": false,
+                "warnings": [],
+                "analysis_mode": "dsp"
+            },
+            "publicability": {
+                "contains_original_audio": false,
+                "contains_full_chart": false,
+                "exportable": true
+            }
+        }"#;
+
+        std::fs::write(&report_file, mock_report_json).unwrap();
+
+        let result = load_analysis_report(temp_ssc.to_string_lossy().to_string());
+        assert!(result.is_ok());
+        let opt = result.unwrap();
+        assert!(opt.is_some());
+        let report = opt.unwrap();
+        assert_eq!(report.song_id, "test-id-123");
+        assert_eq!(report.title, "Mock Song Exists");
+        assert_eq!(report.audio_summary.detected_bpm, 140.0);
+
+        let _ = std::fs::remove_file(&report_file);
+        let _ = std::fs::remove_file(&temp_ssc);
+        let _ = std::fs::remove_dir(&report_dir);
+        let _ = std::fs::remove_dir(&temp_dir);
     }
 }

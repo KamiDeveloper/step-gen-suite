@@ -5,6 +5,10 @@ import { useSettingsStore } from "../store/settingsStore";
 import { ISongDetails } from "../types/song";
 import { ArrowRight, Save, AlertTriangle, CheckCircle, Play, Pause, Music, Image, Video, Trash2 } from "lucide-react";
 import { WizardFooter } from "../components/WizardFooter";
+import { analyzeBrowserBpmFromArrayBuffer } from "../features/music-analysis/browser-bpm/analyzeBrowserBpmFromBuffer";
+import { BrowserBpmAnalysisReport } from "../features/music-analysis/browser-bpm/browserBpmTypes";
+import { reconcileBpmCandidates } from "../features/music-analysis/browser-bpm/browserBpmReconciliation";
+import { getBrowserBpmSupport } from "../features/music-analysis/browser-bpm/browserBpmSupport";
 
 interface CreateSongWizardProps {
   onNavigate: (screen: string) => void;
@@ -27,6 +31,14 @@ interface IFileMetadata {
 export const CreateSongWizard: React.FC<CreateSongWizardProps> = ({ onNavigate }) => {
   const { setCurrentSong } = useSongProjectStore();
   const { settings, ensureSongpack } = useSettingsStore();
+
+  const isMountedRef = useRef(true);
+  useEffect(() => {
+    isMountedRef.current = true;
+    return () => {
+      isMountedRef.current = false;
+    };
+  }, []);
 
   const [currentStep, setCurrentStep] = useState(1);
   const [errorMsg, setErrorMsg] = useState<string | null>(null);
@@ -156,6 +168,104 @@ export const CreateSongWizard: React.FC<CreateSongWizardProps> = ({ onNavigate }
   const [displayBpm, setDisplayBpm] = useState("120.000");
   const [timingBpm, setTimingBpm] = useState("120.000");
   const [offset, setOffset] = useState("0.000000");
+
+  // Browser BPM Analysis States
+  const [browserBpmReport, setBrowserBpmReport] = useState<BrowserBpmAnalysisReport | null>(null);
+  const [isBpmAnalyzing, setIsBpmAnalyzing] = useState(false);
+  const [bpmAnalysisError, setBpmAnalysisError] = useState<string | null>(null);
+
+  const activeAudioPathRef = useRef<string | null>(null);
+  const hasUserEditedBpmRef = useRef(false);
+  const requestIdRef = useRef(0);
+
+  const runBpmAnalysis = async (filePath: string, fileName: string, reqId: number) => {
+    setIsBpmAnalyzing(true);
+    setBpmAnalysisError(null);
+    try {
+      const bytes = await invoke<number[]>("read_audio_file", { path: filePath });
+      if (requestIdRef.current !== reqId || !isMountedRef.current || activeAudioPathRef.current !== filePath) {
+        return;
+      }
+      const uint8 = new Uint8Array(bytes);
+      const report = await analyzeBrowserBpmFromArrayBuffer({
+        arrayBuffer: uint8.buffer,
+        audioFileName: fileName,
+      });
+
+      if (requestIdRef.current !== reqId || !isMountedRef.current || activeAudioPathRef.current !== filePath) {
+        return;
+      }
+
+      setBrowserBpmReport(report);
+
+      const recon = reconcileBpmCandidates({
+        sscBpms: [],
+        browserCandidates: report.candidates,
+        toleranceBpm: 2.0,
+        minConfidence: 0.2,
+        minCount: 4,
+      });
+
+      if (recon.suggestedBpm && !hasUserEditedBpmRef.current) {
+        setTimingBpm(recon.suggestedBpm.toString());
+        setDisplayBpm(recon.suggestedBpm.toString());
+      }
+    } catch (err: any) {
+      if (requestIdRef.current === reqId && isMountedRef.current && activeAudioPathRef.current === filePath) {
+        console.error("BPM preanalysis error:", err);
+        setBpmAnalysisError(err.toString());
+      }
+    } finally {
+      if (requestIdRef.current === reqId && isMountedRef.current && activeAudioPathRef.current === filePath) {
+        setIsBpmAnalyzing(false);
+      }
+    }
+  };
+
+  useEffect(() => {
+    if (audioFile) {
+      activeAudioPathRef.current = audioFile.path;
+      hasUserEditedBpmRef.current = false;
+      const nextId = ++requestIdRef.current;
+      runBpmAnalysis(audioFile.path, audioFile.name, nextId);
+    } else {
+      activeAudioPathRef.current = null;
+      setBrowserBpmReport(null);
+      setBpmAnalysisError(null);
+      hasUserEditedBpmRef.current = false;
+    }
+    return () => {
+      requestIdRef.current++;
+      activeAudioPathRef.current = null;
+    };
+  }, [audioFile]);
+
+  const handleTimingBpmChange = (e: React.ChangeEvent<HTMLInputElement>) => {
+    setTimingBpm(e.target.value);
+    hasUserEditedBpmRef.current = true;
+  };
+
+  const handleDisplayBpmChange = (e: React.ChangeEvent<HTMLInputElement>) => {
+    setDisplayBpm(e.target.value);
+    hasUserEditedBpmRef.current = true;
+  };
+
+  const handleUseSuggestedBpm = () => {
+    if (browserBpmReport?.candidates && browserBpmReport.candidates.length > 0) {
+      const recon = reconcileBpmCandidates({
+        sscBpms: [],
+        browserCandidates: browserBpmReport.candidates,
+        toleranceBpm: 2.0,
+        minConfidence: 0.2,
+        minCount: 4,
+      });
+      if (recon.suggestedBpm) {
+        setTimingBpm(recon.suggestedBpm.toString());
+        setDisplayBpm(recon.suggestedBpm.toString());
+        hasUserEditedBpmRef.current = true;
+      }
+    }
+  };
 
   // Load default songpack path and preset settings
   useEffect(() => {
@@ -822,7 +932,7 @@ export const CreateSongWizard: React.FC<CreateSongWizardProps> = ({ onNavigate }
                       type="text"
                       className="input-contained"
                       value={displayBpm}
-                      onChange={(e) => setDisplayBpm(e.target.value)}
+                      onChange={handleDisplayBpmChange}
                       placeholder="e.g. 120.000 or *"
                     />
                   </div>
@@ -834,7 +944,7 @@ export const CreateSongWizard: React.FC<CreateSongWizardProps> = ({ onNavigate }
                       step="0.001"
                       className="input-contained"
                       value={timingBpm}
-                      onChange={(e) => setTimingBpm(e.target.value)}
+                      onChange={handleTimingBpmChange}
                       placeholder="e.g. 120.000"
                     />
                   </div>
@@ -851,6 +961,147 @@ export const CreateSongWizard: React.FC<CreateSongWizardProps> = ({ onNavigate }
                     />
                   </div>
                 </div>
+              </div>
+
+              {/* Quick BPM Analysis Panel */}
+              <div className="settings-card bpm-analysis-wrapper">
+                <div className="bpm-analysis-header-row">
+                  <h4 className="card-subtitle-obsidian">Quick BPM Analysis</h4>
+                  {!getBrowserBpmSupport().isSupported && (
+                    <span className="badge-status-error">Web Audio Unsupported</span>
+                  )}
+                </div>
+                <p className="caption-text-gravel">
+                  Detect tempo in your browser using <code>realtime-bpm-analyzer</code>.
+                </p>
+
+                {isBpmAnalyzing ? (
+                  <div className="info-banner-gray">
+                    <div className="gemini-waves-container animating">
+                      <div className="gemini-wave wave1"></div>
+                      <div className="gemini-wave wave2"></div>
+                      <div className="gemini-wave wave3"></div>
+                    </div>
+                    <span className="icon-ml">Running analysis on audio buffer...</span>
+                  </div>
+                ) : bpmAnalysisError ? (
+                  <div className="error-box">
+                    <AlertTriangle size={16} className="icon-mr text-danger-icon" />
+                    <span>Failed browser BPM analysis: {bpmAnalysisError}</span>
+                  </div>
+                ) : browserBpmReport ? (
+                  <div>
+                    <div className="bpm-results-grid">
+                      <div className="bpm-stat-box">
+                        <span className="bpm-stat-title">Suggested BPM</span>
+                        <span className="bpm-stat-value">
+                          {(() => {
+                            const recon = reconcileBpmCandidates({
+                              sscBpms: [],
+                              browserCandidates: browserBpmReport.candidates,
+                              toleranceBpm: 2.0,
+                              minConfidence: 0.2,
+                              minCount: 4,
+                            });
+                            return recon.suggestedBpm ?? "No result (low confidence/count)";
+                          })()}
+                        </span>
+                      </div>
+                      {browserBpmReport.stableTempo && (
+                        <div className="bpm-stat-box">
+                          <span className="bpm-stat-title">Confidence</span>
+                          <span className="bpm-stat-value">
+                            {(browserBpmReport.stableTempo.confidence * 100).toFixed(0)}%
+                          </span>
+                        </div>
+                      )}
+                    </div>
+
+                    {browserBpmReport.warnings && browserBpmReport.warnings.length > 0 && (
+                      <div className="warning-box">
+                        <AlertTriangle size={16} className="icon-mr text-warning-icon" />
+                        <div>
+                          {browserBpmReport.warnings.map((w, idx) => (
+                            <div key={idx}>{w}</div>
+                          ))}
+                        </div>
+                      </div>
+                    )}
+
+                    {browserBpmReport.candidates && browserBpmReport.candidates.length > 0 && (
+                      <div className="bpm-candidates-section">
+                        <span className="bpm-stat-title">Raw Candidates</span>
+                        <div className="bpm-candidates-list">
+                          {browserBpmReport.candidates.map((c, i) => (
+                            <div key={i} className="bpm-candidate-row">
+                              <span className="bpm-candidate-tempo">
+                                <strong>{c.tempo}</strong> BPM
+                              </span>
+                              <span className="bpm-candidate-meta">
+                                Count: {c.count} | Confidence: {(c.confidence * 100).toFixed(0)}% | Aliases: {c.aliases.join(", ")}
+                              </span>
+                            </div>
+                          ))}
+                        </div>
+                      </div>
+                    )}
+
+                    <div className="bpm-actions-row">
+                      {(() => {
+                        const recon = reconcileBpmCandidates({
+                          sscBpms: [],
+                          browserCandidates: browserBpmReport.candidates,
+                          toleranceBpm: 2.0,
+                          minConfidence: 0.2,
+                          minCount: 4,
+                        });
+                        const hasSuggested = recon.suggestedBpm != null;
+                        return (
+                          <button
+                            type="button"
+                            className="btn-ghost-pill btn-sm-contained"
+                            onClick={handleUseSuggestedBpm}
+                            disabled={!hasSuggested}
+                          >
+                            Use Suggested BPM
+                          </button>
+                        );
+                      })()}
+                      {audioFile && (
+                        <button
+                          type="button"
+                          className="btn-ghost-pill btn-sm-contained"
+                          onClick={() => {
+                            const nextId = ++requestIdRef.current;
+                            runBpmAnalysis(audioFile.path, audioFile.name, nextId);
+                          }}
+                        >
+                          Run Browser BPM Analysis
+                        </button>
+                      )}
+                      <span className="caption-text-gravel">
+                        * Offset remains manual for now (default 0.000000)
+                      </span>
+                    </div>
+                  </div>
+                ) : (
+                  <div>
+                    {audioFile ? (
+                      <button
+                        type="button"
+                        className="btn-ghost-pill btn-sm-contained"
+                        onClick={() => {
+                          const nextId = ++requestIdRef.current;
+                          runBpmAnalysis(audioFile.path, audioFile.name, nextId);
+                        }}
+                      >
+                        Run Browser BPM Analysis
+                      </button>
+                    ) : (
+                      <span className="caption-text-gravel">Please select an audio asset to enable analysis.</span>
+                    )}
+                  </div>
+                )}
               </div>
             </div>
           </div>
