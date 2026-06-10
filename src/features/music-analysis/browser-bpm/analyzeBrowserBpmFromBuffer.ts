@@ -1,4 +1,4 @@
-import { analyzeFullBuffer, Tempo } from "realtime-bpm-analyzer";
+import { analyzeFullBuffer, type Tempo } from "realtime-bpm-analyzer";
 import { getBrowserBpmSupport } from "./browserBpmSupport.ts";
 import { expandTempoAliases } from "./browserBpmAliases.ts";
 import type {
@@ -42,16 +42,23 @@ export async function analyzeBrowserBpmFromArrayBuffer(params: {
     // Run offline analysis
     const tempos: Tempo[] = await analyzeFullBuffer(audioBuffer);
 
-    // Map and sort candidates by confidence descending (realtime-bpm-analyzer usually ranks them already)
+    // Calculate max count to derive local confidence = count / maxCount
+    const maxCount = tempos.length > 0 ? Math.max(...tempos.map((t) => t.count)) : 1;
+
+    // Map candidates with both raw confidence and local count-based confidence
     const allCandidates: BrowserTempoCandidate[] = tempos.map((t) => ({
       tempo: Number(t.tempo.toFixed(3)),
       count: t.count,
-      confidence: Number(t.confidence.toFixed(3)),
+      confidence: maxCount > 0 ? Number((t.count / maxCount).toFixed(3)) : 0,
+      rawConfidence: Number(t.confidence.toFixed(3)),
       aliases: expandTempoAliases(t.tempo),
     }));
 
+    // Sort by count descending to ensure best candidates are first
+    const sortedCandidates = [...allCandidates].sort((a, b) => b.count - a.count);
+
     // Limit to top 8 candidates
-    const candidates = allCandidates.slice(0, 8);
+    const candidates = sortedCandidates.slice(0, 8);
 
     return {
       source: "browser_realtime_bpm_analyzer",

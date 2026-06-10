@@ -5,9 +5,51 @@ use crate::biomechanics::{
 use crate::gemini::{GeminiClient, GeminiWriteMode};
 use crate::ssc::parser::{SscChart, SscDocument, SscTag};
 use serde::{Deserialize, Serialize};
+use std::collections::HashSet;
 use std::fs;
 use std::io::Write;
 use std::path::{Path, PathBuf};
+use std::sync::{Mutex, OnceLock};
+
+static ALLOWED_AUDIO_PATHS: OnceLock<Mutex<HashSet<PathBuf>>> = OnceLock::new();
+
+fn get_allowed_audio_paths() -> &'static Mutex<HashSet<PathBuf>> {
+    ALLOWED_AUDIO_PATHS.get_or_init(|| Mutex::new(HashSet::new()))
+}
+
+pub fn grant_audio_read_access(path: &Path) -> Result<PathBuf, String> {
+    let canonical = path
+        .canonicalize()
+        .map_err(|e| format!("Failed to canonicalize path for grant: {}", e))?;
+    if let Ok(mut allowed) = get_allowed_audio_paths().lock() {
+        allowed.insert(canonical.clone());
+    }
+    Ok(canonical)
+}
+
+pub fn revoke_audio_read_access(path: &Path) {
+    if let Ok(canonical) = path.canonicalize() {
+        if let Ok(mut allowed) = get_allowed_audio_paths().lock() {
+            allowed.remove(&canonical);
+        }
+    } else if let Ok(mut allowed) = get_allowed_audio_paths().lock() {
+        allowed.remove(path);
+    }
+}
+
+pub fn clear_audio_read_grants() {
+    if let Ok(mut allowed) = get_allowed_audio_paths().lock() {
+        allowed.clear();
+    }
+}
+
+pub fn is_audio_read_granted(canonical_path: &Path) -> bool {
+    if let Ok(allowed) = get_allowed_audio_paths().lock() {
+        allowed.contains(canonical_path)
+    } else {
+        false
+    }
+}
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct ChartDetails {
@@ -562,11 +604,18 @@ pub async fn select_song_asset_file<R: Runtime>(
         _ => return Err(format!("Unsupported asset kind: {}", kind)),
     };
 
+    let is_audio = kind == "audio";
     let (tx, rx) = tokio::sync::oneshot::channel();
     picker.pick_file(move |file| {
         if let Some(f) = file {
-            let path_result = f.into_path().map(|p| p.to_string_lossy().to_string()).ok();
-            let _ = tx.send(path_result);
+            if let Ok(path) = f.into_path() {
+                if is_audio {
+                    let _ = grant_audio_read_access(&path);
+                }
+                let _ = tx.send(Some(path.to_string_lossy().to_string()));
+            } else {
+                let _ = tx.send(None);
+            }
         } else {
             let _ = tx.send(None);
         }
@@ -1139,6 +1188,12 @@ pub fn import_song_folder(folder_path: String) -> Result<SongDetails, String> {
     let mut hasher = DefaultHasher::new();
     song_name.hash(&mut hasher);
     let song_id = format!("{:016x}", hasher.finish());
+
+    // Register the resolved audio path in ALLOWED_AUDIO_PATHS securely if it exists
+    if let Some(ref path_str) = audio_path {
+        let path = PathBuf::from(path_str);
+        let _ = grant_audio_read_access(&path);
+    }
 
     Ok(SongDetails {
         song_id,
@@ -1833,8 +1888,10 @@ pub async fn generate_gemini_chart_preview<R: tauri::Runtime>(
     .await
 }
 
-#[tauri::command]
-pub async fn read_audio_file(path: String) -> Result<Vec<u8>, String> {
+pub async fn read_audio_file_impl(
+    songs_dir: Option<std::path::PathBuf>,
+    path: String,
+) -> Result<Vec<u8>, String> {
     use std::io::Read;
 
     let raw_path_lower = path.to_lowercase();
@@ -1875,6 +1932,26 @@ pub async fn read_audio_file(path: String) -> Result<Vec<u8>, String> {
                     .to_string(),
             );
         }
+    }
+
+    // Allowlist check:
+    // 1. Check if under songs_dir
+    let mut allowed = false;
+    if let Some(ref s_dir) = songs_dir {
+        if let Ok(canonical_songs_dir) = s_dir.canonicalize() {
+            if canonical.starts_with(&canonical_songs_dir) {
+                allowed = true;
+            }
+        }
+    }
+
+    // 2. Check if explicitly allowed via dynamic grants allowlist
+    if !allowed {
+        allowed = is_audio_read_granted(&canonical);
+    }
+
+    if !allowed {
+        return Err("Acceso denegado: El archivo de audio no está en el directorio de canciones activo ni ha sido seleccionado explícitamente.".to_string());
     }
 
     let ext = p
@@ -1932,11 +2009,93 @@ pub async fn read_audio_file(path: String) -> Result<Vec<u8>, String> {
     std::fs::read(p).map_err(|e| format!("Error al leer el archivo de audio: {}", e))
 }
 
+#[tauri::command]
+pub async fn read_audio_file<R: tauri::Runtime>(
+    app_handle: tauri::AppHandle<R>,
+    path: String,
+) -> Result<Vec<u8>, String> {
+    let settings = crate::settings::load_settings_internal(&app_handle);
+    let songs_dir = settings.songs_dir.map(std::path::PathBuf::from);
+    read_audio_file_impl(songs_dir, path).await
+}
+
+#[tauri::command]
+pub fn clear_browser_bpm_audio_grants() -> Result<(), String> {
+    clear_audio_read_grants();
+    Ok(())
+}
+
+#[tauri::command]
+pub fn grant_active_song_audio_access(ssc_path: String) -> Result<String, String> {
+    let ssc_path_buf = PathBuf::from(&ssc_path);
+    if !ssc_path_buf.exists() || !ssc_path_buf.is_file() {
+        return Err("SSC file does not exist.".to_string());
+    }
+
+    let canonical_ssc = ssc_path_buf
+        .canonicalize()
+        .map_err(|e| format!("Failed to canonicalize ssc path: {}", e))?;
+
+    let folder = canonical_ssc
+        .parent()
+        .ok_or_else(|| "Invalid ssc file folder path".to_string())?;
+
+    // Parse the ssc to get the audio filename
+    let doc = SscDocument::parse(&canonical_ssc)
+        .map_err(|e| format!("Failed to parse ssc file: {}", e))?;
+
+    let mut music_file = None;
+    for tag in &doc.global_tags {
+        if let Some(key) = &tag.key {
+            if key == "MUSIC" {
+                music_file = Some(tag.value.clone());
+                break;
+            }
+        }
+    }
+
+    let music_val = music_file.ok_or_else(|| "No MUSIC tag defined in ssc file".to_string())?;
+    if music_val.trim().is_empty() {
+        return Err("MUSIC tag is empty in ssc file".to_string());
+    }
+
+    // Resolve path under the folder
+    let resolved_path = folder.join(&music_val);
+
+    // Verify resolving is safe and does not escape folder via traversal
+    let canonical_folder = folder
+        .canonicalize()
+        .map_err(|e| format!("Failed to canonicalize folder: {}", e))?;
+
+    let canonical_resolved = resolved_path
+        .canonicalize()
+        .map_err(|e| format!("Audio file does not exist or is invalid: {}", e))?;
+
+    if !canonical_resolved.starts_with(&canonical_folder) {
+        return Err("Access denied: Audio path traversal attempt detected.".to_string());
+    }
+
+    if !canonical_resolved.is_file() {
+        return Err("Resolved audio path is not a file.".to_string());
+    }
+
+    // Grant access
+    let granted_path = grant_audio_read_access(&canonical_resolved)?;
+    Ok(granted_path.to_string_lossy().to_string())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use mockito::Server;
     use std::path::PathBuf;
+    use std::sync::{Mutex, OnceLock};
+
+    static AUDIO_GRANTS_TEST_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+
+    fn get_test_lock() -> &'static Mutex<()> {
+        AUDIO_GRANTS_TEST_LOCK.get_or_init(|| Mutex::new(()))
+    }
 
     fn get_fixture_path() -> PathBuf {
         let mut p = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
@@ -3420,6 +3579,8 @@ mod tests {
 
     #[tokio::test]
     async fn test_read_audio_file_security() {
+        let _lock = get_test_lock().lock().unwrap();
+        clear_audio_read_grants();
         let manifest_dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
         let test_dir = manifest_dir.join("temp_security_test");
         let _ = std::fs::remove_dir_all(&test_dir);
@@ -3428,21 +3589,33 @@ mod tests {
         // Test 1: Invalid extension
         let txt_file = test_dir.join("test_security.txt");
         std::fs::write(&txt_file, b"some content").unwrap();
-        let res = read_audio_file(txt_file.to_string_lossy().to_string()).await;
+        let res = read_audio_file_impl(
+            Some(test_dir.clone()),
+            txt_file.to_string_lossy().to_string(),
+        )
+        .await;
         assert!(res.is_err());
         assert!(res.unwrap_err().contains("Formato de audio no soportado"));
 
         // Test 2: Invalid magic bytes on audio extension
         let fake_mp3 = test_dir.join("test_security.mp3");
         std::fs::write(&fake_mp3, b"malicious binary or config content here").unwrap();
-        let res = read_audio_file(fake_mp3.to_string_lossy().to_string()).await;
+        let res = read_audio_file_impl(
+            Some(test_dir.clone()),
+            fake_mp3.to_string_lossy().to_string(),
+        )
+        .await;
         assert!(res.is_err());
         assert!(res
             .unwrap_err()
             .contains("Los bytes mágicos del archivo no corresponden"));
 
         // Test 3: Path blocklisting (e.g. system folder path simulating traversal)
-        let res_blocked = read_audio_file("C:\\Windows\\System32\\test.mp3".to_string()).await;
+        let res_blocked = read_audio_file_impl(
+            Some(test_dir.clone()),
+            "C:\\Windows\\System32\\test.mp3".to_string(),
+        )
+        .await;
         assert!(res_blocked.is_err());
         assert!(res_blocked.unwrap_err().contains("Acceso denegado"));
 
@@ -3452,13 +3625,21 @@ mod tests {
         wav_bytes[0..4].copy_from_slice(b"RIFF");
         wav_bytes[8..12].copy_from_slice(b"WAVE");
         std::fs::write(&valid_wav, &wav_bytes).unwrap();
-        let res = read_audio_file(valid_wav.to_string_lossy().to_string()).await;
+        let res = read_audio_file_impl(
+            Some(test_dir.clone()),
+            valid_wav.to_string_lossy().to_string(),
+        )
+        .await;
         assert!(res.is_ok());
         assert_eq!(res.unwrap(), wav_bytes);
 
         // Test 5: Missing file
         let missing_file = test_dir.join("does_not_exist.wav");
-        let res_missing = read_audio_file(missing_file.to_string_lossy().to_string()).await;
+        let res_missing = read_audio_file_impl(
+            Some(test_dir.clone()),
+            missing_file.to_string_lossy().to_string(),
+        )
+        .await;
         assert!(res_missing.is_err());
         assert!(res_missing
             .unwrap_err()
@@ -3469,7 +3650,11 @@ mod tests {
         let file = std::fs::File::create(&oversized_file).unwrap();
         file.set_len(100 * 1024 * 1024 + 1).unwrap();
         drop(file);
-        let res_oversized = read_audio_file(oversized_file.to_string_lossy().to_string()).await;
+        let res_oversized = read_audio_file_impl(
+            Some(test_dir.clone()),
+            oversized_file.to_string_lossy().to_string(),
+        )
+        .await;
         assert!(res_oversized.is_err());
         assert!(res_oversized
             .unwrap_err()
@@ -3481,7 +3666,11 @@ mod tests {
         case_bytes[0..4].copy_from_slice(b"RIFF");
         case_bytes[8..12].copy_from_slice(b"WAVE");
         std::fs::write(&case_wav, &case_bytes).unwrap();
-        let res_case = read_audio_file(case_wav.to_string_lossy().to_string()).await;
+        let res_case = read_audio_file_impl(
+            Some(test_dir.clone()),
+            case_wav.to_string_lossy().to_string(),
+        )
+        .await;
         assert!(res_case.is_ok());
 
         // Test 8: Valid OGG magic bytes
@@ -3489,7 +3678,11 @@ mod tests {
         let mut ogg_bytes = vec![0u8; 12];
         ogg_bytes[0..4].copy_from_slice(b"OggS");
         std::fs::write(&valid_ogg, &ogg_bytes).unwrap();
-        let res_ogg = read_audio_file(valid_ogg.to_string_lossy().to_string()).await;
+        let res_ogg = read_audio_file_impl(
+            Some(test_dir.clone()),
+            valid_ogg.to_string_lossy().to_string(),
+        )
+        .await;
         assert!(res_ogg.is_ok());
 
         // Test 9: Valid FLAC magic bytes
@@ -3497,7 +3690,11 @@ mod tests {
         let mut flac_bytes = vec![0u8; 12];
         flac_bytes[0..4].copy_from_slice(b"fLaC");
         std::fs::write(&valid_flac, &flac_bytes).unwrap();
-        let res_flac = read_audio_file(valid_flac.to_string_lossy().to_string()).await;
+        let res_flac = read_audio_file_impl(
+            Some(test_dir.clone()),
+            valid_flac.to_string_lossy().to_string(),
+        )
+        .await;
         assert!(res_flac.is_ok());
 
         // Test 10: Valid MP3 magic bytes (ID3 tag)
@@ -3505,7 +3702,11 @@ mod tests {
         let mut mp3_bytes = vec![0u8; 12];
         mp3_bytes[0..3].copy_from_slice(b"ID3");
         std::fs::write(&valid_mp3, &mp3_bytes).unwrap();
-        let res_mp3 = read_audio_file(valid_mp3.to_string_lossy().to_string()).await;
+        let res_mp3 = read_audio_file_impl(
+            Some(test_dir.clone()),
+            valid_mp3.to_string_lossy().to_string(),
+        )
+        .await;
         assert!(res_mp3.is_ok());
 
         // Test 11: Valid MP3 magic bytes (raw sync word 0xFFFB)
@@ -3514,14 +3715,204 @@ mod tests {
         mp3_raw_bytes[0] = 0xFF;
         mp3_raw_bytes[1] = 0xFB;
         std::fs::write(&valid_mp3_raw, &mp3_raw_bytes).unwrap();
-        let res_mp3_raw = read_audio_file(valid_mp3_raw.to_string_lossy().to_string()).await;
+        let res_mp3_raw = read_audio_file_impl(
+            Some(test_dir.clone()),
+            valid_mp3_raw.to_string_lossy().to_string(),
+        )
+        .await;
         assert!(res_mp3_raw.is_ok());
 
         // Test 12: Blocklist path trigger
-        let res_git_blocked = read_audio_file("C:\\my_songpack\\.git\\audio.wav".to_string()).await;
+        let res_git_blocked = read_audio_file_impl(
+            Some(test_dir.clone()),
+            "C:\\my_songpack\\.git\\audio.wav".to_string(),
+        )
+        .await;
         assert!(res_git_blocked.is_err());
         assert!(res_git_blocked.unwrap_err().contains("Acceso denegado"));
 
+        // Test 13: Allowlist restriction outside scope
+        let outside_dir = manifest_dir.join("temp_outside_test");
+        let _ = std::fs::remove_dir_all(&outside_dir);
+        std::fs::create_dir_all(&outside_dir).unwrap();
+        let outside_wav = outside_dir.join("outside_valid.wav");
+        let mut outside_bytes = vec![0u8; 12];
+        outside_bytes[0..4].copy_from_slice(b"RIFF");
+        outside_bytes[8..12].copy_from_slice(b"WAVE");
+        std::fs::write(&outside_wav, &outside_bytes).unwrap();
+
+        // Reading with None songs_dir and not in ALLOWED_AUDIO_PATHS should fail with "Acceso denegado"
+        let res_outside =
+            read_audio_file_impl(None, outside_wav.to_string_lossy().to_string()).await;
+        assert!(res_outside.is_err());
+        assert!(res_outside.unwrap_err().contains("Acceso denegado"));
+
+        // Registering it explicitly should allow it
+        let _ = grant_audio_read_access(&outside_wav);
+        let res_outside_allowed =
+            read_audio_file_impl(None, outside_wav.to_string_lossy().to_string()).await;
+        assert!(res_outside_allowed.is_ok());
+
+        // Cleanup allowlist entry to prevent leak
+        revoke_audio_read_access(&outside_wav);
+        clear_audio_read_grants();
+
+        let _ = std::fs::remove_dir_all(&outside_dir);
         let _ = std::fs::remove_dir_all(&test_dir);
+    }
+
+    #[tokio::test]
+    async fn test_imported_song_outside_songs_dir() {
+        let _lock = get_test_lock().lock().unwrap();
+        clear_audio_read_grants();
+        let manifest_dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+        let import_dir = manifest_dir.join("temp_import_test_outside");
+        let _ = std::fs::remove_dir_all(&import_dir);
+        std::fs::create_dir_all(&import_dir).unwrap();
+
+        // 1. Create a valid WAV audio file
+        let wav_file = import_dir.join("sound.wav");
+        let mut wav_bytes = vec![0u8; 12];
+        wav_bytes[0..4].copy_from_slice(b"RIFF");
+        wav_bytes[8..12].copy_from_slice(b"WAVE");
+        std::fs::write(&wav_file, &wav_bytes).unwrap();
+
+        // 2. Create a mini SSC file referencing the audio
+        let ssc_file = import_dir.join("song.ssc");
+        let ssc_content = "
+#TITLE:Imported Song;
+#ARTIST:Artist Name;
+#MUSIC:sound.wav;
+#BPMS:0.000=120.000;
+#OFFSET:0.000000;
+";
+        std::fs::write(&ssc_file, ssc_content).unwrap();
+
+        // 3. Call import_song_folder. This should succeed and register the audio in allowlist
+        let result = import_song_folder(import_dir.to_string_lossy().to_string());
+        assert!(result.is_ok());
+        let details = result.unwrap();
+        assert!(details.audio_path.is_some());
+        let resolved_audio_path = details.audio_path.unwrap();
+
+        // 4. Verify read_audio_file_impl succeeds with None songs_dir (since it was registered in allowlist)
+        let read_result = read_audio_file_impl(None, resolved_audio_path.clone()).await;
+        assert!(read_result.is_ok());
+        assert_eq!(read_result.unwrap(), wav_bytes);
+
+        // 5. Cleanup allowlist entry
+        revoke_audio_read_access(std::path::Path::new(&resolved_audio_path));
+        clear_audio_read_grants();
+
+        let _ = std::fs::remove_dir_all(&import_dir);
+    }
+
+    #[tokio::test]
+    async fn test_grant_lifecycle_scoping() {
+        let _lock = get_test_lock().lock().unwrap();
+        clear_audio_read_grants();
+        let manifest_dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+        let test_dir = manifest_dir.join("temp_scoping_lifecycle_test");
+        let _ = std::fs::remove_dir_all(&test_dir);
+        std::fs::create_dir_all(&test_dir).unwrap();
+
+        let test_file = test_dir.join("test_scoping_lifecycle.wav");
+        let mut wav_bytes = vec![0u8; 12];
+        wav_bytes[0..4].copy_from_slice(b"RIFF");
+        wav_bytes[8..12].copy_from_slice(b"WAVE");
+        std::fs::write(&test_file, &wav_bytes).unwrap();
+
+        // 1. Initially reading should fail (not in songs_dir, not granted)
+        let res_initial = read_audio_file_impl(None, test_file.to_string_lossy().to_string()).await;
+        assert!(res_initial.is_err());
+
+        // 2. Grant and read should succeed
+        let grant_res = grant_audio_read_access(&test_file);
+        assert!(grant_res.is_ok());
+        let res_granted = read_audio_file_impl(None, test_file.to_string_lossy().to_string()).await;
+        assert!(res_granted.is_ok());
+
+        // 3. Revoke and read should fail
+        revoke_audio_read_access(&test_file);
+        let res_revoked = read_audio_file_impl(None, test_file.to_string_lossy().to_string()).await;
+        assert!(res_revoked.is_err());
+
+        // 4. Grant again, clear grants, and read should fail
+        let _ = grant_audio_read_access(&test_file);
+        clear_audio_read_grants();
+        let res_cleared = read_audio_file_impl(None, test_file.to_string_lossy().to_string()).await;
+        assert!(res_cleared.is_err());
+
+        clear_audio_read_grants();
+        let _ = std::fs::remove_dir_all(&test_dir);
+    }
+
+    #[test]
+    fn test_grant_active_song_audio_access() {
+        let _lock = get_test_lock().lock().unwrap();
+        clear_audio_read_grants();
+        let manifest_dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+        let test_root = manifest_dir.join("temp_active_song_grant_root");
+        let _ = std::fs::remove_dir_all(&test_root);
+        std::fs::create_dir_all(&test_root).unwrap();
+
+        let song_dir = test_root.join("song_folder");
+        std::fs::create_dir_all(&song_dir).unwrap();
+
+        // 1. Create a valid WAV audio file
+        let wav_file = song_dir.join("audio.wav");
+        let mut wav_bytes = vec![0u8; 12];
+        wav_bytes[0..4].copy_from_slice(b"RIFF");
+        wav_bytes[8..12].copy_from_slice(b"WAVE");
+        std::fs::write(&wav_file, &wav_bytes).unwrap();
+
+        // 2. Create a valid SSC file referencing the audio
+        let ssc_file = song_dir.join("song.ssc");
+        let ssc_content = "
+#TITLE:Active Song;
+#ARTIST:Artist Name;
+#MUSIC:audio.wav;
+#BPMS:0.000=120.000;
+#OFFSET:0.000000;
+";
+        std::fs::write(&ssc_file, ssc_content).unwrap();
+
+        // 3. Call grant_active_song_audio_access
+        let grant_res = grant_active_song_audio_access(ssc_file.to_string_lossy().to_string());
+        assert!(grant_res.is_ok());
+        let granted_path = grant_res.unwrap();
+        assert_eq!(
+            PathBuf::from(&granted_path).canonicalize().unwrap(),
+            wav_file.canonicalize().unwrap()
+        );
+
+        // Verify it was granted
+        assert!(is_audio_read_granted(&wav_file.canonicalize().unwrap()));
+
+        // 4. Test directory traversal detection
+        // Create the outside file so it exists and can be canonicalized
+        let dangerous_file = test_root.join("dangerous.wav");
+        std::fs::write(&dangerous_file, &wav_bytes).unwrap();
+
+        let traversal_ssc = song_dir.join("traversal.ssc");
+        let traversal_content = "
+#TITLE:Traversal Song;
+#ARTIST:Artist Name;
+#MUSIC:../dangerous.wav;
+#BPMS:0.000=120.000;
+#OFFSET:0.000000;
+";
+        std::fs::write(&traversal_ssc, traversal_content).unwrap();
+
+        let traversal_res =
+            grant_active_song_audio_access(traversal_ssc.to_string_lossy().to_string());
+        assert!(traversal_res.is_err());
+        assert!(traversal_res
+            .unwrap_err()
+            .contains("traversal attempt detected"));
+
+        // Cleanup
+        clear_audio_read_grants();
+        let _ = std::fs::remove_dir_all(&test_root);
     }
 }

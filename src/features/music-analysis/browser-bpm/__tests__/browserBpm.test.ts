@@ -26,7 +26,7 @@ test("expandTempoAliases bounds limits (40-400)", () => {
 
 test("reconcileBpmCandidates agreement with SSC using half/double", () => {
   const browserCandidates: BrowserTempoCandidate[] = [
-    { tempo: 80, count: 10, confidence: 0.9, aliases: expandTempoAliases(80) },
+    { tempo: 80, count: 10, confidence: 0.9, rawConfidence: 0.0, aliases: expandTempoAliases(80) },
   ];
   const report = reconcileBpmCandidates({
     sscBpms: [160],
@@ -35,11 +35,12 @@ test("reconcileBpmCandidates agreement with SSC using half/double", () => {
   });
   assert.strictEqual(report.browserAgreesWithSsc, true, "Browser BPM 80 (alias 160) should agree with SSC 160");
   assert.strictEqual(report.requiresManualTimingReview, false, "No review needed since they agree");
+  assert.strictEqual(report.reconciliationStatus, "agrees");
 });
 
 test("reconcileBpmCandidates flags manual review if browser does not match SSC", () => {
   const browserCandidates: BrowserTempoCandidate[] = [
-    { tempo: 80, count: 10, confidence: 0.9, aliases: expandTempoAliases(80) },
+    { tempo: 80, count: 10, confidence: 0.9, rawConfidence: 0.0, aliases: expandTempoAliases(80) },
   ];
   const report = reconcileBpmCandidates({
     sscBpms: [120],
@@ -48,11 +49,12 @@ test("reconcileBpmCandidates flags manual review if browser does not match SSC",
   });
   assert.strictEqual(report.browserAgreesWithSsc, false, "Browser BPM 80 should not agree with SSC 120");
   assert.strictEqual(report.requiresManualTimingReview, true, "Should require manual review");
+  assert.strictEqual(report.reconciliationStatus, "disagrees");
 });
 
 test("reconcileBpmCandidates without SSC uses sidecar or browser as suggestion", () => {
   const browserCandidates: BrowserTempoCandidate[] = [
-    { tempo: 120.005, count: 10, confidence: 0.9, aliases: expandTempoAliases(120.005) },
+    { tempo: 120.005, count: 10, confidence: 0.9, rawConfidence: 0.0, aliases: expandTempoAliases(120.005) },
   ];
   const reportOnlyBrowser = reconcileBpmCandidates({
     sscBpms: [],
@@ -72,7 +74,7 @@ test("reconcileBpmCandidates without SSC uses sidecar or browser as suggestion",
 
 test("reconcileBpmCandidates raw BPM near an integer produces suggested integer BPM", () => {
   const browserCandidates: BrowserTempoCandidate[] = [
-    { tempo: 123.8, count: 10, confidence: 0.9, aliases: expandTempoAliases(123.8) },
+    { tempo: 123.8, count: 10, confidence: 0.9, rawConfidence: 0.0, aliases: expandTempoAliases(123.8) },
   ];
 
   const reportClose = reconcileBpmCandidates({
@@ -102,14 +104,14 @@ test("reconcileBpmCandidates with empty browser candidates (no evidence)", () =>
     browserCandidates: [],
     toleranceBpm: 2.0,
   });
-  assert.strictEqual(report.browserAgreesWithSsc, true, "Should assume agreement/no contradiction if no evidence");
+  assert.strictEqual(report.browserAgreesWithSsc, false, "Should be false if no evidence");
   assert.strictEqual(report.requiresManualTimingReview, false, "Should not require review if browser is empty");
-  assert.strictEqual(report.notes.length, 0, "Should have no warning notes");
+  assert.strictEqual(report.reconciliationStatus, "no_browser_evidence");
 });
 
 test("reconcileBpmCandidates low confidence candidates are not suggested", () => {
   const browserCandidates: BrowserTempoCandidate[] = [
-    { tempo: 120, count: 2, confidence: 0.05, aliases: expandTempoAliases(120) },
+    { tempo: 120, count: 2, confidence: 0.05, rawConfidence: 0.0, aliases: expandTempoAliases(120) },
   ];
   const report = reconcileBpmCandidates({
     sscBpms: [],
@@ -123,7 +125,7 @@ test("reconcileBpmCandidates low confidence candidates are not suggested", () =>
 
 test("reconcileBpmCandidates with multiple sscBpms matches any", () => {
   const browserCandidates: BrowserTempoCandidate[] = [
-    { tempo: 150, count: 10, confidence: 0.9, aliases: expandTempoAliases(150) },
+    { tempo: 150, count: 10, confidence: 0.9, rawConfidence: 0.0, aliases: expandTempoAliases(150) },
   ];
   const reportMatch = reconcileBpmCandidates({
     sscBpms: [120, 150, 180],
@@ -140,4 +142,28 @@ test("reconcileBpmCandidates with multiple sscBpms matches any", () => {
   });
   assert.strictEqual(reportNoMatch.browserAgreesWithSsc, false, "Should not agree if browser BPM does not match any SSC BPM");
   assert.strictEqual(reportNoMatch.requiresManualTimingReview, true, "Review needed");
+});
+
+test("reconcileBpmCandidates suggests BPM based on count when rawConfidence is 0 but count is high", () => {
+  const browserCandidates: BrowserTempoCandidate[] = [
+    { tempo: 135, count: 12, confidence: 1.0, rawConfidence: 0.0, aliases: expandTempoAliases(135) },
+  ];
+  const report = reconcileBpmCandidates({
+    sscBpms: [],
+    browserCandidates,
+    toleranceBpm: 2.0,
+    minConfidence: 0.2,
+    minCount: 4,
+  });
+  assert.strictEqual(report.suggestedBpm, 135, "Should suggest 135 because local count-derived confidence is 1.0 and count is high");
+});
+
+test("reconcileBpmCandidates status is unsupported when Web Audio support is false", () => {
+  const report = reconcileBpmCandidates({
+    sscBpms: [120],
+    browserCandidates: [],
+    toleranceBpm: 2.0,
+    isSupported: false,
+  });
+  assert.strictEqual(report.reconciliationStatus, "unsupported");
 });

@@ -29,6 +29,8 @@ pub fn run() {
             commands::create_song_project,
             commands::get_file_metadata,
             commands::read_audio_file,
+            commands::clear_browser_bpm_audio_grants,
+            commands::grant_active_song_audio_access,
             credentials::save_gemini_api_key,
             credentials::has_gemini_api_key,
             credentials::delete_gemini_api_key,

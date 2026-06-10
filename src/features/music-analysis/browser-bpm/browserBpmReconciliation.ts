@@ -7,6 +7,7 @@ export interface BpmReconciliationInput {
   readonly toleranceBpm: number;
   readonly minConfidence?: number;
   readonly minCount?: number;
+  readonly isSupported?: boolean;
 }
 
 export function reconcileBpmCandidates(
@@ -19,6 +20,7 @@ export function reconcileBpmCandidates(
     toleranceBpm,
     minConfidence = 0.2,
     minCount = 4,
+    isSupported = true,
   } = input;
 
   const hasBrowserEvidence = browserCandidates.length > 0;
@@ -28,7 +30,7 @@ export function reconcileBpmCandidates(
   );
 
   const browserAgreesWithSsc = !hasBrowserEvidence
-    ? true
+    ? false
     : sscBpms.some((sscBpm) =>
         Array.from(browserAliases).some((candidate) =>
           Math.abs(candidate - sscBpm) <= toleranceBpm
@@ -39,7 +41,7 @@ export function reconcileBpmCandidates(
     sidecarDetectedBpm == null
       ? true
       : !hasBrowserEvidence
-      ? true
+      ? false
       : Array.from(browserAliases).some((candidate) =>
           Math.abs(candidate - sidecarDetectedBpm) <= toleranceBpm
         );
@@ -96,6 +98,19 @@ export function reconcileBpmCandidates(
 
   const requiresManualTimingReview = sscBpms.length > 0 && hasBrowserEvidence && !browserAgreesWithSsc;
 
+  let reconciliationStatus: "agrees" | "disagrees" | "no_browser_evidence" | "unsupported";
+  if (isSupported === false) {
+    reconciliationStatus = "unsupported";
+  } else if (!hasBrowserEvidence) {
+    reconciliationStatus = "no_browser_evidence";
+  } else if (sscBpms.length > 0) {
+    reconciliationStatus = browserAgreesWithSsc ? "agrees" : "disagrees";
+  } else if (sidecarDetectedBpm != null) {
+    reconciliationStatus = browserAgreesWithSidecar ? "agrees" : "disagrees";
+  } else {
+    reconciliationStatus = "agrees";
+  }
+
   return {
     canonicalSource,
     canonicalBpm: canonicalBpm != null ? Number(canonicalBpm.toFixed(3)) : undefined,
@@ -104,5 +119,6 @@ export function reconcileBpmCandidates(
     requiresManualTimingReview,
     suggestedBpm,
     notes,
+    reconciliationStatus,
   };
 }

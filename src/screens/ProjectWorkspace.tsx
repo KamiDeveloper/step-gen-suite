@@ -18,6 +18,7 @@ import { SongAnalysisReport, AnalysisCommandResult } from "../types/musicAnalysi
 import { analyzeBrowserBpmFromArrayBuffer } from "../features/music-analysis/browser-bpm/analyzeBrowserBpmFromBuffer";
 import { BrowserBpmAnalysisReport } from "../features/music-analysis/browser-bpm/browserBpmTypes";
 import { reconcileBpmCandidates } from "../features/music-analysis/browser-bpm/browserBpmReconciliation";
+import { getBrowserBpmSupport } from "../features/music-analysis/browser-bpm/browserBpmSupport";
 
 const getAssetUI = (key: "audio" | "banner" | "background" | "video", status: IAssetStatus | undefined) => {
   const isRequired = key === "audio";
@@ -123,6 +124,9 @@ export const ProjectWorkspace: React.FC<ProjectWorkspaceProps> = ({ onNavigate }
     isMountedRef.current = true;
     return () => {
       isMountedRef.current = false;
+      invoke("clear_browser_bpm_audio_grants").catch((err) =>
+        console.warn("Failed to clear audio grants:", err)
+      );
     };
   }, []);
 
@@ -130,9 +134,29 @@ export const ProjectWorkspace: React.FC<ProjectWorkspaceProps> = ({ onNavigate }
     if (!currentSong || !currentSong.audio_path) return;
     const currentSongId = currentSong.song_id;
     activeWorkspaceSongIdRef.current = currentSongId;
+
+    const support = getBrowserBpmSupport();
+    if (!support.isSupported) {
+      setWorkspaceBpmReport({
+        source: "browser_realtime_bpm_analyzer",
+        libraryName: "realtime-bpm-analyzer",
+        generatedAtIso: new Date().toISOString(),
+        mode: "offline_full_buffer",
+        audioFileName: currentSong.audio_path.split(/[\\/]/).pop(),
+        candidates: [],
+        support,
+        warnings: [support.reasonIfUnsupported ?? "Browser BPM unsupported"],
+      });
+      return;
+    }
+
     setIsWorkspaceBpmAnalyzing(true);
     setWorkspaceBpmError(null);
     try {
+      // Grant active song audio access just-in-time
+      await invoke("grant_active_song_audio_access", { sscPath: currentSong.ssc_path });
+      if (workspaceRequestIdRef.current !== reqId || !isMountedRef.current || activeWorkspaceSongIdRef.current !== currentSongId) return;
+
       const bytes = await invoke<number[]>("read_audio_file", { path: currentSong.audio_path });
       if (workspaceRequestIdRef.current !== reqId || !isMountedRef.current || activeWorkspaceSongIdRef.current !== currentSongId) return;
       const uint8 = new Uint8Array(bytes);
@@ -157,16 +181,18 @@ export const ProjectWorkspace: React.FC<ProjectWorkspaceProps> = ({ onNavigate }
   useEffect(() => {
     setWorkspaceBpmReport(null);
     setWorkspaceBpmError(null);
+    // Lazily do not run workspace BPM analysis automatically on song load.
     if (currentSong && currentSong.audio_path) {
       activeWorkspaceSongIdRef.current = currentSong.song_id;
-      const nextId = ++workspaceRequestIdRef.current;
-      runWorkspaceBpmAnalysis(nextId);
     } else {
       activeWorkspaceSongIdRef.current = null;
     }
     return () => {
       workspaceRequestIdRef.current++;
       activeWorkspaceSongIdRef.current = null;
+      invoke("clear_browser_bpm_audio_grants").catch((err) =>
+        console.warn("Failed to clear audio grants:", err)
+      );
     };
   }, [currentSong?.song_id]);
 
@@ -1301,10 +1327,26 @@ export const ProjectWorkspace: React.FC<ProjectWorkspaceProps> = ({ onNavigate }
                             toleranceBpm: 2.0,
                             minConfidence: 0.2,
                             minCount: 4,
+                            isSupported: workspaceBpmReport.support.isSupported,
                           });
+                          let displayStatus = "";
+                          let statusClass = "";
+                          if (recon.reconciliationStatus === "unsupported") {
+                            displayStatus = "Unsupported";
+                            statusClass = "requires-review";
+                          } else if (recon.reconciliationStatus === "no_browser_evidence") {
+                            displayStatus = "No Browser Evidence";
+                            statusClass = "caption-text-gravel";
+                          } else if (recon.reconciliationStatus === "disagrees") {
+                            displayStatus = "Manual Review Required";
+                            statusClass = "requires-review";
+                          } else {
+                            displayStatus = "Agreed";
+                            statusClass = "";
+                          }
                           return (
-                            <span className={`bpm-diagnostics-value ${recon.requiresManualTimingReview ? "requires-review" : ""}`}>
-                              {recon.requiresManualTimingReview ? "Manual Review Required" : "Agreed"}
+                            <span className={`bpm-diagnostics-value ${statusClass}`}>
+                              {displayStatus}
                             </span>
                           );
                         })()}
@@ -1332,6 +1374,7 @@ export const ProjectWorkspace: React.FC<ProjectWorkspaceProps> = ({ onNavigate }
                         toleranceBpm: 2.0,
                         minConfidence: 0.2,
                         minCount: 4,
+                        isSupported: workspaceBpmReport.support.isSupported,
                       });
                       return (
                         <>
@@ -1359,7 +1402,7 @@ export const ProjectWorkspace: React.FC<ProjectWorkspaceProps> = ({ onNavigate }
                                 <strong>{c.tempo}</strong> BPM
                               </span>
                               <span className="bpm-candidate-meta">
-                                Count: {c.count} | Confidence: {(c.confidence * 100).toFixed(0)}% | Aliases: {c.aliases.join(", ")}
+                                Count: {c.count} | Relative Score: {(c.confidence * 100).toFixed(0)}% | Aliases: {c.aliases.join(", ")}
                               </span>
                             </div>
                           ))}

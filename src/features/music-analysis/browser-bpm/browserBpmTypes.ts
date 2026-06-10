@@ -8,6 +8,7 @@ export interface BrowserTempoCandidate {
   readonly tempo: number;
   readonly count: number;
   readonly confidence: number;
+  readonly rawConfidence: number;
   readonly aliases: readonly number[];
 }
 
@@ -41,4 +42,5 @@ export interface BpmReconciliationReport {
   readonly requiresManualTimingReview: boolean;
   readonly suggestedBpm?: number;
   readonly notes: readonly string[];
+  readonly reconciliationStatus: "agrees" | "disagrees" | "no_browser_evidence" | "unsupported";
 }

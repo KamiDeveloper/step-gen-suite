@@ -37,6 +37,9 @@ export const CreateSongWizard: React.FC<CreateSongWizardProps> = ({ onNavigate }
     isMountedRef.current = true;
     return () => {
       isMountedRef.current = false;
+      invoke("clear_browser_bpm_audio_grants").catch((err) =>
+        console.warn("Failed to clear audio grants:", err)
+      );
     };
   }, []);
 
@@ -179,6 +182,21 @@ export const CreateSongWizard: React.FC<CreateSongWizardProps> = ({ onNavigate }
   const requestIdRef = useRef(0);
 
   const runBpmAnalysis = async (filePath: string, fileName: string, reqId: number) => {
+    const support = getBrowserBpmSupport();
+    if (!support.isSupported) {
+      setBrowserBpmReport({
+        source: "browser_realtime_bpm_analyzer",
+        libraryName: "realtime-bpm-analyzer",
+        generatedAtIso: new Date().toISOString(),
+        mode: "offline_full_buffer",
+        audioFileName: fileName,
+        candidates: [],
+        support,
+        warnings: [support.reasonIfUnsupported ?? "Browser BPM unsupported"],
+      });
+      return;
+    }
+
     setIsBpmAnalyzing(true);
     setBpmAnalysisError(null);
     try {
@@ -204,6 +222,7 @@ export const CreateSongWizard: React.FC<CreateSongWizardProps> = ({ onNavigate }
         toleranceBpm: 2.0,
         minConfidence: 0.2,
         minCount: 4,
+        isSupported: support.isSupported,
       });
 
       if (recon.suggestedBpm && !hasUserEditedBpmRef.current) {
@@ -258,6 +277,7 @@ export const CreateSongWizard: React.FC<CreateSongWizardProps> = ({ onNavigate }
         toleranceBpm: 2.0,
         minConfidence: 0.2,
         minCount: 4,
+        isSupported: browserBpmReport.support.isSupported,
       });
       if (recon.suggestedBpm) {
         setTimingBpm(recon.suggestedBpm.toString());
@@ -397,6 +417,11 @@ export const CreateSongWizard: React.FC<CreateSongWizardProps> = ({ onNavigate }
   const handleSelectAsset = async (kind: "audio" | "banner" | "background" | "video") => {
     setErrorMsg(null);
     try {
+      if (kind === "audio") {
+        await invoke("clear_browser_bpm_audio_grants").catch((err) =>
+          console.warn("Failed to clear audio grants:", err)
+        );
+      }
       const selectedPath = await invoke<string | null>("select_song_asset_file", { kind });
       if (selectedPath) {
         const normalizedPath = selectedPath.replace(/\\/g, "/");
@@ -529,7 +554,7 @@ export const CreateSongWizard: React.FC<CreateSongWizardProps> = ({ onNavigate }
     switch (currentStep) {
       case 1:
         return (
-          <div className="wizard-step-body">
+          <div className="wizard-step-body" key="wizard-step-1">
             <h3 className="wizard-step-title">1. Project Destination</h3>
             <p className="wizard-step-desc">
               Specify the output directory for this new StepF2/StepP1 song pack project.
@@ -663,7 +688,7 @@ export const CreateSongWizard: React.FC<CreateSongWizardProps> = ({ onNavigate }
         const videoUrl = videoFile ? convertFileSrc(videoFile.path) : "";
 
         return (
-          <div className="wizard-step-body">
+          <div className="wizard-step-body" key="wizard-step-2">
             <h3 className="wizard-step-title">2. Song Assets</h3>
             <p className="wizard-step-desc">
               Select media assets to bundle into your song folder. The audio file is mandatory.
@@ -855,7 +880,7 @@ export const CreateSongWizard: React.FC<CreateSongWizardProps> = ({ onNavigate }
         );
       case 3:
         return (
-          <div className="wizard-step-body">
+          <div className="wizard-step-body" key="wizard-step-3">
             <h3 className="wizard-step-title">3. Song Metadata</h3>
             <p className="wizard-step-desc">
               Specify the primary metadata parameters that will be written into the base `.ssc` configuration.
@@ -1002,6 +1027,7 @@ export const CreateSongWizard: React.FC<CreateSongWizardProps> = ({ onNavigate }
                               toleranceBpm: 2.0,
                               minConfidence: 0.2,
                               minCount: 4,
+                              isSupported: browserBpmReport.support.isSupported,
                             });
                             return recon.suggestedBpm ?? "No result (low confidence/count)";
                           })()}
@@ -1009,7 +1035,7 @@ export const CreateSongWizard: React.FC<CreateSongWizardProps> = ({ onNavigate }
                       </div>
                       {browserBpmReport.stableTempo && (
                         <div className="bpm-stat-box">
-                          <span className="bpm-stat-title">Confidence</span>
+                          <span className="bpm-stat-title">Relative Score</span>
                           <span className="bpm-stat-value">
                             {(browserBpmReport.stableTempo.confidence * 100).toFixed(0)}%
                           </span>
@@ -1038,7 +1064,7 @@ export const CreateSongWizard: React.FC<CreateSongWizardProps> = ({ onNavigate }
                                 <strong>{c.tempo}</strong> BPM
                               </span>
                               <span className="bpm-candidate-meta">
-                                Count: {c.count} | Confidence: {(c.confidence * 100).toFixed(0)}% | Aliases: {c.aliases.join(", ")}
+                                Count: {c.count} | Relative Score: {(c.confidence * 100).toFixed(0)}% | Aliases: {c.aliases.join(", ")}
                               </span>
                             </div>
                           ))}
@@ -1054,6 +1080,7 @@ export const CreateSongWizard: React.FC<CreateSongWizardProps> = ({ onNavigate }
                           toleranceBpm: 2.0,
                           minConfidence: 0.2,
                           minCount: 4,
+                          isSupported: browserBpmReport.support.isSupported,
                         });
                         const hasSuggested = recon.suggestedBpm != null;
                         return (
@@ -1108,7 +1135,7 @@ export const CreateSongWizard: React.FC<CreateSongWizardProps> = ({ onNavigate }
         );
       case 4:
         return (
-          <div className="wizard-step-body">
+          <div className="wizard-step-body" key="wizard-step-4">
             <h3 className="wizard-step-title">4. Review & Create</h3>
             <p className="wizard-step-desc">
               Please review your project settings and asset list before generating the StepF2 folder structure.
