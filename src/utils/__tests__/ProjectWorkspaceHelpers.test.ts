@@ -7,7 +7,10 @@ import {
   groupValidationIssues,
   getPatternFamilyLabel,
   getMotifStrategyLabel,
-  getTransitionTypeLabel
+  getTransitionTypeLabel,
+  getIntensityBandLabel,
+  isSectionPlanStale,
+  sanitizeSectionOverrideNote
 } from "../ProjectWorkspaceHelpers.ts";
 import type {
   PreviewParams,
@@ -199,4 +202,72 @@ test("getTransitionTypeLabel mappings", () => {
   assert.strictEqual(getTransitionTypeLabel("climax_entry"), "Climax Entry");
   assert.strictEqual(getTransitionTypeLabel("unknown_transition"), "Unknown Transition");
 });
+
+test("getIntensityBandLabel mappings", () => {
+  assert.strictEqual(getIntensityBandLabel("auto"), "Auto");
+  assert.strictEqual(getIntensityBandLabel("very_low"), "Very Low");
+  assert.strictEqual(getIntensityBandLabel("medium"), "Medium");
+  assert.strictEqual(getIntensityBandLabel("high"), "High");
+  assert.strictEqual(getIntensityBandLabel("unknown"), "Unknown");
+});
+
+test("isSectionPlanStale change detection", () => {
+  const baseOverrides = [
+    {
+      section_id: "sec1",
+      enabled: true,
+      primary_pattern_family: "stamina",
+      secondary_pattern_families: ["stream"],
+      avoid_pattern_families: ["bracket_technical"],
+      motif_strategy: "develop",
+      intensity_band: "medium",
+      transition_in_type: "smooth_continue",
+      transition_out_type: "smooth_continue",
+      notes: "some notes"
+    }
+  ];
+
+  // Identical overrides should not be stale
+  assert.strictEqual(isSectionPlanStale(baseOverrides, [{ ...baseOverrides[0] }]), false);
+
+  // Null snapshot overrides should not be stale
+  assert.strictEqual(isSectionPlanStale(null, baseOverrides), false);
+
+  // Different length should be stale
+  assert.strictEqual(isSectionPlanStale(baseOverrides, []), true);
+
+  // Changed field should be stale
+  assert.strictEqual(isSectionPlanStale(baseOverrides, [{ ...baseOverrides[0], enabled: false }]), true);
+  assert.strictEqual(isSectionPlanStale(baseOverrides, [{ ...baseOverrides[0], primary_pattern_family: "balanced" }]), true);
+  assert.strictEqual(isSectionPlanStale(baseOverrides, [{ ...baseOverrides[0], notes: "different note" }]), true);
+
+  // Changed secondary/avoid arrays should be stale
+  assert.strictEqual(isSectionPlanStale(baseOverrides, [{ ...baseOverrides[0], secondary_pattern_families: [] }]), true);
+  assert.strictEqual(isSectionPlanStale(baseOverrides, [{ ...baseOverrides[0], avoid_pattern_families: ["stamina"] }]), true);
+});
+
+test("sanitizeSectionOverrideNote security boundaries", () => {
+  // Safe notes
+  const res1 = sanitizeSectionOverrideNote("Please make this section slightly faster and technical");
+  assert.strictEqual(res1.isValid, true);
+  assert.strictEqual(res1.error, null);
+
+  // Exceeds max length
+  const longNote = "a".repeat(241);
+  const res2 = sanitizeSectionOverrideNote(longNote);
+  assert.strictEqual(res2.isValid, false);
+  assert.ok(res2.error?.includes("exceed maximum length"));
+
+  // Forbidden patterns
+  assert.strictEqual(sanitizeSectionOverrideNote("This has #NOTEDATA inside").isValid, false);
+  assert.strictEqual(sanitizeSectionOverrideNote("using c:\\path\\to\\ssc").isValid, false);
+  assert.strictEqual(sanitizeSectionOverrideNote("contains d:/path/to/file").isValid, false);
+  assert.strictEqual(sanitizeSectionOverrideNote("contains /Users/secret/file").isValid, false);
+  assert.strictEqual(sanitizeSectionOverrideNote("using /home/user/song").isValid, false);
+  assert.strictEqual(sanitizeSectionOverrideNote("dumping to /tmp/file").isValid, false);
+  assert.strictEqual(sanitizeSectionOverrideNote("contains .ssc file").isValid, false);
+  assert.strictEqual(sanitizeSectionOverrideNote("contains .mp3 extension").isValid, false);
+  assert.strictEqual(sanitizeSectionOverrideNote("contains docs/official_songs inside").isValid, false);
+});
+
 

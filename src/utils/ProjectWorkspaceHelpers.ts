@@ -1,3 +1,5 @@
+import type { ISectionPlanOverride } from "../types/song.ts";
+
 export interface PreviewParams {
   targetLevel: number;
   sectionId: string;
@@ -191,5 +193,136 @@ export function getTransitionTypeLabel(type: string): string {
         .map((word) => word.charAt(0).toUpperCase() + word.slice(1).toLowerCase())
         .join(" ");
   }
+}
+
+/**
+ * Returns a human-friendly label for a given intensity band.
+ */
+export function getIntensityBandLabel(band: string): string {
+  const normalized = band.toLowerCase().trim();
+  switch (normalized) {
+    case "auto":
+      return "Auto";
+    case "very_low":
+      return "Very Low";
+    case "low":
+      return "Low";
+    case "medium":
+      return "Medium";
+    case "high":
+      return "High";
+    case "very_high":
+      return "Very High";
+    default:
+      return band.charAt(0).toUpperCase() + band.slice(1).toLowerCase();
+  }
+}
+
+/**
+ * Checks if current overrides differ from generated/snapshot overrides.
+ */
+export function isSectionPlanStale(
+  snapshotOverrides: ISectionPlanOverride[] | null,
+  currentOverrides: ISectionPlanOverride[]
+): boolean {
+  if (!snapshotOverrides) return false;
+  if (snapshotOverrides.length !== currentOverrides.length) return true;
+
+  const sortedSnapshot = [...snapshotOverrides].sort((a, b) => a.section_id.localeCompare(b.section_id));
+  const sortedCurrent = [...currentOverrides].sort((a, b) => a.section_id.localeCompare(b.section_id));
+
+  for (let i = 0; i < sortedSnapshot.length; i++) {
+    const s = sortedSnapshot[i];
+    const c = sortedCurrent[i];
+    if (s.section_id !== c.section_id) return true;
+    if (s.enabled !== c.enabled) return true;
+    if (s.primary_pattern_family !== c.primary_pattern_family) return true;
+    if (s.motif_strategy !== c.motif_strategy) return true;
+    if (s.intensity_band !== c.intensity_band) return true;
+    if (s.transition_in_type !== c.transition_in_type) return true;
+    if (s.transition_out_type !== c.transition_out_type) return true;
+    if (s.notes !== c.notes) return true;
+
+    const sSec = s.secondary_pattern_families || [];
+    const cSec = c.secondary_pattern_families || [];
+    if (sSec.length !== cSec.length || sSec.some((val, idx) => val !== cSec[idx])) return true;
+
+    const sAvoid = s.avoid_pattern_families || [];
+    const cAvoid = c.avoid_pattern_families || [];
+    if (sAvoid.length !== cAvoid.length || sAvoid.some((val, idx) => val !== cAvoid[idx])) return true;
+  }
+  return false;
+}
+
+/**
+ * Sanitizes and validates section override notes to prevent privacy violations.
+ */
+export function sanitizeSectionOverrideNote(note: string): { isValid: boolean; error: string | null } {
+  if (note.length > 240) {
+    return { isValid: false, error: "Notes exceed maximum length of 240 characters." };
+  }
+  const lower = note.toLowerCase();
+  const forbidden = [
+    "#notedata",
+    "#title:",
+    "#bpms:",
+    "#offset:",
+    "base64",
+    "data:audio",
+    ".ssc",
+    ".mp3",
+    ".ogg",
+    ".flac",
+    ".wav",
+    ".mp4",
+    ".mpg",
+    ".png",
+    ".jpg",
+    ".jpeg",
+    ".ai-step-gen-private-datasets",
+    "docs/official_songs",
+  ];
+
+  for (const item of forbidden) {
+    if (lower.includes(item)) {
+      return {
+        isValid: false,
+        error: `Override notes contain forbidden keyword/pattern '${item}'`
+      };
+    }
+  }
+
+  // Windows drive letters check with both slash and backslash
+  for (let i = 97; i <= 122; i++) { // a-z
+    const drive = String.fromCharCode(i);
+    const prefixBackslash = drive + ":\\";
+    const prefixSlash = drive + ":/";
+    if (lower.includes(prefixBackslash) || lower.includes(prefixSlash)) {
+      return {
+        isValid: false,
+        error: `Override notes contain Windows path prefix (drive letter)`
+      };
+    }
+  }
+
+  // Common system paths check
+  const forbiddenFolders = [
+    "/users/",
+    "/home/",
+    "/var/",
+    "/tmp/",
+    "/etc/",
+    "/opt/",
+  ];
+  for (const folder of forbiddenFolders) {
+    if (lower.includes(folder)) {
+      return {
+        isValid: false,
+        error: `Override notes contain system path prefix '${folder}'`
+      };
+    }
+  }
+
+  return { isValid: true, error: null };
 }
 

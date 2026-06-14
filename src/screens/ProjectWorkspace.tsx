@@ -13,7 +13,13 @@ import {
   Sparkles,
   FileJson
 } from "lucide-react";
-import { IAppendChartResult, IFileFingerprint, IAssetStatus } from "../types/song";
+import {
+  IAppendChartResult,
+  IFileFingerprint,
+  IAssetStatus,
+  ISectionPlanOverride,
+  ISongContinuityPlan
+} from "../types/song";
 import { SongAnalysisReport, AnalysisCommandResult } from "../types/musicAnalysis";
 import { analyzeBrowserBpmFromArrayBuffer } from "../features/music-analysis/browser-bpm/analyzeBrowserBpmFromBuffer";
 import { BrowserBpmAnalysisReport } from "../features/music-analysis/browser-bpm/browserBpmTypes";
@@ -26,7 +32,10 @@ import {
   groupValidationIssues,
   getPatternFamilyLabel,
   getMotifStrategyLabel,
-  getTransitionTypeLabel
+  getTransitionTypeLabel,
+  getIntensityBandLabel,
+  isSectionPlanStale,
+  sanitizeSectionOverrideNote
 } from "../utils/ProjectWorkspaceHelpers";
 import type { PreviewParams } from "../utils/ProjectWorkspaceHelpers";
 
@@ -105,6 +114,12 @@ export const ProjectWorkspace: React.FC<ProjectWorkspaceProps> = ({ onNavigate }
   const [useContinuityPlanning, setUseContinuityPlanning] = useState(true);
   const [patternFocus, setPatternFocus] = useState<string>("auto");
   const [previewParamsSnapshot, setPreviewParamsSnapshot] = useState<PreviewParams | null>(null);
+
+  // Overrides and continuity plan review state
+  const [sectionPlan, setSectionPlan] = useState<ISongContinuityPlan | null>(null);
+  const [overrides, setOverrides] = useState<ISectionPlanOverride[]>([]);
+  const [selectedSectionForOverride, setSelectedSectionForOverride] = useState<string | null>(null);
+  const [sectionPlanSnapshotOverrides, setSectionPlanSnapshotOverrides] = useState<ISectionPlanOverride[] | null>(null);
 
   // Preview result states
   const [previewResult, setPreviewResult] = useState<IAppendChartResult | null>(null);
@@ -247,6 +262,10 @@ export const ProjectWorkspace: React.FC<ProjectWorkspaceProps> = ({ onNavigate }
     setAnalysisError(null);
     setError(null);
     setUseContinuityPlanning(false);
+    setSectionPlan(null);
+    setOverrides([]);
+    setSelectedSectionForOverride(null);
+    setSectionPlanSnapshotOverrides(null);
 
     if (requestedPath) {
       let cancelled = false;
@@ -301,7 +320,10 @@ export const ProjectWorkspace: React.FC<ProjectWorkspaceProps> = ({ onNavigate }
         patternFamilyTarget: patternFocus,
         useContinuityPlanning
       };
-      if (isPreviewStale(previewParamsSnapshot, currentParams)) {
+      const paramsStale = isPreviewStale(previewParamsSnapshot, currentParams);
+      const overridesStale = sectionPlanSnapshotOverrides ? isSectionPlanStale(sectionPlanSnapshotOverrides, overrides) : false;
+
+      if (paramsStale || overridesStale) {
         handleDiscardPreview();
       }
     }
@@ -317,7 +339,9 @@ export const ProjectWorkspace: React.FC<ProjectWorkspaceProps> = ({ onNavigate }
     useCalibratedPromptContext,
     patternFocus,
     useContinuityPlanning,
-    previewParamsSnapshot
+    previewParamsSnapshot,
+    overrides,
+    sectionPlanSnapshotOverrides
   ]);
 
   if (!currentSong) {
@@ -335,8 +359,92 @@ export const ProjectWorkspace: React.FC<ProjectWorkspaceProps> = ({ onNavigate }
     );
   }
 
+  const rebuildSectionPlan = async (currentOvs: ISectionPlanOverride[]) => {
+    if (!currentSong) return;
+    try {
+      let browserBpmReconciliationStr = "";
+      if (useBrowserBpm && workspaceBpmReport) {
+        const recon = reconcileBpmCandidates({
+          sscBpms: currentSong.ssc_bpms && currentSong.ssc_bpms.length > 0
+            ? currentSong.ssc_bpms
+            : (currentSong.bpm ? [currentSong.bpm] : []),
+          sidecarDetectedBpm: analysisReport?.diagnostics?.audio_bpm_detected || undefined,
+          browserCandidates: workspaceBpmReport.candidates,
+          toleranceBpm: 2.0,
+          minConfidence: 0.2,
+          minCount: 4,
+          isSupported: workspaceBpmReport.support.isSupported,
+        });
+        const notesStr = recon.notes && recon.notes.length > 0 ? recon.notes.join(" | ") : "None";
+        browserBpmReconciliationStr = `Status: ${recon.reconciliationStatus}, Canonical BPM: ${recon.canonicalBpm ?? "None"}, Browser BPM: ${workspaceBpmReport.stableTempo?.tempo ?? "None"}, Candidates: [${workspaceBpmReport.candidates.map(c => `${c.tempo} (${(c.confidence * 100).toFixed(0)}%)`).join(", ")}], Notes: ${notesStr}`;
+      }
+
+      const plan = await invoke<ISongContinuityPlan>("build_single_continuity_plan_preview", {
+        sscPath: currentSong.ssc_path,
+        playMode: "Single",
+        targetLevel,
+        sectionId: sectionId.trim() || "chorus_1",
+        startMeasure: selectedSectionKey === "custom" ? startMeasure : undefined,
+        endMeasure: selectedSectionKey === "custom" ? endMeasure : undefined,
+        browserBpmReconciliation: useBrowserBpm ? browserBpmReconciliationStr : undefined,
+        overrides: currentOvs.length > 0 ? currentOvs : undefined,
+      });
+      setSectionPlan(plan);
+    } catch (err) {
+      console.error("Failed to build section plan preview:", err);
+    }
+  };
+
+  const handleApplyOverride = (secId: string, updatedFields: Partial<ISectionPlanOverride>) => {
+    let exists = false;
+    const nextOverrides = overrides.map((o) => {
+      if (o.section_id === secId) {
+        exists = true;
+        return { ...o, ...updatedFields };
+      }
+      return o;
+    });
+
+    if (!exists) {
+      nextOverrides.push({
+        section_id: secId,
+        ...updatedFields
+      });
+    }
+
+    setOverrides(nextOverrides);
+    rebuildSectionPlan(nextOverrides);
+  };
+
+  const handleResetOverrides = () => {
+    setOverrides([]);
+    rebuildSectionPlan([]);
+  };
+
+  // Re-build plan preview on load, analysis change, level or range edits
+  useEffect(() => {
+    if (currentSong) {
+      rebuildSectionPlan(overrides);
+    }
+  }, [
+    currentSong?.song_id,
+    analysisReport,
+    useBrowserBpm,
+    workspaceBpmReport,
+    targetLevel,
+    sectionId,
+    startMeasure,
+    endMeasure,
+    selectedSectionKey
+  ]);
+
   // Difficulty limit logic - Single levels 1-26 are allowed for Generation
   const isGeminiBlocked = targetLevel < 1 || targetLevel > 26;
+
+  // Check if selected section is disabled by plan review overrides
+  const isSelectedSectionDisabled = overrides.some(
+    (o) => o.section_id === selectedSectionKey && o.enabled === false
+  );
 
   // Measure range validation for the active settings
   const matchedSection = analysisReport?.sections.find(s => s.section_id === selectedSectionKey);
@@ -347,6 +455,10 @@ export const ProjectWorkspace: React.FC<ProjectWorkspaceProps> = ({ onNavigate }
 
   const handleGeneratePreview = async () => {
     if (!currentSong) return;
+    if (isSelectedSectionDisabled) {
+      setError("This section is disabled in Section Plan Review. Re-enable it before generating.");
+      return;
+    }
     if (!passphrase.trim()) {
       setError("Please enter your unlock passphrase to decrypt the API Key.");
       return;
@@ -422,10 +534,12 @@ export const ProjectWorkspace: React.FC<ProjectWorkspaceProps> = ({ onNavigate }
         useCalibratedPromptContext,
         patternFamilyTarget: patternFocus,
         useContinuityPlanning,
+        overrides: overrides.length > 0 ? overrides : undefined,
       });
 
       if (!isActivePreview()) return;
       setPreviewResult(result);
+      setSectionPlanSnapshotOverrides(overrides);
       setPreviewParamsSnapshot({
         targetLevel,
         sectionId: sectionId.trim() || "chorus_1",
@@ -922,16 +1036,277 @@ export const ProjectWorkspace: React.FC<ProjectWorkspaceProps> = ({ onNavigate }
         )}
 
         {/* Tab: Generate Chart */}
-        {activeTab === "generate" && (
-          <div className="workspace-tab">
-            <h3 className="section-title-waldenburg">Generate Stepchart Section</h3>
-            <p className="section-subtitle-gravel">
-              Generate choreography patterns using Gemini 3.5 Flash. Real Gemini requests run in memory and never modify disk files without explicit confirmation.
-            </p>
+        {activeTab === "generate" && (() => {
+          const getSectionPlanState = () => {
+            if (!analysisReport) return { label: "No Music Analysis", class: "degraded" };
+            if (!sectionPlan) return { label: "Not Built", class: "stale" };
+            
+            const isDegraded = sectionPlan.warnings.some(w => w.toLowerCase().includes("degraded"));
+            if (isDegraded) return { label: "Degraded", class: "degraded" };
+            
+            const isStale = sectionPlanSnapshotOverrides ? isSectionPlanStale(sectionPlanSnapshotOverrides, overrides) : false;
+            if (isStale) return { label: "Stale (Preview Mismatch)", class: "stale" };
+            
+            return { label: "Ready", class: "ready" };
+          };
 
-            {/* Inputs Panel */}
-            <div className="generate-form-card">
-              <h4 className="card-subtitle-obsidian">Gemini Real Preview Configuration</h4>
+          const planState = getSectionPlanState();
+
+          return (
+            <div className="workspace-tab">
+              <h3 className="section-title-waldenburg">Generate Stepchart Section</h3>
+              <p className="section-subtitle-gravel">
+                Generate choreography patterns using Gemini 3.5 Flash. Real Gemini requests run in memory and never modify disk files without explicit confirmation.
+              </p>
+
+              {/* Section Plan Review & Overrides Panel */}
+              <div className="section-plan-card">
+                <div className="section-plan-header">
+                  <div className="section-plan-status-row">
+                    <h4 className="card-subtitle-obsidian">Section Plan Review</h4>
+                    <span className={`section-plan-badge ${planState.class}`}>
+                      {planState.label}
+                    </span>
+                  </div>
+                  <div className="import-action-buttons">
+                    <button 
+                      className="btn-ghost-pill btn-sm-contained"
+                      onClick={() => rebuildSectionPlan(overrides)}
+                      disabled={isLoading}
+                    >
+                      Refresh Section Plan
+                    </button>
+                    {overrides.length > 0 && (
+                      <button 
+                        className="btn-ghost-pill btn-sm-contained btn-danger-text"
+                        onClick={handleResetOverrides}
+                        disabled={isLoading}
+                      >
+                        Reset Overrides
+                      </button>
+                    )}
+                  </div>
+                </div>
+
+                {sectionPlan?.warnings && sectionPlan.warnings.length > 0 && (
+                  <div className="warning-box section-plan-warning">
+                    <AlertTriangle size={14} className="icon-mr text-warning-icon" />
+                    <span>{sectionPlan.warnings.join(" | ")}</span>
+                  </div>
+                )}
+
+                {sectionPlan ? (
+                  <div className="section-plan-layout">
+                    {/* Left: compact sections table */}
+                    <div className="section-plan-table-wrapper">
+                      <table className="workspace-table">
+                        <thead>
+                          <tr>
+                            <th className="section-plan-col-act">Act</th>
+                            <th>Section ID</th>
+                            <th>Measures</th>
+                            <th>Role</th>
+                            <th>Intensity</th>
+                            <th>Pattern Family</th>
+                            <th>Motif</th>
+                            <th className="section-plan-col-warn">Warn</th>
+                          </tr>
+                        </thead>
+                        <tbody>
+                          {sectionPlan.sections.map((sec) => {
+                            const isSelected = selectedSectionKey === sec.section_id;
+                            const secOverride = overrides.find(o => o.section_id === sec.section_id);
+                            const isEnabled = secOverride?.enabled !== false;
+                            const warningsCount = sec.warnings.length;
+
+                            return (
+                              <tr 
+                                key={sec.section_id}
+                                className={`section-plan-row ${isSelected ? "selected" : ""} ${!isEnabled ? "disabled" : ""}`}
+                                onClick={() => {
+                                  setSelectedSectionForOverride(sec.section_id);
+                                  setSelectedSectionKey(sec.section_id);
+                                  setSectionId(sec.section_id);
+                                  setStartMeasure(sec.start_measure);
+                                  setEndMeasure(sec.end_measure);
+                                  if (analysisReport?.timing_grid.song_type) {
+                                    setSongType(analysisReport.timing_grid.song_type as any);
+                                  }
+                                }}
+                              >
+                                <td className="section-plan-cell-center" onClick={(e) => e.stopPropagation()}>
+                                  <input
+                                    type="checkbox"
+                                    checked={isEnabled}
+                                    onChange={(e) => handleApplyOverride(sec.section_id, { enabled: e.target.checked })}
+                                  />
+                                </td>
+                                <td><strong>{sec.section_id}</strong></td>
+                                <td>M.{sec.start_measure} – M.{sec.end_measure}</td>
+                                <td>{sec.music_role} / {sec.piu_role}</td>
+                                <td>
+                                  {secOverride?.intensity_band 
+                                    ? <span>{getIntensityBandLabel(secOverride.intensity_band)} (Overridden)</span>
+                                    : getIntensityBandLabel(sec.intensity_band)
+                                  }
+                                </td>
+                                <td>
+                                  {secOverride?.primary_pattern_family
+                                    ? <span>{getPatternFamilyLabel(secOverride.primary_pattern_family)} (Overridden)</span>
+                                    : getPatternFamilyLabel(sec.primary_pattern_family)
+                                  }
+                                </td>
+                                <td>
+                                  {secOverride?.motif_strategy
+                                    ? <span>{getMotifStrategyLabel(secOverride.motif_strategy)} (Overridden)</span>
+                                    : getMotifStrategyLabel(sec.motif_strategy)
+                                  }
+                                </td>
+                                <td className="section-plan-cell-center">
+                                  {warningsCount > 0 ? (
+                                    <span className="level-badge section-plan-warning-badge">
+                                      {warningsCount}
+                                    </span>
+                                  ) : "—"}
+                                </td>
+                              </tr>
+                            );
+                          })}
+                        </tbody>
+                      </table>
+                    </div>
+
+                    {/* Right: Selected Section Overrides Editor */}
+                    <div className="section-plan-details-wrapper">
+                      {(() => {
+                        const activeSecId = selectedSectionForOverride || selectedSectionKey;
+                        const activeSec = sectionPlan.sections.find(s => s.section_id === activeSecId);
+                        if (!activeSec) {
+                          return <div className="caption-text-gravel">Select a section to edit overrides.</div>;
+                        }
+
+                        const activeOvr = overrides.find(o => o.section_id === activeSec.section_id) || {
+                          section_id: activeSec.section_id,
+                          enabled: true,
+                          primary_pattern_family: null,
+                          motif_strategy: null,
+                          intensity_band: null,
+                          notes: null
+                        };
+
+                        const noteValidation = activeOvr.notes ? sanitizeSectionOverrideNote(activeOvr.notes) : { isValid: true, error: null };
+
+                        return (
+                          <>
+                            <div className="override-detail-title">
+                              Overrides: {activeSec.section_id}
+                            </div>
+                            
+                            <div className="override-controls-grid">
+                              <label className="override-row-checkbox">
+                                <input
+                                  type="checkbox"
+                                  checked={activeOvr.enabled !== false}
+                                  onChange={(e) => handleApplyOverride(activeSec.section_id, { enabled: e.target.checked })}
+                                />
+                                <span>Section Enabled for Generation</span>
+                              </label>
+
+                              <div className="form-group-contained override-form-group">
+                                <label className="form-label-dark override-form-label">Primary Pattern Family</label>
+                                <select
+                                  className="input-contained override-input-select"
+                                  value={activeOvr.primary_pattern_family || "auto"}
+                                  onChange={(e) => handleApplyOverride(activeSec.section_id, { primary_pattern_family: e.target.value === "auto" ? null : e.target.value })}
+                                >
+                                  <option value="auto">Auto (Default: {getPatternFamilyLabel(activeSec.primary_pattern_family)})</option>
+                                  <option value="Balanced">Balanced</option>
+                                  <option value="Stream">Stream</option>
+                                  <option value="Jump Accent">Jump Accent</option>
+                                  <option value="Twist Technical">Twist Technical</option>
+                                  <option value="Bracket Technical">Bracket Technical</option>
+                                  <option value="Hold Control">Hold Control</option>
+                                  <option value="Center Control">Center Control</option>
+                                  <option value="Stamina">Stamina</option>
+                                </select>
+                              </div>
+
+                              <div className="form-group-contained override-form-group">
+                                <label className="form-label-dark override-form-label">Motif Strategy</label>
+                                <select
+                                  className="input-contained override-input-select"
+                                  value={activeOvr.motif_strategy || "auto"}
+                                  onChange={(e) => handleApplyOverride(activeSec.section_id, { motif_strategy: e.target.value === "auto" ? null : e.target.value })}
+                                >
+                                  <option value="auto">Auto (Default: {getMotifStrategyLabel(activeSec.motif_strategy)})</option>
+                                  <option value="Introduce">Introduce</option>
+                                  <option value="Develop">Develop</option>
+                                  <option value="Intensify">Intensify</option>
+                                  <option value="Contrast">Contrast</option>
+                                  <option value="Rest">Rest</option>
+                                  <option value="Callback">Callback</option>
+                                  <option value="Resolve">Resolve</option>
+                                  <option value="Final Burst">Final Burst</option>
+                                </select>
+                              </div>
+
+                              <div className="form-group-contained override-form-group">
+                                <label className="form-label-dark override-form-label">Intensity Band</label>
+                                <select
+                                  className="input-contained override-input-select"
+                                  value={activeOvr.intensity_band || "auto"}
+                                  onChange={(e) => handleApplyOverride(activeSec.section_id, { intensity_band: e.target.value === "auto" ? null : e.target.value })}
+                                >
+                                  <option value="auto">Auto (Default: {getIntensityBandLabel(activeSec.intensity_band)})</option>
+                                  <option value="Very Low">Very Low</option>
+                                  <option value="Low">Low</option>
+                                  <option value="Medium">Medium</option>
+                                  <option value="High">High</option>
+                                  <option value="Very High">Very High</option>
+                                </select>
+                              </div>
+
+                              <div className="form-group-contained">
+                                <label className="form-label-dark override-form-label">Custom Notes / Prompts</label>
+                                <textarea
+                                  className="input-contained override-input-textarea"
+                                  maxLength={240}
+                                  placeholder="Add custom constraints (e.g. Speed drills)"
+                                  value={activeOvr.notes || ""}
+                                  onChange={(e) => handleApplyOverride(activeSec.section_id, { notes: e.target.value || null })}
+                                />
+                                {!noteValidation.isValid && (
+                                  <div className="override-note-error">
+                                    ⚠ {noteValidation.error}
+                                  </div>
+                                )}
+                              </div>
+                            </div>
+                          </>
+                        );
+                      })()}
+                    </div>
+                  </div>
+                ) : (
+                  <div className="placeholder-state-card placeholder-state-card-compact">
+                    <span className="placeholder-text-main">No plan loaded</span>
+                    <p className="placeholder-text-sub">
+                      Build or load the plan preview to view/adjust sections.
+                    </p>
+                    <button 
+                      className="btn-primary-pill btn-sm-contained"
+                      onClick={() => rebuildSectionPlan(overrides)}
+                      disabled={isLoading}
+                    >
+                      Build Section Plan
+                    </button>
+                  </div>
+                )}
+              </div>
+
+              {/* Inputs Panel */}
+              <div className="generate-form-card">
+                <h4 className="card-subtitle-obsidian">Gemini Real Preview Configuration</h4>
               <p className="caption-text-gravel">
                 Select target mode and difficulty parameters for real AI generation.
               </p>
@@ -1209,11 +1584,18 @@ export const ProjectWorkspace: React.FC<ProjectWorkspaceProps> = ({ onNavigate }
                 </div>
               )}
 
+              {isSelectedSectionDisabled && (
+                <div className="warning-box section-plan-warning">
+                  <AlertTriangle size={16} className="icon-mr text-warning-icon" />
+                  <span>This section is disabled in Section Plan Review. Re-enable it before generating.</span>
+                </div>
+              )}
+
               <div className="action-row-with-sub">
                 <button
                   className="btn-primary-pill"
                   onClick={handleGeneratePreview}
-                  disabled={isLoading || isGeminiBlocked || !rangeValidation.isValid || !currentSong.audio_path || !passphrase}
+                  disabled={isLoading || isGeminiBlocked || !rangeValidation.isValid || !currentSong.audio_path || !passphrase || isSelectedSectionDisabled}
                 >
                   {isLoading ? "Generating..." : "Generate Single Section Preview with Gemini (uses API, does not write)"}
                 </button>
@@ -1717,7 +2099,8 @@ export const ProjectWorkspace: React.FC<ProjectWorkspaceProps> = ({ onNavigate }
               </div>
             </details>
           </div>
-        )}
+          );
+        })()}
 
         {/* Tab: Music Analysis */}
         {activeTab === "analysis" && (

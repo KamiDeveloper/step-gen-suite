@@ -23,6 +23,7 @@ pub fn run() {
             commands::append_mock_gemini_payload,
             commands::append_approved_gemini_payload,
             commands::generate_gemini_chart_preview,
+            commands::build_single_continuity_plan_preview,
             commands::get_file_fingerprint,
             commands::validate_folder_name,
             commands::check_destination_folder,

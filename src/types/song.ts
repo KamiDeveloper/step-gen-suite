@@ -138,6 +138,21 @@ export interface ISectionContinuityNode {
   confidence: string;
   evidence: string[];
   warnings: string[];
+  enabled: boolean;
+  notes?: string | null;
+}
+
+export interface ISectionPlanOverride {
+  section_id: string;
+  enabled?: boolean | null;
+  primary_pattern_family?: string | null;
+  secondary_pattern_families?: string[] | null;
+  avoid_pattern_families?: string[] | null;
+  motif_strategy?: string | null;
+  intensity_band?: string | null;
+  transition_in_type?: string | null;
+  transition_out_type?: string | null;
+  notes?: string | null;
 }
 
 export interface IGlobalArcSummary {
@@ -188,6 +203,7 @@ export interface IContinuityContextSummary {
   current_intensity_band: string;
   current_density_intent: string;
   current_confidence: string;
+  current_notes?: string | null;
 }
 
 export interface IAppendChartResult {

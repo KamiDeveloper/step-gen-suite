@@ -1593,7 +1593,7 @@ pub async fn generate_gemini_chart_preview_core_internal(
     play_mode: PlayMode,
     target_level: u32,
     section_id: &str,
-    _author: &str,
+    author: &str,
     client: &GeminiClient,
     start_measure: Option<u32>,
     end_measure: Option<u32>,
@@ -1606,6 +1606,64 @@ pub async fn generate_gemini_chart_preview_core_internal(
     override_calibration: Option<&crate::guardrail_calibration::SingleGuardrailCalibration>,
     use_continuity_planning: Option<bool>,
 ) -> Result<AppendChartResult, String> {
+    generate_gemini_chart_preview_core_internal_with_overrides(
+        api_key,
+        ssc_path,
+        audio_path,
+        play_mode,
+        target_level,
+        section_id,
+        author,
+        client,
+        start_measure,
+        end_measure,
+        song_type,
+        use_music_analysis,
+        use_browser_bpm,
+        browser_bpm_reconciliation,
+        use_calibrated_prompt_context,
+        pattern_family_target,
+        override_calibration,
+        use_continuity_planning,
+        None,
+    )
+    .await
+}
+
+pub async fn generate_gemini_chart_preview_core_internal_with_overrides(
+    api_key: &str,
+    ssc_path: &str,
+    audio_path: &str,
+    play_mode: PlayMode,
+    target_level: u32,
+    section_id: &str,
+    _author: &str,
+    client: &GeminiClient,
+    start_measure: Option<u32>,
+    end_measure: Option<u32>,
+    song_type: Option<String>,
+    use_music_analysis: Option<bool>,
+    use_browser_bpm: Option<bool>,
+    browser_bpm_reconciliation: Option<String>,
+    use_calibrated_prompt_context: Option<bool>,
+    pattern_family_target: Option<String>,
+    override_calibration: Option<&crate::guardrail_calibration::SingleGuardrailCalibration>,
+    use_continuity_planning: Option<bool>,
+    overrides: Option<Vec<crate::section_continuity::SectionPlanOverride>>,
+) -> Result<AppendChartResult, String> {
+    // Validate overrides and check if the requested section is disabled
+    if let Some(ref ovs) = overrides {
+        for ov in ovs {
+            crate::section_continuity::validate_section_plan_override(ov)?;
+            if ov.section_id == section_id && ov.enabled == Some(false) {
+                return Err(format!(
+                    "Section '{}' is disabled in Section Plan Review. Re-enable it before generating preview.",
+                    section_id
+                ));
+            }
+        }
+    }
+
     // 1. Check environment variable gate
     if !crate::settings::is_gemini_enabled() {
         return Err("La integración real con Gemini está deshabilitada en esta sesión. Configure la variable de entorno AI_STEP_GEN_ENABLE_REAL_GEMINI=1 para habilitarla.".to_string());
@@ -1934,7 +1992,7 @@ pub async fn generate_gemini_chart_preview_core_internal(
     };
 
     let use_continuity = use_continuity_planning.unwrap_or(true);
-    let continuity_plan = if use_continuity {
+    let mut continuity_plan = if use_continuity {
         Some(crate::section_continuity::build_song_continuity_plan(
             target_level,
             play_mode,
@@ -1948,6 +2006,12 @@ pub async fn generate_gemini_chart_preview_core_internal(
     } else {
         None
     };
+
+    if let Some(ref mut plan) = continuity_plan {
+        if let Some(ref ovs) = overrides {
+            *plan = crate::section_continuity::apply_section_plan_overrides(plan.clone(), ovs)?;
+        }
+    }
 
     let continuity_context = if let Some(ref plan) = continuity_plan {
         if let Some(node) = plan.sections.iter().find(|n| n.section_id == section_id) {
@@ -1986,7 +2050,7 @@ pub async fn generate_gemini_chart_preview_core_internal(
             warnings.extend(node.warnings.clone());
 
             Some(crate::section_continuity::ContinuityContextSummary {
-                enabled: true,
+                enabled: node.enabled,
                 section_index,
                 section_count,
                 global_arc: plan.global_arc.arc_type.clone(),
@@ -2004,6 +2068,7 @@ pub async fn generate_gemini_chart_preview_core_internal(
                 current_intensity_band: node.intensity_band.clone(),
                 current_density_intent: node.density_intent.clone(),
                 current_confidence: node.confidence.clone(),
+                current_notes: node.notes.clone(),
             })
         } else {
             let avoid_from_targeting = targeting_report.avoid_families.clone();
@@ -2043,6 +2108,7 @@ pub async fn generate_gemini_chart_preview_core_internal(
                 current_intensity_band: fallback_intensity.clone(),
                 current_density_intent: fallback_intensity,
                 current_confidence: "low".to_string(),
+                current_notes: None,
             })
         }
     } else {
@@ -2184,6 +2250,14 @@ pub async fn generate_gemini_chart_preview_core_internal(
             prompt_instructions.push("Use secondary families sparingly.".to_string());
             prompt_instructions
                 .push("Do not output notes outside the requested section.".to_string());
+            if let Some(ref notes) = cont_ctx.current_notes {
+                if !notes.trim().is_empty() {
+                    prompt_instructions.push(format!(
+                        "Additional instruction for this section: {}",
+                        notes
+                    ));
+                }
+            }
         }
     }
 
@@ -2623,6 +2697,7 @@ pub async fn generate_gemini_chart_preview<R: tauri::Runtime>(
     use_calibrated_prompt_context: Option<bool>,
     pattern_family_target: Option<String>,
     use_continuity_planning: Option<bool>,
+    overrides: Option<Vec<crate::section_continuity::SectionPlanOverride>>,
 ) -> Result<AppendChartResult, String> {
     let play_mode_enum = match play_mode.as_str() {
         "Single" => PlayMode::Single,
@@ -2675,7 +2750,7 @@ pub async fn generate_gemini_chart_preview<R: tauri::Runtime>(
     #[cfg(not(test))]
     let client = GeminiClient::new();
 
-    generate_gemini_chart_preview_core(
+    generate_gemini_chart_preview_core_internal_with_overrides(
         &api_key,
         &ssc_path,
         &audio_path,
@@ -2692,7 +2767,9 @@ pub async fn generate_gemini_chart_preview<R: tauri::Runtime>(
         browser_bpm_reconciliation,
         use_calibrated_prompt_context,
         pattern_family_target,
+        None,
         use_continuity_planning,
+        overrides,
     )
     .await
 }
@@ -2893,12 +2970,112 @@ pub fn grant_active_song_audio_access(ssc_path: String) -> Result<String, String
     Ok(granted_path.to_string_lossy().to_string())
 }
 
+#[tauri::command]
+pub async fn build_single_continuity_plan_preview(
+    ssc_path: String,
+    play_mode: String,
+    target_level: u32,
+    section_id: String,
+    start_measure: Option<u32>,
+    end_measure: Option<u32>,
+    browser_bpm_reconciliation: Option<String>,
+    overrides: Option<Vec<crate::section_continuity::SectionPlanOverride>>,
+) -> Result<crate::section_continuity::SongContinuityPlan, String> {
+    let play_mode_enum = match play_mode.as_str() {
+        "Single" => PlayMode::Single,
+        _ => {
+            return Err(format!(
+                "Unsupported play mode: {}. Only Single is supported.",
+                play_mode
+            ))
+        }
+    };
+
+    if target_level < 1 || target_level > 26 {
+        return Err(format!(
+            "Nivel de dificultad Single ({}) fuera de rango (1-26).",
+            target_level
+        ));
+    }
+
+    let ssc_p = Path::new(&ssc_path);
+    let mut report_opt = None;
+    if let Some(dir) = ssc_p.parent() {
+        let report_file = dir
+            .join(".ai-step-gen-analysis")
+            .join("song-analysis-report.v1.json");
+        if report_file.exists() && report_file.is_file() {
+            if let Ok(report_content) = fs::read_to_string(&report_file) {
+                if let Ok(report) = serde_json::from_str::<crate::music_analysis::SongAnalysisReport>(
+                    &report_content,
+                ) {
+                    report_opt = Some(report);
+                }
+            }
+        }
+    }
+
+    let calib_opt = crate::guardrail_calibration::resolve_calibration_file(None);
+
+    let mut start_m = start_measure.unwrap_or(0);
+    let mut end_m = end_measure.unwrap_or(7);
+
+    if let Some(ref report) = report_opt {
+        if start_measure.is_none() || end_measure.is_none() {
+            if let Some(sec) = report.sections.iter().find(|s| s.section_id == section_id) {
+                if start_measure.is_none() {
+                    start_m = sec.start_measure;
+                }
+                if end_measure.is_none() {
+                    end_m = sec.end_measure;
+                }
+            }
+        }
+    }
+
+    if end_m < start_m {
+        return Err(format!(
+            "El compás de fin ({}) no puede ser menor que el compás de inicio ({})",
+            end_m, start_m
+        ));
+    }
+    let num_measures = end_m
+        .checked_sub(start_m)
+        .and_then(|d| d.checked_add(1))
+        .ok_or_else(|| "Measure range calculation overflowed".to_string())?;
+    if num_measures > crate::biomechanics::MAX_SECTION_MEASURES as u32 {
+        return Err(format!(
+            "El rango solicitado de {} compases supera el límite máximo permitido de {} compases.",
+            num_measures,
+            crate::biomechanics::MAX_SECTION_MEASURES
+        ));
+    }
+
+    let base_plan = crate::section_continuity::build_song_continuity_plan(
+        target_level,
+        play_mode_enum,
+        report_opt.as_ref(),
+        calib_opt.as_ref(),
+        browser_bpm_reconciliation.as_deref(),
+        &section_id,
+        start_m,
+        end_m,
+    );
+
+    if let Some(ovs) = overrides {
+        crate::section_continuity::apply_section_plan_overrides(base_plan, &ovs)
+    } else {
+        Ok(base_plan)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use mockito::Server;
+    use std::io::{Read, Write};
     use std::path::PathBuf;
-    use std::sync::{Mutex, OnceLock};
+    use std::sync::{Arc, Mutex, OnceLock};
 
     static AUDIO_GRANTS_TEST_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
 
@@ -6289,6 +6466,7 @@ mod tests {
             current_intensity_band: "medium".to_string(),
             current_density_intent: "medium".to_string(),
             current_confidence: "low".to_string(),
+            current_notes: None,
         };
 
         let serialized_ok = serde_json::to_string(&summary).unwrap();
@@ -6539,6 +6717,455 @@ mod tests {
         );
 
         crate::settings::set_test_gemini_enabled(None);
+        let _ = std::fs::remove_dir_all(&test_root);
+    }
+
+    #[tokio::test]
+    async fn test_plan_preview_command_does_not_call_gemini() {
+        let original_path = get_fixture_path();
+        let temp_dir = std::env::temp_dir();
+        let test_root = temp_dir.join("plan_preview_gemini_test_run");
+        let _ = std::fs::create_dir_all(&test_root);
+        let temp_ssc_path = test_root.join("test_plan_preview.ssc");
+        std::fs::copy(&original_path, &temp_ssc_path).unwrap();
+
+        let plan = build_single_continuity_plan_preview(
+            temp_ssc_path.to_string_lossy().to_string(),
+            "Single".to_string(),
+            10,
+            "sec2".to_string(),
+            Some(0),
+            Some(7),
+            None,
+            None,
+        )
+        .await;
+        assert!(plan.is_ok());
+        let _ = std::fs::remove_dir_all(&test_root);
+    }
+
+    #[tokio::test]
+    async fn test_plan_preview_command_does_not_write() {
+        let original_path = get_fixture_path();
+        let temp_dir = std::env::temp_dir();
+        let test_root = temp_dir.join("plan_preview_write_test_run");
+        let _ = std::fs::create_dir_all(&test_root);
+        let temp_ssc_path = test_root.join("test_plan_preview.ssc");
+        std::fs::copy(&original_path, &temp_ssc_path).unwrap();
+
+        let initial_metadata = std::fs::metadata(&temp_ssc_path).unwrap();
+        let _ = build_single_continuity_plan_preview(
+            temp_ssc_path.to_string_lossy().to_string(),
+            "Single".to_string(),
+            10,
+            "sec2".to_string(),
+            Some(0),
+            Some(7),
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+
+        let current_metadata = std::fs::metadata(&temp_ssc_path).unwrap();
+        assert_eq!(initial_metadata.len(), current_metadata.len());
+        let backup_dir = test_root.join(".ai-step-gen-backups");
+        assert!(!backup_dir.exists());
+
+        let _ = std::fs::remove_dir_all(&test_root);
+    }
+
+    #[tokio::test]
+    async fn test_generate_preview_uses_applied_overrides() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        std::env::set_var(
+            "AI_STEP_GEN_MOCK_BASE_URL",
+            format!("http://127.0.0.1:{}", port),
+        );
+        crate::settings::set_test_gemini_enabled(Some(true));
+
+        let captured_body = Arc::new(Mutex::new(None));
+        let captured_body_clone = captured_body.clone();
+
+        std::thread::spawn(move || {
+            if let Ok((mut stream, _)) = listener.accept() {
+                let mut buffer = [0; 65536];
+                if let Ok(bytes_read) = stream.read(&mut buffer) {
+                    let req_str = String::from_utf8_lossy(&buffer[..bytes_read]).to_string();
+                    if let Some(body_start) = req_str.find("\r\n\r\n") {
+                        let body = req_str[body_start + 4..].to_string();
+                        let mut cap = captured_body_clone.lock().unwrap();
+                        *cap = Some(body);
+                    }
+                }
+                let response = "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\n\r\n{\
+                    \"candidates\": [\
+                        {\
+                            \"content\": {\
+                                \"parts\": [\
+                                    {\
+                                         \"text\": \"{\\n  \\\"section_id\\\": \\\"sec2\\\",\\n  \\\"difficulty_level\\\": 10,\\n  \\\"play_mode\\\": \\\"Single\\\",\\n  \\\"biomechanical_state\\\": {\\n    \\\"current_twist_debt\\\": 0.0,\\n    \\\"current_stamina_debt\\\": 0.1\\n  },\\n  \\\"measures\\\": []\\n}\"\
+                                     }\
+                                ]\
+                            }\
+                        }\
+                    ]\
+                }";
+                let _ = stream.write_all(response.as_bytes());
+                let _ = stream.flush();
+            }
+        });
+
+        let original_path = get_fixture_path();
+        let temp_dir = std::env::temp_dir();
+        let test_root = temp_dir.join("preview_overrides_test_run");
+        let _ = std::fs::create_dir_all(&test_root);
+        let temp_ssc_path = test_root.join("test_preview_overrides.ssc");
+        std::fs::copy(&original_path, &temp_ssc_path).unwrap();
+        let temp_audio_path = test_root.join("test_audio.ogg");
+        std::fs::copy(&original_path, &temp_audio_path).unwrap();
+
+        let empty_calib_json = r#"{
+            "schema_version": "single-guardrail-calibration.v0",
+            "publicability_status": "private_derived",
+            "play_mode": "Single",
+            "source_dataset_summary": {},
+            "level_thresholds": {
+                "S10": {
+                    "density": { "warning_p90": 1000.0, "hard_limit_p95": 1000.0 },
+                    "jump_rate": { "warning_p90": 10.0, "hard_limit_p95": 10.0 },
+                    "twist_rate": { "warning_p90": 10.0, "hard_limit_p95": 10.0 },
+                    "bracket_candidate_rate": { "warning_p90": 1000.0, "hard_limit_p95": 1000.0 }
+                }
+            },
+            "pattern_family_thresholds": {},
+            "confidence_policy": {},
+            "recommended_runtime_usage": []
+        }"#;
+        let empty_calib: crate::guardrail_calibration::SingleGuardrailCalibration =
+            serde_json::from_str(empty_calib_json).unwrap();
+
+        let client = GeminiClient::new(Some(format!("http://127.0.0.1:{}", port)));
+
+        let overrides = vec![crate::section_continuity::SectionPlanOverride {
+            section_id: "sec2".to_string(),
+            enabled: Some(true),
+            primary_pattern_family: Some("Stamina".to_string()),
+            secondary_pattern_families: None,
+            avoid_pattern_families: None,
+            motif_strategy: None,
+            intensity_band: None,
+            transition_in_type: None,
+            transition_out_type: None,
+            notes: Some("Please emphasize speed drills".to_string()),
+        }];
+
+        let result = generate_gemini_chart_preview_core_internal_with_overrides(
+            "dummy_key",
+            temp_ssc_path.to_str().unwrap(),
+            temp_audio_path.to_str().unwrap(),
+            PlayMode::Single,
+            10,
+            "sec2",
+            "author",
+            &client,
+            Some(0),
+            Some(7),
+            Some("Arcade".to_string()),
+            Some(true),
+            Some(true),
+            Some("Status: agrees".to_string()),
+            Some(true),
+            Some("auto".to_string()),
+            Some(&empty_calib),
+            Some(true),
+            Some(overrides),
+        )
+        .await;
+
+        assert!(result.is_ok(), "Preview failed: {:?}", result.err());
+        let res_val = result.unwrap();
+
+        let plan = res_val.continuity_plan.unwrap();
+        let sec = plan
+            .sections
+            .iter()
+            .find(|s| s.section_id == "sec2")
+            .unwrap();
+        assert_eq!(sec.primary_pattern_family, "stamina");
+        assert_eq!(sec.notes, Some("Please emphasize speed drills".to_string()));
+
+        let prompt_data = captured_body.lock().unwrap().clone().unwrap();
+        let v: serde_json::Value = serde_json::from_str(&prompt_data).unwrap();
+        let prompt_text = v["contents"][0]["parts"][0]["text"].as_str().unwrap();
+
+        assert!(prompt_text.contains("Please emphasize speed drills"));
+        assert!(prompt_text.contains("stamina"));
+
+        crate::settings::set_test_gemini_enabled(None);
+        let _ = std::fs::remove_dir_all(&test_root);
+    }
+
+    #[tokio::test]
+    async fn test_preview_still_written_false() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        std::env::set_var(
+            "AI_STEP_GEN_MOCK_BASE_URL",
+            format!("http://127.0.0.1:{}", port),
+        );
+        crate::settings::set_test_gemini_enabled(Some(true));
+
+        let captured_body = Arc::new(Mutex::new(None));
+        let captured_body_clone = captured_body.clone();
+
+        std::thread::spawn(move || {
+            if let Ok((mut stream, _)) = listener.accept() {
+                let mut buffer = [0; 65536];
+                if let Ok(bytes_read) = stream.read(&mut buffer) {
+                    let req_str = String::from_utf8_lossy(&buffer[..bytes_read]).to_string();
+                    if let Some(body_start) = req_str.find("\r\n\r\n") {
+                        let body = req_str[body_start + 4..].to_string();
+                        let mut cap = captured_body_clone.lock().unwrap();
+                        *cap = Some(body);
+                    }
+                }
+                let response = "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\n\r\n{\
+                    \"candidates\": [\
+                        {\
+                            \"content\": {\
+                                \"parts\": [\
+                                    {\
+                                         \"text\": \"{\\n  \\\"section_id\\\": \\\"sec2\\\",\\n  \\\"difficulty_level\\\": 10,\\n  \\\"play_mode\\\": \\\"Single\\\",\\n  \\\"biomechanical_state\\\": {\\n    \\\"current_twist_debt\\\": 0.0,\\n    \\\"current_stamina_debt\\\": 0.1\\n  },\\n  \\\"measures\\\": []\\n}\"\
+                                     }\
+                                ]\
+                            }\
+                        }\
+                    ]\
+                }";
+                let _ = stream.write_all(response.as_bytes());
+                let _ = stream.flush();
+            }
+        });
+
+        let original_path = get_fixture_path();
+        let temp_dir = std::env::temp_dir();
+        let test_root = temp_dir.join("preview_written_false_test_run");
+        let _ = std::fs::create_dir_all(&test_root);
+        let temp_ssc_path = test_root.join("test_preview.ssc");
+        std::fs::copy(&original_path, &temp_ssc_path).unwrap();
+        let temp_audio_path = test_root.join("test_audio.ogg");
+        std::fs::copy(&original_path, &temp_audio_path).unwrap();
+
+        let empty_calib_json = r#"{
+            "schema_version": "single-guardrail-calibration.v0",
+            "publicability_status": "private_derived",
+            "play_mode": "Single",
+            "source_dataset_summary": {},
+            "level_thresholds": {
+                "S10": {
+                    "density": { "warning_p90": 1000.0, "hard_limit_p95": 1000.0 },
+                    "jump_rate": { "warning_p90": 10.0, "hard_limit_p95": 10.0 },
+                    "twist_rate": { "warning_p90": 10.0, "hard_limit_p95": 10.0 },
+                    "bracket_candidate_rate": { "warning_p90": 1000.0, "hard_limit_p95": 1000.0 }
+                }
+            },
+            "pattern_family_thresholds": {},
+            "confidence_policy": {},
+            "recommended_runtime_usage": []
+        }"#;
+        let empty_calib: crate::guardrail_calibration::SingleGuardrailCalibration =
+            serde_json::from_str(empty_calib_json).unwrap();
+
+        let client = GeminiClient::new(Some(format!("http://127.0.0.1:{}", port)));
+
+        let result = generate_gemini_chart_preview_core_internal(
+            "dummy_key",
+            temp_ssc_path.to_str().unwrap(),
+            temp_audio_path.to_str().unwrap(),
+            PlayMode::Single,
+            10,
+            "sec2",
+            "author",
+            &client,
+            Some(0),
+            Some(7),
+            Some("Arcade".to_string()),
+            Some(true),
+            Some(true),
+            Some("Status: agrees".to_string()),
+            Some(true),
+            Some("auto".to_string()),
+            Some(&empty_calib),
+            Some(true),
+        )
+        .await;
+
+        assert!(result.is_ok());
+        let res_val = result.unwrap();
+        assert_eq!(res_val.written, false);
+
+        crate::settings::set_test_gemini_enabled(None);
+        let _ = std::fs::remove_dir_all(&test_root);
+    }
+
+    #[tokio::test]
+    async fn test_append_still_requires_fingerprint() {
+        let temp_dir = std::env::temp_dir();
+        let test_root = temp_dir.join("append_fingerprint_test_run");
+        let _ = std::fs::create_dir_all(&test_root);
+        let temp_ssc_path = test_root.join("test_append.ssc");
+        std::fs::copy(&get_fixture_path(), &temp_ssc_path).unwrap();
+
+        let _fingerprint =
+            get_file_fingerprint(temp_ssc_path.to_string_lossy().to_string()).unwrap();
+
+        let payload_json = r#"{
+            "section_id": "sec2",
+            "difficulty_level": 10,
+            "play_mode": "Single",
+            "biomechanical_state": {
+                "current_twist_debt": 0.0,
+                "current_stamina_debt": 0.1
+            },
+            "measures": [
+                {
+                    "measure_index": 0,
+                    "subdivision": 4,
+                    "rows": ["10000", "00100", "00001", "00100"]
+                }
+            ]
+        }"#;
+
+        let result = append_approved_gemini_payload(
+            temp_ssc_path.to_string_lossy().to_string(),
+            payload_json.to_string(),
+            "author".to_string(),
+            "mismatched_sha256".to_string(),
+        );
+
+        assert!(result.is_err());
+        assert!(result
+            .unwrap_err()
+            .contains("fingerprint del archivo .ssc ha cambiado"));
+
+        let _ = std::fs::remove_dir_all(&test_root);
+    }
+
+    #[tokio::test]
+    async fn test_generate_gemini_chart_preview_disabled_section_blocked() {
+        crate::settings::set_test_gemini_enabled(Some(true));
+        let client = GeminiClient::new(None);
+        let original_path = get_fixture_path();
+        let temp_dir = std::env::temp_dir();
+        let test_root = temp_dir.join("preview_disabled_blocked_test");
+        let _ = std::fs::create_dir_all(&test_root);
+        let temp_ssc_path = test_root.join("test_disabled.ssc");
+        std::fs::copy(&original_path, &temp_ssc_path).unwrap();
+        let temp_audio_path = test_root.join("test_audio.ogg");
+        std::fs::copy(&original_path, &temp_audio_path).unwrap();
+
+        let overrides = vec![crate::section_continuity::SectionPlanOverride {
+            section_id: "sec2".to_string(),
+            enabled: Some(false),
+            primary_pattern_family: None,
+            secondary_pattern_families: None,
+            avoid_pattern_families: None,
+            motif_strategy: None,
+            intensity_band: None,
+            transition_in_type: None,
+            transition_out_type: None,
+            notes: None,
+        }];
+
+        let result = generate_gemini_chart_preview_core_internal_with_overrides(
+            "dummy_key",
+            temp_ssc_path.to_str().unwrap(),
+            temp_audio_path.to_str().unwrap(),
+            PlayMode::Single,
+            10,
+            "sec2",
+            "author",
+            &client,
+            Some(0),
+            Some(7),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            Some(true),
+            Some(overrides),
+        )
+        .await;
+
+        assert!(result.is_err());
+        let err_msg = result.unwrap_err();
+        assert!(err_msg.contains("is disabled in Section Plan Review"));
+
+        crate::settings::set_test_gemini_enabled(None);
+        let _ = std::fs::remove_dir_all(&test_root);
+    }
+
+    #[tokio::test]
+    async fn test_build_single_continuity_plan_preview_bounds_validation() {
+        let original_path = get_fixture_path();
+        let temp_dir = std::env::temp_dir();
+        let test_root = temp_dir.join("build_plan_bounds_test");
+        let _ = std::fs::create_dir_all(&test_root);
+        let temp_ssc_path = test_root.join("test_bounds.ssc");
+        std::fs::copy(&original_path, &temp_ssc_path).unwrap();
+
+        // Level 27 (invalid)
+        let result_level = build_single_continuity_plan_preview(
+            temp_ssc_path.to_string_lossy().to_string(),
+            "Single".to_string(),
+            27,
+            "sec2".to_string(),
+            Some(0),
+            Some(7),
+            None,
+            None,
+        )
+        .await;
+        assert!(result_level.is_err());
+        assert!(result_level.unwrap_err().contains("fuera de rango"));
+
+        // start_measure > end_measure (invalid)
+        let result_order = build_single_continuity_plan_preview(
+            temp_ssc_path.to_string_lossy().to_string(),
+            "Single".to_string(),
+            10,
+            "sec2".to_string(),
+            Some(10),
+            Some(5),
+            None,
+            None,
+        )
+        .await;
+        assert!(result_order.is_err());
+        assert!(result_order.unwrap_err().contains("no puede ser menor"));
+
+        // Range exceeding MAX_SECTION_MEASURES = 16
+        let result_range = build_single_continuity_plan_preview(
+            temp_ssc_path.to_string_lossy().to_string(),
+            "Single".to_string(),
+            10,
+            "sec2".to_string(),
+            Some(0),
+            Some(17),
+            None,
+            None,
+        )
+        .await;
+        assert!(result_range.is_err());
+        assert!(result_range
+            .unwrap_err()
+            .contains("supera el límite máximo"));
+
         let _ = std::fs::remove_dir_all(&test_root);
     }
 }

@@ -34,6 +34,8 @@ pub struct SectionContinuityNode {
     pub confidence: String,
     pub evidence: Vec<String>,
     pub warnings: Vec<String>,
+    pub enabled: bool,
+    pub notes: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -71,6 +73,7 @@ pub struct ContinuityContextSummary {
     pub current_intensity_band: String,
     pub current_density_intent: String,
     pub current_confidence: String,
+    pub current_notes: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -470,6 +473,8 @@ pub fn build_song_continuity_plan(
                 confidence: resolved_targeting.confidence,
                 evidence,
                 warnings: node_warnings,
+                enabled: true,
+                notes: None,
             });
         }
     }
@@ -524,6 +529,8 @@ pub fn build_song_continuity_plan(
             confidence: "low".to_string(),
             evidence,
             warnings: node_warnings,
+            enabled: true,
+            notes: None,
         });
     }
 
@@ -652,6 +659,285 @@ pub fn build_song_continuity_plan(
         global_arc,
         warnings,
     }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SectionPlanOverride {
+    pub section_id: String,
+    pub enabled: Option<bool>,
+    pub primary_pattern_family: Option<String>,
+    pub secondary_pattern_families: Option<Vec<String>>,
+    pub avoid_pattern_families: Option<Vec<String>>,
+    pub motif_strategy: Option<String>,
+    pub intensity_band: Option<String>,
+    pub transition_in_type: Option<String>,
+    pub transition_out_type: Option<String>,
+    pub notes: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SectionPlanReviewState {
+    pub schema_version: String,
+    pub overrides: Vec<SectionPlanOverride>,
+}
+
+pub fn sanitize_override_notes(notes: &str) -> Result<String, String> {
+    let lower = notes.to_lowercase();
+
+    let forbidden = &[
+        "#notedata",
+        "#title:",
+        "#bpms:",
+        "#offset:",
+        "base64",
+        "data:audio",
+        ".ssc",
+        ".mp3",
+        ".ogg",
+        ".flac",
+        ".wav",
+        ".mp4",
+        ".mpg",
+        ".png",
+        ".jpg",
+        ".jpeg",
+        ".ai-step-gen-private-datasets",
+        "docs/official_songs",
+    ];
+
+    for &item in forbidden {
+        if lower.contains(item) {
+            return Err(format!(
+                "Privacy Violation: Override notes contain forbidden keyword/pattern '{}'",
+                item
+            ));
+        }
+    }
+
+    for c in b'a'..=b'z' {
+        let prefix_backslash = format!("{}:\\", c as char);
+        let prefix_slash = format!("{}:/", c as char);
+        if lower.contains(&prefix_backslash) || lower.contains(&prefix_slash) {
+            return Err(format!(
+                "Privacy Violation: Override notes contain Windows path prefix (drive letter)"
+            ));
+        }
+    }
+
+    let forbidden_folders = &["/users/", "/home/", "/var/", "/tmp/", "/etc/", "/opt/"];
+    for &folder in forbidden_folders {
+        if lower.contains(folder) {
+            return Err(format!(
+                "Privacy Violation: Override notes contain system path prefix '{}'",
+                folder
+            ));
+        }
+    }
+
+    Ok(notes.to_string())
+}
+
+pub fn validate_section_plan_override(o: &SectionPlanOverride) -> Result<(), String> {
+    if let Some(ref primary) = o.primary_pattern_family {
+        let norm = primary.to_lowercase().replace(' ', "_");
+        if norm != "auto" {
+            let fam = crate::generation_context::PatternFamily::from_str(&norm);
+            if matches!(fam, crate::generation_context::PatternFamily::Unknown) {
+                return Err(format!("Invalid primary pattern family: {}", primary));
+            }
+        }
+    }
+
+    if let Some(ref secondaries) = o.secondary_pattern_families {
+        for sec in secondaries {
+            let norm = sec.to_lowercase().replace(' ', "_");
+            let fam = crate::generation_context::PatternFamily::from_str(&norm);
+            if matches!(fam, crate::generation_context::PatternFamily::Unknown) {
+                return Err(format!("Invalid secondary pattern family: {}", sec));
+            }
+        }
+    }
+
+    if let Some(ref avoids) = o.avoid_pattern_families {
+        for av in avoids {
+            let norm = av.to_lowercase().replace(' ', "_");
+            let fam = crate::generation_context::PatternFamily::from_str(&norm);
+            if matches!(fam, crate::generation_context::PatternFamily::Unknown) {
+                return Err(format!("Invalid avoid pattern family: {}", av));
+            }
+        }
+    }
+
+    if let Some(ref motif) = o.motif_strategy {
+        let norm = motif.to_lowercase().replace(' ', "_");
+        let valid_motifs = &[
+            "auto",
+            "introduce",
+            "develop",
+            "intensify",
+            "contrast",
+            "rest",
+            "callback",
+            "resolve",
+            "final_burst",
+        ];
+        if !valid_motifs.contains(&norm.as_str()) {
+            return Err(format!("Invalid motif strategy: {}", motif));
+        }
+    }
+
+    if let Some(ref intensity) = o.intensity_band {
+        let norm = intensity.to_lowercase().replace(' ', "_");
+        let valid_intensities = &["auto", "very_low", "low", "medium", "high", "very_high"];
+        if !valid_intensities.contains(&norm.as_str()) {
+            return Err(format!("Invalid intensity band: {}", intensity));
+        }
+    }
+
+    let valid_transitions = &[
+        "auto",
+        "smooth_continue",
+        "density_ramp_up",
+        "climax_entry",
+        "density_ramp_down",
+        "contrast_break",
+        "unknown",
+        "none",
+    ];
+
+    if let Some(ref trans_in) = o.transition_in_type {
+        let norm = trans_in.to_lowercase().replace(' ', "_");
+        if !valid_transitions.contains(&norm.as_str()) {
+            return Err(format!("Invalid transition in type: {}", trans_in));
+        }
+    }
+
+    if let Some(ref trans_out) = o.transition_out_type {
+        let norm = trans_out.to_lowercase().replace(' ', "_");
+        if !valid_transitions.contains(&norm.as_str()) {
+            return Err(format!("Invalid transition out type: {}", trans_out));
+        }
+    }
+
+    if let Some(ref notes) = o.notes {
+        if notes.len() > 240 {
+            return Err("Notes exceed maximum length of 240 characters.".to_string());
+        }
+        sanitize_override_notes(notes)?;
+    }
+
+    Ok(())
+}
+
+pub fn apply_section_plan_overrides(
+    mut plan: SongContinuityPlan,
+    overrides: &[SectionPlanOverride],
+) -> Result<SongContinuityPlan, String> {
+    // First, validate all overrides and verify that they reference existing sections
+    for ov in overrides {
+        validate_section_plan_override(ov)?;
+        if !plan.sections.iter().any(|s| s.section_id == ov.section_id) {
+            return Err(format!(
+                "Override references unknown section '{}'. Rebuild the section plan before applying overrides.",
+                ov.section_id
+            ));
+        }
+    }
+
+    // Second pass: apply all non-transition overrides
+    for ov in overrides {
+        if let Some(ref mut node) = plan
+            .sections
+            .iter_mut()
+            .find(|s| s.section_id == ov.section_id)
+        {
+            if let Some(enabled) = ov.enabled {
+                node.enabled = enabled;
+            }
+            if let Some(ref primary) = ov.primary_pattern_family {
+                let norm = primary.to_lowercase().replace(' ', "_");
+                if norm != "auto" {
+                    node.primary_pattern_family = norm;
+                }
+            }
+            if let Some(ref secondaries) = &ov.secondary_pattern_families {
+                node.secondary_pattern_families = secondaries
+                    .iter()
+                    .map(|s| s.to_lowercase().replace(' ', "_"))
+                    .collect();
+            }
+            if let Some(ref avoids) = &ov.avoid_pattern_families {
+                node.avoid_pattern_families = avoids
+                    .iter()
+                    .map(|s| s.to_lowercase().replace(' ', "_"))
+                    .collect();
+            }
+            if let Some(ref motif) = ov.motif_strategy {
+                let norm = motif.to_lowercase().replace(' ', "_");
+                if norm != "auto" {
+                    node.motif_strategy = norm;
+                }
+            }
+            if let Some(ref intensity) = ov.intensity_band {
+                let norm = intensity.to_lowercase().replace(' ', "_");
+                if norm != "auto" {
+                    node.intensity_band = norm.clone();
+                    node.density_intent = norm;
+                }
+            }
+            if let Some(ref notes) = ov.notes {
+                let sanitized = sanitize_override_notes(notes)?;
+                node.notes = Some(sanitized);
+            }
+        }
+    }
+
+    // Recalculate transitions dynamically based on updated intensity bands
+    let nodes_len = plan.sections.len();
+    for idx in 0..nodes_len {
+        let prev_node = if idx > 0 {
+            Some(plan.sections[idx - 1].clone())
+        } else {
+            None
+        };
+        let transition_in =
+            build_transition_guidance(prev_node.as_ref(), &plan.sections[idx], false);
+
+        let next_node = if idx + 1 < nodes_len {
+            Some(plan.sections[idx + 1].clone())
+        } else {
+            None
+        };
+        let transition_out =
+            build_transition_guidance(next_node.as_ref(), &plan.sections[idx], true);
+
+        plan.sections[idx].transition_in = transition_in;
+        plan.sections[idx].transition_out = transition_out;
+    }
+
+    // Second pass: apply transition type overrides (user overrides take precedence over recalculated ones)
+    for ov in overrides {
+        if let Some(ref mut node) = plan
+            .sections
+            .iter_mut()
+            .find(|s| s.section_id == ov.section_id)
+        {
+            if let Some(ref trans_in) = ov.transition_in_type {
+                let norm = trans_in.to_lowercase().replace(' ', "_");
+                if norm != "auto" {
+                    node.transition_in.transition_type = norm;
+                }
+            }
+            if let Some(ref trans_out) = ov.transition_out_type {
+                let norm = trans_out.to_lowercase().replace(' ', "_");
+                if norm != "auto" {
+                    node.transition_out.transition_type = norm;
+                }
+            }
+        }
+    }
+
+    Ok(plan)
 }
 
 #[cfg(test)]
@@ -1046,6 +1332,7 @@ mod tests {
             current_intensity_band: node.intensity_band.clone(),
             current_density_intent: node.density_intent.clone(),
             current_confidence: node.confidence.clone(),
+            current_notes: None,
         };
         let serialized = serde_json::to_string(&summary).unwrap();
         assert!(crate::generation_context::self_audit_prompt_context(&serialized).is_ok());
@@ -1259,6 +1546,7 @@ mod tests {
             current_intensity_band: node.intensity_band.clone(),
             current_density_intent: node.density_intent.clone(),
             current_confidence: node.confidence.clone(),
+            current_notes: None,
         };
         assert_eq!(summary.current_primary_pattern_family, "stream");
         assert_eq!(summary.current_intensity_band, "low");
@@ -1274,5 +1562,454 @@ mod tests {
         assert!(serialized.get("current_intensity_band").is_some());
         assert!(serialized.get("current_density_intent").is_some());
         assert!(serialized.get("current_confidence").is_some());
+    }
+
+    #[test]
+    fn test_override_primary_family_applies_to_section() {
+        let plan = build_song_continuity_plan(
+            10,
+            PlayMode::Single,
+            Some(&make_mock_report()),
+            None,
+            None,
+            "sec_verse",
+            8,
+            24,
+        );
+        let overrides = vec![SectionPlanOverride {
+            section_id: "sec_verse".to_string(),
+            enabled: None,
+            primary_pattern_family: Some("Stamina".to_string()),
+            secondary_pattern_families: None,
+            avoid_pattern_families: None,
+            motif_strategy: None,
+            intensity_band: None,
+            transition_in_type: None,
+            transition_out_type: None,
+            notes: None,
+        }];
+        let applied = apply_section_plan_overrides(plan, &overrides).unwrap();
+        let verse = applied
+            .sections
+            .iter()
+            .find(|s| s.section_id == "sec_verse")
+            .unwrap();
+        assert_eq!(verse.primary_pattern_family, "stamina");
+    }
+
+    #[test]
+    fn test_override_motif_strategy_applies_to_section() {
+        let plan = build_song_continuity_plan(
+            10,
+            PlayMode::Single,
+            Some(&make_mock_report()),
+            None,
+            None,
+            "sec_verse",
+            8,
+            24,
+        );
+        let overrides = vec![SectionPlanOverride {
+            section_id: "sec_verse".to_string(),
+            enabled: None,
+            primary_pattern_family: None,
+            secondary_pattern_families: None,
+            avoid_pattern_families: None,
+            motif_strategy: Some("Contrast".to_string()),
+            intensity_band: None,
+            transition_in_type: None,
+            transition_out_type: None,
+            notes: None,
+        }];
+        let applied = apply_section_plan_overrides(plan, &overrides).unwrap();
+        let verse = applied
+            .sections
+            .iter()
+            .find(|s| s.section_id == "sec_verse")
+            .unwrap();
+        assert_eq!(verse.motif_strategy, "contrast");
+    }
+
+    #[test]
+    fn test_override_intensity_applies_to_section() {
+        let plan = build_song_continuity_plan(
+            10,
+            PlayMode::Single,
+            Some(&make_mock_report()),
+            None,
+            None,
+            "sec_verse",
+            8,
+            24,
+        );
+        let overrides = vec![SectionPlanOverride {
+            section_id: "sec_verse".to_string(),
+            enabled: None,
+            primary_pattern_family: None,
+            secondary_pattern_families: None,
+            avoid_pattern_families: None,
+            motif_strategy: None,
+            intensity_band: Some("Very High".to_string()),
+            transition_in_type: None,
+            transition_out_type: None,
+            notes: None,
+        }];
+        let applied = apply_section_plan_overrides(plan, &overrides).unwrap();
+        let verse = applied
+            .sections
+            .iter()
+            .find(|s| s.section_id == "sec_verse")
+            .unwrap();
+        assert_eq!(verse.intensity_band, "very_high");
+        assert_eq!(verse.density_intent, "very_high");
+    }
+
+    #[test]
+    fn test_disabled_section_is_marked_and_not_selected_for_prompt() {
+        let plan = build_song_continuity_plan(
+            10,
+            PlayMode::Single,
+            Some(&make_mock_report()),
+            None,
+            None,
+            "sec_verse",
+            8,
+            24,
+        );
+        let overrides = vec![SectionPlanOverride {
+            section_id: "sec_verse".to_string(),
+            enabled: Some(false),
+            primary_pattern_family: None,
+            secondary_pattern_families: None,
+            avoid_pattern_families: None,
+            motif_strategy: None,
+            intensity_band: None,
+            transition_in_type: None,
+            transition_out_type: None,
+            notes: None,
+        }];
+        let applied = apply_section_plan_overrides(plan, &overrides).unwrap();
+        let verse = applied
+            .sections
+            .iter()
+            .find(|s| s.section_id == "sec_verse")
+            .unwrap();
+        assert_eq!(verse.enabled, false);
+    }
+
+    #[test]
+    fn test_invalid_family_override_is_rejected() {
+        let plan = build_song_continuity_plan(
+            10,
+            PlayMode::Single,
+            Some(&make_mock_report()),
+            None,
+            None,
+            "sec_verse",
+            8,
+            24,
+        );
+        let overrides = vec![SectionPlanOverride {
+            section_id: "sec_verse".to_string(),
+            enabled: None,
+            primary_pattern_family: Some("InvalidFamily".to_string()),
+            secondary_pattern_families: None,
+            avoid_pattern_families: None,
+            motif_strategy: None,
+            intensity_band: None,
+            transition_in_type: None,
+            transition_out_type: None,
+            notes: None,
+        }];
+        let res = apply_section_plan_overrides(plan, &overrides);
+        assert!(res.is_err());
+        assert!(res.unwrap_err().contains("Invalid primary pattern family"));
+    }
+
+    #[test]
+    fn test_invalid_motif_override_is_rejected() {
+        let plan = build_song_continuity_plan(
+            10,
+            PlayMode::Single,
+            Some(&make_mock_report()),
+            None,
+            None,
+            "sec_verse",
+            8,
+            24,
+        );
+        let overrides = vec![SectionPlanOverride {
+            section_id: "sec_verse".to_string(),
+            enabled: None,
+            primary_pattern_family: None,
+            secondary_pattern_families: None,
+            avoid_pattern_families: None,
+            motif_strategy: Some("InvalidMotif".to_string()),
+            intensity_band: None,
+            transition_in_type: None,
+            transition_out_type: None,
+            notes: None,
+        }];
+        let res = apply_section_plan_overrides(plan, &overrides);
+        assert!(res.is_err());
+        assert!(res.unwrap_err().contains("Invalid motif strategy"));
+    }
+
+    #[test]
+    fn test_override_notes_reject_private_paths() {
+        let plan = build_song_continuity_plan(
+            10,
+            PlayMode::Single,
+            Some(&make_mock_report()),
+            None,
+            None,
+            "sec_verse",
+            8,
+            24,
+        );
+        let overrides1 = vec![SectionPlanOverride {
+            section_id: "sec_verse".to_string(),
+            enabled: None,
+            primary_pattern_family: None,
+            secondary_pattern_families: None,
+            avoid_pattern_families: None,
+            motif_strategy: None,
+            intensity_band: None,
+            transition_in_type: None,
+            transition_out_type: None,
+            notes: Some("C:\\Users\\private_file.ssc".to_string()),
+        }];
+        assert!(apply_section_plan_overrides(plan.clone(), &overrides1).is_err());
+
+        let overrides2 = vec![SectionPlanOverride {
+            section_id: "sec_verse".to_string(),
+            enabled: None,
+            primary_pattern_family: None,
+            secondary_pattern_families: None,
+            avoid_pattern_families: None,
+            motif_strategy: None,
+            intensity_band: None,
+            transition_in_type: None,
+            transition_out_type: None,
+            notes: Some("/Users/someone/secret".to_string()),
+        }];
+        assert!(apply_section_plan_overrides(plan, &overrides2).is_err());
+    }
+
+    #[test]
+    fn test_override_notes_reject_raw_stepmania_tags() {
+        let plan = build_song_continuity_plan(
+            10,
+            PlayMode::Single,
+            Some(&make_mock_report()),
+            None,
+            None,
+            "sec_verse",
+            8,
+            24,
+        );
+        let overrides1 = vec![SectionPlanOverride {
+            section_id: "sec_verse".to_string(),
+            enabled: None,
+            primary_pattern_family: None,
+            secondary_pattern_families: None,
+            avoid_pattern_families: None,
+            motif_strategy: None,
+            intensity_band: None,
+            transition_in_type: None,
+            transition_out_type: None,
+            notes: Some("#NOTEDATA:".to_string()),
+        }];
+        assert!(apply_section_plan_overrides(plan.clone(), &overrides1).is_err());
+
+        let overrides2 = vec![SectionPlanOverride {
+            section_id: "sec_verse".to_string(),
+            enabled: None,
+            primary_pattern_family: None,
+            secondary_pattern_families: None,
+            avoid_pattern_families: None,
+            motif_strategy: None,
+            intensity_band: None,
+            transition_in_type: None,
+            transition_out_type: None,
+            notes: Some("#TITLE: My Title".to_string()),
+        }];
+        assert!(apply_section_plan_overrides(plan, &overrides2).is_err());
+    }
+
+    #[test]
+    fn test_missing_music_analysis_returns_degraded_plan() {
+        let plan =
+            build_song_continuity_plan(10, PlayMode::Single, None, None, None, "sec_verse", 8, 24);
+        assert_eq!(plan.section_count, 1);
+        assert_eq!(plan.sections[0].section_id, "sec_verse");
+        assert!(plan.sections[0]
+            .warnings
+            .iter()
+            .any(|w| w.contains("degraded")));
+    }
+
+    #[test]
+    fn test_override_nonexistent_section_rejected() {
+        let plan = build_song_continuity_plan(
+            10,
+            PlayMode::Single,
+            Some(&make_mock_report()),
+            None,
+            None,
+            "sec_verse",
+            8,
+            24,
+        );
+        let overrides = vec![SectionPlanOverride {
+            section_id: "sec_nonexistent".to_string(),
+            enabled: Some(true),
+            primary_pattern_family: None,
+            secondary_pattern_families: None,
+            avoid_pattern_families: None,
+            motif_strategy: None,
+            intensity_band: None,
+            transition_in_type: None,
+            transition_out_type: None,
+            notes: None,
+        }];
+        let res = apply_section_plan_overrides(plan, &overrides);
+        assert!(res.is_err());
+        assert!(res
+            .unwrap_err()
+            .contains("Override references unknown section"));
+    }
+
+    #[test]
+    fn test_invalid_transitions_rejected() {
+        let plan = build_song_continuity_plan(
+            10,
+            PlayMode::Single,
+            Some(&make_mock_report()),
+            None,
+            None,
+            "sec_verse",
+            8,
+            24,
+        );
+
+        let overrides_in = vec![SectionPlanOverride {
+            section_id: "sec_verse".to_string(),
+            enabled: None,
+            primary_pattern_family: None,
+            secondary_pattern_families: None,
+            avoid_pattern_families: None,
+            motif_strategy: None,
+            intensity_band: None,
+            transition_in_type: Some("invalid_trans".to_string()),
+            transition_out_type: None,
+            notes: None,
+        }];
+        let res_in = apply_section_plan_overrides(plan.clone(), &overrides_in);
+        assert!(res_in.is_err());
+        assert!(res_in.unwrap_err().contains("Invalid transition in type"));
+
+        let overrides_out = vec![SectionPlanOverride {
+            section_id: "sec_verse".to_string(),
+            enabled: None,
+            primary_pattern_family: None,
+            secondary_pattern_families: None,
+            avoid_pattern_families: None,
+            motif_strategy: None,
+            intensity_band: None,
+            transition_in_type: None,
+            transition_out_type: Some("invalid_trans".to_string()),
+            notes: None,
+        }];
+        let res_out = apply_section_plan_overrides(plan, &overrides_out);
+        assert!(res_out.is_err());
+        assert!(res_out.unwrap_err().contains("Invalid transition out type"));
+    }
+
+    #[test]
+    fn test_valid_transitions_accepted() {
+        let plan = build_song_continuity_plan(
+            10,
+            PlayMode::Single,
+            Some(&make_mock_report()),
+            None,
+            None,
+            "sec_verse",
+            8,
+            24,
+        );
+        let overrides = vec![SectionPlanOverride {
+            section_id: "sec_verse".to_string(),
+            enabled: None,
+            primary_pattern_family: None,
+            secondary_pattern_families: None,
+            avoid_pattern_families: None,
+            motif_strategy: None,
+            intensity_band: None,
+            transition_in_type: Some("smooth_continue".to_string()),
+            transition_out_type: Some("climax_entry".to_string()),
+            notes: None,
+        }];
+        let res = apply_section_plan_overrides(plan, &overrides);
+        assert!(res.is_ok());
+    }
+
+    #[test]
+    fn test_stricter_override_notes_sanitization() {
+        let plan = build_song_continuity_plan(
+            10,
+            PlayMode::Single,
+            Some(&make_mock_report()),
+            None,
+            None,
+            "sec_verse",
+            8,
+            24,
+        );
+
+        // Windows drive letter with forward slash
+        let ov_drive = vec![SectionPlanOverride {
+            section_id: "sec_verse".to_string(),
+            enabled: None,
+            primary_pattern_family: None,
+            secondary_pattern_families: None,
+            avoid_pattern_families: None,
+            motif_strategy: None,
+            intensity_band: None,
+            transition_in_type: None,
+            transition_out_type: None,
+            notes: Some("d:/secret/file.ssc".to_string()),
+        }];
+        assert!(apply_section_plan_overrides(plan.clone(), &ov_drive).is_err());
+
+        // Unix system path /home/
+        let ov_home = vec![SectionPlanOverride {
+            section_id: "sec_verse".to_string(),
+            enabled: None,
+            primary_pattern_family: None,
+            secondary_pattern_families: None,
+            avoid_pattern_families: None,
+            motif_strategy: None,
+            intensity_band: None,
+            transition_in_type: None,
+            transition_out_type: None,
+            notes: Some("/home/user/my_song".to_string()),
+        }];
+        assert!(apply_section_plan_overrides(plan.clone(), &ov_home).is_err());
+
+        // Unix system path /tmp/
+        let ov_tmp = vec![SectionPlanOverride {
+            section_id: "sec_verse".to_string(),
+            enabled: None,
+            primary_pattern_family: None,
+            secondary_pattern_families: None,
+            avoid_pattern_families: None,
+            motif_strategy: None,
+            intensity_band: None,
+            transition_in_type: None,
+            transition_out_type: None,
+            notes: Some("/tmp/dump".to_string()),
+        }];
+        assert!(apply_section_plan_overrides(plan, &ov_tmp).is_err());
     }
 }

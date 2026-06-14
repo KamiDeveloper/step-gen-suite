@@ -2949,4 +2949,194 @@ details[open] .accordion-icon {
   list-style-type: disc;
 }
 
+/* Section Plan Styles */
+.section-plan-card {
+  background-color: var(--surface-card-white);
+  border: 1px solid var(--color-chalk);
+  border-radius: var(--radius-panels);
+  box-shadow: var(--shadow-subtle-2);
+  padding: var(--spacing-24);
+  margin-bottom: var(--spacing-24);
+}
+
+.section-plan-header {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  margin-bottom: var(--spacing-16);
+  border-bottom: 1px solid var(--color-chalk);
+  padding-bottom: var(--spacing-12);
+}
+
+.section-plan-status-row {
+  display: flex;
+  align-items: center;
+  gap: var(--spacing-12);
+}
+
+.section-plan-badge {
+  font-family: var(--font-inter);
+  font-size: 11px;
+  font-weight: var(--font-weight-bold);
+  padding: 3px 8px;
+  border-radius: var(--radius-tags);
+  text-transform: uppercase;
+}
+
+.section-plan-badge.ready {
+  background-color: #f0fdf4;
+  color: #16a34a;
+  border: 1px solid #bbf7d0;
+}
+
+.section-plan-badge.stale {
+  background-color: #fffbeb;
+  color: #d97706;
+  border: 1px solid #fde68a;
+}
+
+.section-plan-badge.degraded {
+  background-color: #fff1f2;
+  color: #be123c;
+  border: 1px solid #fecdd3;
+}
+
+.section-plan-layout {
+  display: flex;
+  flex-direction: column;
+  gap: var(--spacing-16);
+}
+
+@media (min-width: 900px) {
+  .section-plan-layout {
+    flex-direction: row;
+    align-items: flex-start;
+  }
+}
+
+.section-plan-table-wrapper {
+  flex: 7;
+  overflow-x: auto;
+  border: 1px solid var(--color-chalk);
+  border-radius: var(--radius-cards);
+}
+
+.section-plan-details-wrapper {
+  flex: 4;
+  background-color: var(--color-eggshell);
+  border: 1px solid var(--color-chalk);
+  border-radius: var(--radius-cards);
+  padding: var(--spacing-16);
+  display: flex;
+  flex-direction: column;
+  gap: var(--spacing-12);
+}
+
+.section-plan-row {
+  cursor: pointer;
+  transition: background-color 0.15s ease;
+}
+
+.section-plan-row:hover {
+  background-color: var(--color-powder);
+}
+
+.section-plan-row.selected {
+  background-color: var(--color-powder) !important;
+  font-weight: 500;
+}
+
+.section-plan-row.disabled {
+  opacity: 0.5;
+}
+
+.override-detail-title {
+  font-family: var(--font-inter);
+  font-weight: var(--font-weight-bold);
+  font-size: 13px;
+  color: var(--color-obsidian);
+  margin-bottom: var(--spacing-4);
+  border-bottom: 1px solid var(--color-chalk);
+  padding-bottom: var(--spacing-8);
+}
+
+.override-controls-grid {
+  display: flex;
+  flex-direction: column;
+  gap: var(--spacing-8);
+}
+
+.override-row-checkbox {
+  display: flex;
+  align-items: center;
+  gap: var(--spacing-8);
+  font-size: 12px;
+  color: var(--color-obsidian);
+}
+
+.override-note-error {
+  color: #be123c;
+  font-size: 11px;
+  margin-top: 2px;
+}
+
+/* Helper styles to avoid inline styles in ProjectWorkspace */
+.section-plan-header h4 {
+  margin: 0 !important;
+}
+
+.section-plan-header .import-action-buttons {
+  margin: 0 !important;
+}
+
+.section-plan-warning {
+  margin-bottom: 12px !important;
+}
+
+.section-plan-col-act {
+  width: 40px !important;
+  text-align: center !important;
+}
+
+.section-plan-col-warn {
+  width: 50px !important;
+  text-align: center !important;
+}
+
+.section-plan-cell-center {
+  text-align: center !important;
+}
+
+.section-plan-warning-badge {
+  background-color: var(--color-ember) !important;
+  color: white !important;
+}
+
+.override-form-group {
+  margin-bottom: 8px !important;
+}
+
+.override-input-select {
+  padding: 8px 12px !important;
+  font-size: 12px !important;
+}
+
+.override-input-textarea {
+  padding: 8px 12px !important;
+  font-size: 12px !important;
+  height: 60px !important;
+  resize: none !important;
+}
+
+.placeholder-state-card-compact {
+  padding: 16px !important;
+}
+
+.override-form-label {
+  font-size: 11px !important;
+}
+
+
+
+
 
