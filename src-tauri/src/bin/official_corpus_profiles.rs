@@ -1,6 +1,6 @@
 use chrono::Utc;
 use serde::{Deserialize, Serialize};
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fs::{self, File};
 use std::io::{self, BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
@@ -253,8 +253,8 @@ pub struct LevelProfileRecord {
     pub song_count_estimate: usize,
     pub window_count: usize,
     pub sample_confidence: String,
-    pub song_type_distribution: HashMap<String, usize>,
-    pub pack_distribution: HashMap<String, usize>,
+    pub song_type_distribution: BTreeMap<String, usize>,
+    pub pack_distribution: BTreeMap<String, usize>,
     pub bpm_profile: StatsSummary,
     pub chart_feature_profile: LevelChartFeatureProfile,
     pub window_feature_profile: LevelWindowFeatureProfile,
@@ -264,8 +264,8 @@ pub struct LevelProfileRecord {
 
 #[derive(Debug, Clone, Serialize)]
 pub struct PatternFamilySignature {
-    pub primary_metrics: HashMap<String, f64>,
-    pub secondary_metrics: HashMap<String, f64>,
+    pub primary_metrics: BTreeMap<String, f64>,
+    pub secondary_metrics: BTreeMap<String, f64>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -316,7 +316,7 @@ pub struct StyleArchetypeProfileRecord {
     pub chart_count: usize,
     pub window_count: usize,
     pub sample_confidence: String,
-    pub feature_signature: HashMap<String, f64>,
+    pub feature_signature: BTreeMap<String, f64>,
     pub pattern_families: Vec<String>,
     pub generation_bias: StyleArchetypeBias,
     pub guardrail_warnings: Vec<String>,
@@ -324,10 +324,24 @@ pub struct StyleArchetypeProfileRecord {
 
 #[derive(Debug, Clone, Serialize)]
 pub struct CalibrationLevelThreshold {
-    pub density: HashMap<String, f64>,
-    pub jump_rate: HashMap<String, f64>,
-    pub twist_rate: HashMap<String, f64>,
-    pub bracket_candidate_rate: HashMap<String, f64>,
+    pub density: BTreeMap<String, f64>,
+    pub jump_rate: BTreeMap<String, f64>,
+    pub twist_rate: BTreeMap<String, f64>,
+    pub bracket_candidate_rate: BTreeMap<String, f64>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct FamilyCalibrationSignal {
+    pub pattern_family: String,
+    pub classification_rule: String,
+    pub classifier_thresholds: BTreeMap<String, f64>,
+    pub sample_count: usize,
+    pub sample_confidence: String,
+    pub typical_level_range: TypicalLevelRange,
+    pub metric_stats: StatsSummary,
+    pub recommended_when: Vec<String>,
+    pub avoid_when: Vec<String>,
+    pub guardrail_notes: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -336,8 +350,9 @@ pub struct GuardrailCalibration {
     pub publicability_status: String,
     pub play_mode: String,
     pub source_dataset_summary: serde_json::Value,
-    pub level_thresholds: HashMap<String, CalibrationLevelThreshold>,
-    pub confidence_policy: HashMap<String, String>,
+    pub level_thresholds: BTreeMap<String, CalibrationLevelThreshold>,
+    pub pattern_family_thresholds: BTreeMap<String, FamilyCalibrationSignal>,
+    pub confidence_policy: BTreeMap<String, String>,
     pub recommended_runtime_usage: Vec<String>,
 }
 
@@ -367,7 +382,7 @@ pub struct Manifest {
     pub generated_at_utc: String,
     pub dataset_root_kind: String,
     pub output_root_kind: String,
-    pub input_schema_versions: HashMap<String, String>,
+    pub input_schema_versions: BTreeMap<String, String>,
     pub output_schema_versions: SchemaVersions,
     pub input_catalog_records: usize,
     pub input_chart_feature_records: usize,
@@ -577,10 +592,16 @@ pub fn compute_stats(data: &[f64]) -> StatsSummary {
 // Input Validation Helper
 // ==========================================
 
+#[derive(Debug, Deserialize)]
+pub struct BaseRecordHeader {
+    pub schema_version: Option<String>,
+    pub publicability_status: Option<String>,
+}
+
 fn validate_input_record(
     line_num: usize,
     filename: &str,
-    val: &serde_json::Value,
+    header: &BaseRecordHeader,
     expected_schema: &str,
     expected_status: &str,
     fail_fast: bool,
@@ -588,8 +609,8 @@ fn validate_input_record(
     missing_required_fields_count: &mut usize,
     invalid_publicability_status_count: &mut usize,
 ) -> Result<bool, String> {
-    let schema = match val.get("schema_version").and_then(|s| s.as_str()) {
-        Some(s) => s,
+    let schema = match &header.schema_version {
+        Some(s) => s.as_str(),
         None => {
             let msg = format!(
                 "Missing schema_version in {} at line {}",
@@ -627,10 +648,11 @@ fn validate_input_record(
         if fail_fast {
             return Err(msg);
         }
+        return Ok(false);
     }
 
-    let status = match val.get("publicability_status").and_then(|s| s.as_str()) {
-        Some(s) => s,
+    let status = match &header.publicability_status {
+        Some(s) => s.as_str(),
         None => {
             let msg = format!(
                 "Missing publicability_status in {} at line {}",
@@ -822,35 +844,60 @@ fn perform_self_audit(output_root: &Path) -> Result<(), String> {
         "data:audio",
         "C:\\",
         "/Users/",
+        ".ssc",
         ".mp3",
         ".ogg",
         ".flac",
         ".wav",
         ".mp4",
+        ".mpg",
         ".png",
         ".jpg",
+        ".jpeg",
     ];
+
+    // OPTIMIZACIÓN EXTRA: Pre-calculamos los patrones en mayúsculas una sola vez
+    let forbidden_patterns_upper: Vec<String> = forbidden_patterns
+        .iter()
+        .map(|p| p.to_uppercase())
+        .collect();
 
     for filename in &files_to_audit {
         let file_path = output_root.join(filename);
         if !file_path.exists() {
             continue;
         }
-        let content = fs::read_to_string(&file_path).map_err(|e| {
+
+        // 1. Abrimos el archivo de forma eficiente sin cargar su contenido aún
+        let file = File::open(&file_path).map_err(|e| {
             format!(
-                "Failed to read output file {:?} for audit: {}",
+                "Failed to open output file {:?} for audit: {}",
                 file_path, e
             )
         })?;
+        let reader = BufReader::new(file);
 
-        let content_upper = content.to_uppercase();
-        for pattern in &forbidden_patterns {
-            let pattern_upper = pattern.to_uppercase();
-            if content_upper.contains(&pattern_upper) {
-                return Err(format!(
-                    "PRIVACY VIOLATION: Output file {} contains forbidden pattern '{}'!",
-                    filename, pattern
-                ));
+        // 2. Iteramos línea por línea. El uso de memoria ahora es O(longitud de la línea) y no O(tamaño del archivo)
+        for (line_idx, line_result) in reader.lines().enumerate() {
+            let line = line_result.map_err(|e| {
+                format!(
+                    "Failed to read line {} in {:?}: {}",
+                    line_idx + 1,
+                    file_path,
+                    e
+                )
+            })?;
+
+            // 3. Pasamos a mayúsculas únicamente la línea actual
+            let line_upper = line.to_uppercase();
+
+            for (idx, pattern_upper) in forbidden_patterns_upper.iter().enumerate() {
+                if line_upper.contains(pattern_upper) {
+                    return Err(format!(
+                        "PRIVACY VIOLATION: Output file {} contains forbidden pattern '{}' at line {}!",
+                        filename, forbidden_patterns[idx], line_idx + 1
+                    ));
+                }
             }
         }
     }
@@ -893,7 +940,7 @@ pub fn run_aggregator(args: &AppArgs) -> Result<Manifest, String> {
         serde_json::json!({})
     };
 
-    let mut input_schema_versions = HashMap::new();
+    let mut input_schema_versions = BTreeMap::new();
     if let Some(svs) = input_manifest
         .get("schema_versions")
         .and_then(|v| v.as_object())
@@ -927,29 +974,35 @@ pub fn run_aggregator(args: &AppArgs) -> Result<Manifest, String> {
                 continue;
             }
             input_catalog_records += 1;
-            if let Ok(val) = serde_json::from_str::<serde_json::Value>(&content) {
-                let _valid = validate_input_record(
-                    line_num,
-                    "catalog-index.v0.jsonl",
-                    &val,
-                    "official-corpus-catalog.v0",
-                    "private_derived",
-                    args.fail_fast,
-                    &mut diagnostics,
-                    &mut missing_required_fields_count,
-                    &mut invalid_publicability_status_count,
-                )?;
-            } else {
-                diagnostics.push(DiagnosticRecord {
-                    schema_version: "official-corpus-profile-diagnostic.v0".to_string(),
-                    publicability_status: "private_diagnostic".to_string(),
-                    severity: "error".to_string(),
-                    code: "INVALID_JSON".to_string(),
-                    message: format!("Catalog line {} is invalid JSON", line_num),
-                    context: serde_json::json!({ "file": "catalog-index.v0.jsonl", "line": line_num }),
-                });
-                if args.fail_fast {
-                    return Err(format!("Invalid JSON in catalog at line {}", line_num));
+            match serde_json::from_str::<BaseRecordHeader>(&content) {
+                Ok(header) => {
+                    let _valid = validate_input_record(
+                        line_num,
+                        "catalog-index.v0.jsonl",
+                        &header,
+                        "official-corpus-catalog.v0",
+                        "private_derived",
+                        args.fail_fast,
+                        &mut diagnostics,
+                        &mut missing_required_fields_count,
+                        &mut invalid_publicability_status_count,
+                    )?;
+                }
+                Err(e) => {
+                    diagnostics.push(DiagnosticRecord {
+                        schema_version: "official-corpus-profile-diagnostic.v0".to_string(),
+                        publicability_status: "private_diagnostic".to_string(),
+                        severity: "error".to_string(),
+                        code: "INVALID_JSON".to_string(),
+                        message: format!("Catalog line {} is invalid JSON: {}", line_num, e),
+                        context: serde_json::json!({ "file": "catalog-index.v0.jsonl", "line": line_num }),
+                    });
+                    if args.fail_fast {
+                        return Err(format!(
+                            "Invalid JSON in catalog at line {}: {}",
+                            line_num, e
+                        ));
+                    }
                 }
             }
         }
@@ -968,29 +1021,35 @@ pub fn run_aggregator(args: &AppArgs) -> Result<Manifest, String> {
                 continue;
             }
             input_diagnostic_records += 1;
-            if let Ok(val) = serde_json::from_str::<serde_json::Value>(&content) {
-                let _valid = validate_input_record(
-                    line_num,
-                    "errors.v0.jsonl",
-                    &val,
-                    "official-corpus-error.v0",
-                    "private_diagnostic",
-                    args.fail_fast,
-                    &mut diagnostics,
-                    &mut missing_required_fields_count,
-                    &mut invalid_publicability_status_count,
-                )?;
-            } else {
-                diagnostics.push(DiagnosticRecord {
-                    schema_version: "official-corpus-profile-diagnostic.v0".to_string(),
-                    publicability_status: "private_diagnostic".to_string(),
-                    severity: "error".to_string(),
-                    code: "INVALID_JSON".to_string(),
-                    message: format!("Errors line {} is invalid JSON", line_num),
-                    context: serde_json::json!({ "file": "errors.v0.jsonl", "line": line_num }),
-                });
-                if args.fail_fast {
-                    return Err(format!("Invalid JSON in errors at line {}", line_num));
+            match serde_json::from_str::<BaseRecordHeader>(&content) {
+                Ok(header) => {
+                    let _valid = validate_input_record(
+                        line_num,
+                        "errors.v0.jsonl",
+                        &header,
+                        "official-corpus-error.v0",
+                        "private_diagnostic",
+                        args.fail_fast,
+                        &mut diagnostics,
+                        &mut missing_required_fields_count,
+                        &mut invalid_publicability_status_count,
+                    )?;
+                }
+                Err(e) => {
+                    diagnostics.push(DiagnosticRecord {
+                        schema_version: "official-corpus-profile-diagnostic.v0".to_string(),
+                        publicability_status: "private_diagnostic".to_string(),
+                        severity: "error".to_string(),
+                        code: "INVALID_JSON".to_string(),
+                        message: format!("Errors line {} is invalid JSON: {}", line_num, e),
+                        context: serde_json::json!({ "file": "errors.v0.jsonl", "line": line_num }),
+                    });
+                    if args.fail_fast {
+                        return Err(format!(
+                            "Invalid JSON in errors at line {}: {}",
+                            line_num, e
+                        ));
+                    }
                 }
             }
         }
@@ -1010,94 +1069,114 @@ pub fn run_aggregator(args: &AppArgs) -> Result<Manifest, String> {
                 continue;
             }
             input_chart_feature_records += 1;
-            let val: serde_json::Value = match serde_json::from_str(&content) {
-                Ok(v) => v,
-                Err(e) => {
-                    diagnostics.push(DiagnosticRecord {
-                        schema_version: "official-corpus-profile-diagnostic.v0".to_string(),
-                        publicability_status: "private_diagnostic".to_string(),
-                        severity: "error".to_string(),
-                        code: "INVALID_JSON".to_string(),
-                        message: format!("Chart features line {} is invalid JSON: {}", line_num, e),
-                        context: serde_json::json!({ "file": "single-chart-features.v0.jsonl", "line": line_num }),
-                    });
-                    if args.fail_fast {
-                        return Err(format!(
-                            "Invalid JSON in chart features at line {}",
-                            line_num
-                        ));
+
+            // Try direct deserialization first
+            match serde_json::from_str::<ChartFeatureRecord>(&content) {
+                Ok(record) => {
+                    let header = BaseRecordHeader {
+                        schema_version: Some(record.schema_version.clone()),
+                        publicability_status: Some(record.publicability_status.clone()),
+                    };
+
+                    let valid = validate_input_record(
+                        line_num,
+                        "single-chart-features.v0.jsonl",
+                        &header,
+                        "single-chart-features.v0",
+                        "private_derived",
+                        args.fail_fast,
+                        &mut diagnostics,
+                        &mut missing_required_fields_count,
+                        &mut invalid_publicability_status_count,
+                    )?;
+
+                    if !valid {
+                        skipped_records_count += 1;
+                        continue;
                     }
-                    continue;
+
+                    if record.mode != "Single" && record.stepstype != "pump-single" {
+                        diagnostics.push(DiagnosticRecord {
+                            schema_version: "official-corpus-profile-diagnostic.v0".to_string(),
+                            publicability_status: "private_diagnostic".to_string(),
+                            severity: "warning".to_string(),
+                            code: "UNSUPPORTED_PLAY_MODE".to_string(),
+                            message: format!("Unsupported play mode '{}' at line {}", record.mode, line_num),
+                            context: serde_json::json!({ "file": "single-chart-features.v0.jsonl", "line": line_num, "mode": record.mode }),
+                        });
+                        skipped_records_count += 1;
+                        continue;
+                    }
+
+                    if !args.level_range.contains(&record.meter) {
+                        diagnostics.push(DiagnosticRecord {
+                            schema_version: "official-corpus-profile-diagnostic.v0".to_string(),
+                            publicability_status: "private_diagnostic".to_string(),
+                            severity: "warning".to_string(),
+                            code: "INVALID_LEVEL".to_string(),
+                            message: format!("Level S{} at line {} out of range", record.meter, line_num),
+                            context: serde_json::json!({ "file": "single-chart-features.v0.jsonl", "line": line_num, "level": record.meter }),
+                        });
+                        skipped_records_count += 1;
+                        continue;
+                    }
+
+                    charts.push(record);
                 }
-            };
-
-            let valid = validate_input_record(
-                line_num,
-                "single-chart-features.v0.jsonl",
-                &val,
-                "single-chart-features.v0",
-                "private_derived",
-                args.fail_fast,
-                &mut diagnostics,
-                &mut missing_required_fields_count,
-                &mut invalid_publicability_status_count,
-            )?;
-
-            if !valid {
-                skipped_records_count += 1;
-                continue;
-            }
-
-            // Deserialize to concrete record
-            let record: ChartFeatureRecord = match serde_json::from_value(val) {
-                Ok(r) => r,
                 Err(e) => {
-                    diagnostics.push(DiagnosticRecord {
-                        schema_version: "official-corpus-profile-diagnostic.v0".to_string(),
-                        publicability_status: "private_diagnostic".to_string(),
-                        severity: "error".to_string(),
-                        code: "DESERIALIZATION_ERROR".to_string(),
-                        message: format!("Failed to deserialize chart record at line {}: {}", line_num, e),
-                        context: serde_json::json!({ "file": "single-chart-features.v0.jsonl", "line": line_num }),
-                    });
-                    if args.fail_fast {
-                        return Err(format!(
-                            "Deserialization error in chart features at line {}",
-                            line_num
-                        ));
+                    // Fall back to header-only parsing to diagnose the exact error
+                    match serde_json::from_str::<BaseRecordHeader>(&content) {
+                        Ok(header) => {
+                            let valid = validate_input_record(
+                                line_num,
+                                "single-chart-features.v0.jsonl",
+                                &header,
+                                "single-chart-features.v0",
+                                "private_derived",
+                                args.fail_fast,
+                                &mut diagnostics,
+                                &mut missing_required_fields_count,
+                                &mut invalid_publicability_status_count,
+                            )?;
+
+                            // If validation is Ok(true) but full deserialization failed, it's a field parsing error
+                            if valid {
+                                diagnostics.push(DiagnosticRecord {
+                                    schema_version: "official-corpus-profile-diagnostic.v0".to_string(),
+                                    publicability_status: "private_diagnostic".to_string(),
+                                    severity: "error".to_string(),
+                                    code: "DESERIALIZATION_ERROR".to_string(),
+                                    message: format!("Failed to deserialize chart record at line {}: {}", line_num, e),
+                                    context: serde_json::json!({ "file": "single-chart-features.v0.jsonl", "line": line_num }),
+                                });
+                                if args.fail_fast {
+                                    return Err(format!(
+                                        "Deserialization error in chart features at line {}",
+                                        line_num
+                                    ));
+                                }
+                            }
+                        }
+                        Err(header_err) => {
+                            diagnostics.push(DiagnosticRecord {
+                                schema_version: "official-corpus-profile-diagnostic.v0".to_string(),
+                                publicability_status: "private_diagnostic".to_string(),
+                                severity: "error".to_string(),
+                                code: "INVALID_JSON".to_string(),
+                                message: format!("Chart features line {} is invalid JSON: {}", line_num, header_err),
+                                context: serde_json::json!({ "file": "single-chart-features.v0.jsonl", "line": line_num }),
+                            });
+                            if args.fail_fast {
+                                return Err(format!(
+                                    "Invalid JSON in chart features at line {}",
+                                    line_num
+                                ));
+                            }
+                        }
                     }
                     skipped_records_count += 1;
-                    continue;
                 }
-            };
-
-            if record.mode != "Single" && record.stepstype != "pump-single" {
-                diagnostics.push(DiagnosticRecord {
-                    schema_version: "official-corpus-profile-diagnostic.v0".to_string(),
-                    publicability_status: "private_diagnostic".to_string(),
-                    severity: "warning".to_string(),
-                    code: "UNSUPPORTED_PLAY_MODE".to_string(),
-                    message: format!("Unsupported play mode '{}' at line {}", record.mode, line_num),
-                    context: serde_json::json!({ "file": "single-chart-features.v0.jsonl", "line": line_num, "mode": record.mode }),
-                });
-                skipped_records_count += 1;
-                continue;
             }
-
-            if !args.level_range.contains(&record.meter) {
-                diagnostics.push(DiagnosticRecord {
-                    schema_version: "official-corpus-profile-diagnostic.v0".to_string(),
-                    publicability_status: "private_diagnostic".to_string(),
-                    severity: "warning".to_string(),
-                    code: "INVALID_LEVEL".to_string(),
-                    message: format!("Level S{} at line {} out of range", record.meter, line_num),
-                    context: serde_json::json!({ "file": "single-chart-features.v0.jsonl", "line": line_num, "level": record.meter }),
-                });
-                skipped_records_count += 1;
-                continue;
-            }
-
-            charts.push(record);
         }
     }
 
@@ -1115,78 +1194,98 @@ pub fn run_aggregator(args: &AppArgs) -> Result<Manifest, String> {
                 continue;
             }
             input_window_feature_records += 1;
-            let val: serde_json::Value = match serde_json::from_str(&content) {
-                Ok(v) => v,
-                Err(e) => {
-                    diagnostics.push(DiagnosticRecord {
-                        schema_version: "official-corpus-profile-diagnostic.v0".to_string(),
-                        publicability_status: "private_diagnostic".to_string(),
-                        severity: "error".to_string(),
-                        code: "INVALID_JSON".to_string(),
-                        message: format!("Window features line {} is invalid JSON: {}", line_num, e),
-                        context: serde_json::json!({ "file": "single-window-features.v0.jsonl", "line": line_num }),
-                    });
-                    if args.fail_fast {
-                        return Err(format!(
-                            "Invalid JSON in window features at line {}",
-                            line_num
-                        ));
+
+            // Try direct deserialization first
+            match serde_json::from_str::<WindowFeatureRecord>(&content) {
+                Ok(record) => {
+                    let header = BaseRecordHeader {
+                        schema_version: Some(record.schema_version.clone()),
+                        publicability_status: Some(record.publicability_status.clone()),
+                    };
+
+                    let valid = validate_input_record(
+                        line_num,
+                        "single-window-features.v0.jsonl",
+                        &header,
+                        "single-window-features.v0",
+                        "private_derived",
+                        args.fail_fast,
+                        &mut diagnostics,
+                        &mut missing_required_fields_count,
+                        &mut invalid_publicability_status_count,
+                    )?;
+
+                    if !valid {
+                        skipped_records_count += 1;
+                        continue;
                     }
-                    continue;
+
+                    if record.mode != "Single" {
+                        skipped_records_count += 1;
+                        continue;
+                    }
+
+                    if !args.level_range.contains(&record.meter) {
+                        skipped_records_count += 1;
+                        continue;
+                    }
+
+                    windows.push(record);
                 }
-            };
-
-            let valid = validate_input_record(
-                line_num,
-                "single-window-features.v0.jsonl",
-                &val,
-                "single-window-features.v0",
-                "private_derived",
-                args.fail_fast,
-                &mut diagnostics,
-                &mut missing_required_fields_count,
-                &mut invalid_publicability_status_count,
-            )?;
-
-            if !valid {
-                skipped_records_count += 1;
-                continue;
-            }
-
-            // Deserialize to concrete record
-            let record: WindowFeatureRecord = match serde_json::from_value(val) {
-                Ok(r) => r,
                 Err(e) => {
-                    diagnostics.push(DiagnosticRecord {
-                        schema_version: "official-corpus-profile-diagnostic.v0".to_string(),
-                        publicability_status: "private_diagnostic".to_string(),
-                        severity: "error".to_string(),
-                        code: "DESERIALIZATION_ERROR".to_string(),
-                        message: format!("Failed to deserialize window record at line {}: {}", line_num, e),
-                        context: serde_json::json!({ "file": "single-window-features.v0.jsonl", "line": line_num }),
-                    });
-                    if args.fail_fast {
-                        return Err(format!(
-                            "Deserialization error in window features at line {}",
-                            line_num
-                        ));
+                    // Fall back to header-only parsing to diagnose the exact error
+                    match serde_json::from_str::<BaseRecordHeader>(&content) {
+                        Ok(header) => {
+                            let valid = validate_input_record(
+                                line_num,
+                                "single-window-features.v0.jsonl",
+                                &header,
+                                "single-window-features.v0",
+                                "private_derived",
+                                args.fail_fast,
+                                &mut diagnostics,
+                                &mut missing_required_fields_count,
+                                &mut invalid_publicability_status_count,
+                            )?;
+
+                            // If validation is Ok(true) but full deserialization failed, it's a field parsing error
+                            if valid {
+                                diagnostics.push(DiagnosticRecord {
+                                    schema_version: "official-corpus-profile-diagnostic.v0".to_string(),
+                                    publicability_status: "private_diagnostic".to_string(),
+                                    severity: "error".to_string(),
+                                    code: "DESERIALIZATION_ERROR".to_string(),
+                                    message: format!("Failed to deserialize window record at line {}: {}", line_num, e),
+                                    context: serde_json::json!({ "file": "single-window-features.v0.jsonl", "line": line_num }),
+                                });
+                                if args.fail_fast {
+                                    return Err(format!(
+                                        "Deserialization error in window features at line {}",
+                                        line_num
+                                    ));
+                                }
+                            }
+                        }
+                        Err(header_err) => {
+                            diagnostics.push(DiagnosticRecord {
+                                schema_version: "official-corpus-profile-diagnostic.v0".to_string(),
+                                publicability_status: "private_diagnostic".to_string(),
+                                severity: "error".to_string(),
+                                code: "INVALID_JSON".to_string(),
+                                message: format!("Window features line {} is invalid JSON: {}", line_num, header_err),
+                                context: serde_json::json!({ "file": "single-window-features.v0.jsonl", "line": line_num }),
+                            });
+                            if args.fail_fast {
+                                return Err(format!(
+                                    "Invalid JSON in window features at line {}",
+                                    line_num
+                                ));
+                            }
+                        }
                     }
                     skipped_records_count += 1;
-                    continue;
                 }
-            };
-
-            if record.mode != "Single" {
-                skipped_records_count += 1;
-                continue;
             }
-
-            if !args.level_range.contains(&record.meter) {
-                skipped_records_count += 1;
-                continue;
-            }
-
-            windows.push(record);
         }
     }
 
@@ -1225,7 +1324,11 @@ pub fn run_aggregator(args: &AppArgs) -> Result<Manifest, String> {
     let mut pattern_family_profile_records = 0;
     let mut style_archetype_profile_records = 0;
 
-    let mut calibration_thresholds = HashMap::new();
+    let mut level_profile_records_list = Vec::new();
+    let mut pattern_family_profiles_list = Vec::new();
+    let mut style_archetype_profiles_list = Vec::new();
+
+    let mut calibration_thresholds = BTreeMap::new();
 
     // Loop S1 to S26
     for level in args.level_range.clone() {
@@ -1273,14 +1376,14 @@ pub fn run_aggregator(args: &AppArgs) -> Result<Manifest, String> {
         }
 
         // Distributions
-        let mut song_type_distribution = HashMap::new();
+        let mut song_type_distribution = BTreeMap::new();
         for c in level_charts {
             *song_type_distribution
                 .entry(c.song_type.clone())
                 .or_insert(0) += 1;
         }
 
-        let mut pack_distribution = HashMap::new();
+        let mut pack_distribution = BTreeMap::new();
         for c in level_charts {
             *pack_distribution.entry(c.pack.clone()).or_insert(0) += 1;
         }
@@ -1647,11 +1750,10 @@ pub fn run_aggregator(args: &AppArgs) -> Result<Manifest, String> {
             notes: Vec::new(),
         };
 
-        let _ = write_jsonl_record(&mut l_file, &level_rec);
-        level_profile_records += 1;
+        level_profile_records_list.push(level_rec.clone());
 
         // Populate Calibration Threshold map
-        let mut density_thresh = HashMap::new();
+        let mut density_thresh = BTreeMap::new();
         density_thresh.insert(
             "typical_p50".to_string(),
             level_rec
@@ -1674,7 +1776,7 @@ pub fn run_aggregator(args: &AppArgs) -> Result<Manifest, String> {
                 .p95,
         );
 
-        let mut jump_thresh = HashMap::new();
+        let mut jump_thresh = BTreeMap::new();
         jump_thresh.insert(
             "warning_p90".to_string(),
             level_rec.chart_feature_profile.tech_jump_ratio.p90,
@@ -1684,7 +1786,7 @@ pub fn run_aggregator(args: &AppArgs) -> Result<Manifest, String> {
             level_rec.chart_feature_profile.tech_jump_ratio.p95,
         );
 
-        let mut twist_thresh = HashMap::new();
+        let mut twist_thresh = BTreeMap::new();
         twist_thresh.insert(
             "warning_p90".to_string(),
             level_rec
@@ -1700,7 +1802,7 @@ pub fn run_aggregator(args: &AppArgs) -> Result<Manifest, String> {
                 .p95,
         );
 
-        let mut bracket_thresh = HashMap::new();
+        let mut bracket_thresh = BTreeMap::new();
         bracket_thresh.insert(
             "warning_p90".to_string(),
             level_rec
@@ -1725,6 +1827,11 @@ pub fn run_aggregator(args: &AppArgs) -> Result<Manifest, String> {
                 bracket_candidate_rate: bracket_thresh,
             },
         );
+    }
+
+    for level_rec in &level_profile_records_list {
+        let _ = write_jsonl_record(&mut l_file, level_rec);
+        level_profile_records += 1;
     }
 
     // Pattern families calculations
@@ -1842,8 +1949,8 @@ pub fn run_aggregator(args: &AppArgs) -> Result<Manifest, String> {
             };
 
             // Calculate feature signature primary/secondary metrics
-            let mut primary_metrics = HashMap::new();
-            let mut secondary_metrics = HashMap::new();
+            let mut primary_metrics = BTreeMap::new();
+            let mut secondary_metrics = BTreeMap::new();
 
             if f_window_count > 0 {
                 let densities: Vec<f64> = f_windows
@@ -2029,9 +2136,18 @@ pub fn run_aggregator(args: &AppArgs) -> Result<Manifest, String> {
                 generation_guidance: guidance,
             };
 
-            let _ = write_jsonl_record(&mut f_file, &fam_rec);
-            pattern_family_profile_records += 1;
+            pattern_family_profiles_list.push(fam_rec);
         }
+    }
+
+    pattern_family_profiles_list.sort_by(|a, b| {
+        a.pattern_family
+            .cmp(&b.pattern_family)
+            .then(a.level.cmp(&b.level))
+    });
+    for fam_rec in &pattern_family_profiles_list {
+        let _ = write_jsonl_record(&mut f_file, fam_rec);
+        pattern_family_profile_records += 1;
     }
 
     // Style archetype profiles
@@ -2172,7 +2288,7 @@ pub fn run_aggregator(args: &AppArgs) -> Result<Manifest, String> {
                 .sum::<f64>()
                 / arch_chart_count as f64;
 
-            let mut feature_signature = HashMap::new();
+            let mut feature_signature = BTreeMap::new();
             feature_signature.insert(
                 "density_notes_per_measure".to_string(),
                 (avg_dens * 100.0).round() / 100.0,
@@ -2299,9 +2415,31 @@ pub fn run_aggregator(args: &AppArgs) -> Result<Manifest, String> {
                 guardrail_warnings: Vec::new(),
             };
 
-            let _ = write_jsonl_record(&mut a_file, &arch_rec);
-            style_archetype_profile_records += 1;
+            style_archetype_profiles_list.push(arch_rec);
         }
+    }
+
+    let band_order = |band: &str| -> usize {
+        match band {
+            "S1-S6" => 0,
+            "S7-S10" => 1,
+            "S11-S14" => 2,
+            "S15-S18" => 3,
+            "S19-S22" => 4,
+            "S23-S26" => 5,
+            _ => 6,
+        }
+    };
+
+    style_archetype_profiles_list.sort_by(|a, b| {
+        band_order(&a.level_band)
+            .cmp(&band_order(&b.level_band))
+            .then(a.style_archetype.cmp(&b.style_archetype))
+    });
+
+    for arch_rec in &style_archetype_profiles_list {
+        let _ = write_jsonl_record(&mut a_file, arch_rec);
+        style_archetype_profile_records += 1;
     }
 
     // Flush and close all files
@@ -2309,8 +2447,177 @@ pub fn run_aggregator(args: &AppArgs) -> Result<Manifest, String> {
     drop(f_file);
     drop(a_file);
 
+    // Pattern Family Thresholds Calibration
+    let mut pattern_family_thresholds = BTreeMap::new();
+    for fam in &families {
+        let fam_str = fam.to_string();
+
+        let fam_windows: Vec<&WindowFeatureRecord> = windows
+            .iter()
+            .filter(|w| classify_window_families(w).contains(fam))
+            .collect();
+
+        let sample_count = fam_windows.len();
+        let sample_confidence = if sample_count >= 50 {
+            "high".to_string()
+        } else if sample_count >= 10 {
+            "medium".to_string()
+        } else {
+            "low".to_string()
+        };
+
+        let metrics_vec: Vec<f64> = fam_windows
+            .iter()
+            .map(|w| match fam_str.as_str() {
+                "stream" => w.tech_estimates.stream_score,
+                "jump_accent" => {
+                    if w.active_row_count > 0 {
+                        w.jump_count as f64 / w.active_row_count as f64
+                    } else {
+                        0.0
+                    }
+                }
+                "twist_technical" => w.tech_estimates.twist_candidate_score,
+                "bracket_technical" => w.tech_estimates.bracket_candidate_count as f64,
+                "hold_control" => {
+                    if w.active_row_count > 0 {
+                        w.hold_start_count as f64 / w.active_row_count as f64
+                    } else {
+                        0.0
+                    }
+                }
+                "center_control" => w.tech_estimates.center_usage_ratio,
+                "stamina" => w.tech_estimates.local_difficulty_estimate,
+                "balanced" => w.density.notes_per_measure,
+                _ => w.row_count as f64,
+            })
+            .collect();
+
+        let metric_stats = compute_stats(&metrics_vec);
+
+        let (rule, thresholds) = match fam_str.as_str() {
+            "stream" => {
+                let mut m = BTreeMap::new();
+                m.insert("stream_score".to_string(), 0.50);
+                ("stream_score >= 0.50".to_string(), m)
+            }
+            "jump_accent" => {
+                let mut m = BTreeMap::new();
+                m.insert("jump_ratio".to_string(), 0.20);
+                ("jump_ratio >= 0.20".to_string(), m)
+            }
+            "twist_technical" => {
+                let mut m = BTreeMap::new();
+                m.insert("twist_candidate_score".to_string(), 0.20);
+                ("twist_candidate_score >= 0.20".to_string(), m)
+            }
+            "bracket_technical" => {
+                let mut m = BTreeMap::new();
+                m.insert("bracket_candidate_count".to_string(), 3.0);
+                ("bracket_candidate_count >= 3".to_string(), m)
+            }
+            "hold_control" => {
+                let mut m = BTreeMap::new();
+                m.insert("hold_ratio".to_string(), 0.30);
+                ("hold_ratio >= 0.30".to_string(), m)
+            }
+            "center_control" => {
+                let mut m = BTreeMap::new();
+                m.insert("center_usage_ratio".to_string(), 0.40);
+                ("center_usage_ratio >= 0.40".to_string(), m)
+            }
+            "stamina" => {
+                let mut m = BTreeMap::new();
+                m.insert("local_difficulty_estimate".to_string(), 16.0);
+                m.insert("stream_score".to_string(), 0.45);
+                (
+                    "local_difficulty_estimate >= 16.0 && stream_score >= 0.45".to_string(),
+                    m,
+                )
+            }
+            "balanced" => (
+                "active_rows > 0 && no other family matches".to_string(),
+                BTreeMap::new(),
+            ),
+            _ => ("active_rows == 0".to_string(), BTreeMap::new()),
+        };
+
+        let guidance = match fam_str.as_str() {
+            "stream" => (
+                vec![
+                    "Building running streams".to_string(),
+                    "Increasing stamina requirements".to_string(),
+                ],
+                vec!["Low level charts under S7 where players lack physical speed".to_string()],
+                vec!["Keep streams uninterrupted under 16 active rows at lower levels".to_string()],
+            ),
+            "jump_accent" => (
+                vec!["Adding impact on heavy musical beats or downbeats".to_string()],
+                vec!["High-speed streams where consecutive jumps cause exhaustion".to_string()],
+                vec!["Avoid consecutive jumps under level 16".to_string()],
+            ),
+            "twist_technical" => (
+                vec!["Creating directional transitions and flow changes".to_string()],
+                vec!["Very high speeds where player cannot safely rotate hips".to_string()],
+                vec!["Twists require alternating feet to avoid double-stepping".to_string()],
+            ),
+            "bracket_technical" => (
+                vec!["Level 16+ where double steps or multi-panel taps are introduced".to_string()],
+                vec!["Low levels under S12 where players expect single-note panels".to_string()],
+                vec!["Use brackets primarily on corner panels".to_string()],
+            ),
+            "hold_control" => (
+                vec!["Resting sections or slow pacing segments".to_string()],
+                vec![
+                    "Intense technical streams where holding a foot locks player mobility"
+                        .to_string(),
+                ],
+                vec!["Ensure free foot has accessible patterns".to_string()],
+            ),
+            "center_control" => (
+                vec!["Pacing transitions or low-intensity bridge sections".to_string()],
+                vec!["Technical streams requiring rapid side-to-side transitions".to_string()],
+                vec!["Center panel is a neutral pivot point".to_string()],
+            ),
+            "stamina" => (
+                vec!["Endgame boss sections or high-difficulty stamina tests".to_string()],
+                vec!["Low difficulty levels under S15".to_string()],
+                vec![
+                    "Ensure rests are provided before and after stamina burst segments".to_string(),
+                ],
+            ),
+            _ => (
+                vec!["Standard chart progression".to_string()],
+                vec!["Highly specialized technical styles".to_string()],
+                vec!["Maintains average baseline metrics".to_string()],
+            ),
+        };
+
+        pattern_family_thresholds.insert(
+            fam_str.clone(),
+            FamilyCalibrationSignal {
+                pattern_family: fam_str.clone(),
+                classification_rule: rule,
+                classifier_thresholds: thresholds,
+                sample_count,
+                sample_confidence,
+                typical_level_range: family_level_ranges.get(&fam_str).cloned().unwrap_or(
+                    TypicalLevelRange {
+                        min: 0,
+                        median: 0,
+                        max: 0,
+                    },
+                ),
+                metric_stats,
+                recommended_when: guidance.0,
+                avoid_when: guidance.1,
+                guardrail_notes: guidance.2,
+            },
+        );
+    }
+
     // Write Guardrail Calibration JSON
-    let mut confidence_policy = HashMap::new();
+    let mut confidence_policy = BTreeMap::new();
     confidence_policy.insert("high".to_string(), "n >= 50".to_string());
     confidence_policy.insert("medium".to_string(), "10 <= n < 50".to_string());
     confidence_policy.insert("low".to_string(), "n < 10".to_string());
@@ -2325,6 +2632,7 @@ pub fn run_aggregator(args: &AppArgs) -> Result<Manifest, String> {
             "total_windows": windows.len(),
         }),
         level_thresholds: calibration_thresholds,
+        pattern_family_thresholds,
         confidence_policy,
         recommended_runtime_usage: vec![
             "Use p50-p75 as default generation target.".to_string(),
@@ -3227,6 +3535,327 @@ mod tests {
             fs::read_to_string(args.output_root.join("diagnostics.v0.jsonl")).unwrap();
         assert!(diag_content.contains("LOW_SAMPLE_SIZE"));
         assert!(diag_content.contains("Level S26"));
+
+        let _ = fs::remove_dir_all(&temp);
+    }
+
+    #[test]
+    fn test_perform_self_audit_catches_forbidden_patterns() {
+        let temp = get_temp_dir("self_audit_check");
+        let output_root = temp.join("output");
+        fs::create_dir_all(&output_root).unwrap();
+
+        // Write a valid dummy file
+        fs::write(output_root.join("manifest.v0.json"), "{}").unwrap();
+
+        // Write a file with a forbidden pattern
+        fs::write(
+            output_root.join("single-level-profiles.v0.jsonl"),
+            "some prefix #TITLE: forbidden suffix",
+        )
+        .unwrap();
+
+        // Run self audit, it should fail
+        let result = perform_self_audit(&output_root);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("PRIVACY VIOLATION"));
+
+        // Clean up
+        let _ = fs::remove_dir_all(&temp);
+    }
+
+    #[test]
+    fn test_schema_mismatch_skips_record() {
+        let val = BaseRecordHeader {
+            schema_version: Some("incorrect-schema.v0".to_string()),
+            publicability_status: Some("private_derived".to_string()),
+        };
+        let mut diagnostics = Vec::new();
+        let mut missing_fields = 0;
+        let mut invalid_status = 0;
+
+        let result = validate_input_record(
+            1,
+            "test_file.jsonl",
+            &val,
+            "expected-schema.v0",
+            "private_derived",
+            false,
+            &mut diagnostics,
+            &mut missing_fields,
+            &mut invalid_status,
+        );
+
+        assert_eq!(result, Ok(false));
+        assert_eq!(diagnostics.len(), 1);
+        assert_eq!(diagnostics[0].code, "UNSUPPORTED_SCHEMA_VERSION");
+    }
+
+    #[test]
+    fn test_schema_mismatch_aborts_immediately() {
+        let val = BaseRecordHeader {
+            schema_version: Some("incorrect-schema.v0".to_string()),
+            publicability_status: Some("private_derived".to_string()),
+        };
+        let mut diagnostics = Vec::new();
+        let mut missing_fields = 0;
+        let mut invalid_status = 0;
+
+        let result = validate_input_record(
+            1,
+            "test_file.jsonl",
+            &val,
+            "expected-schema.v0",
+            "private_derived",
+            true,
+            &mut diagnostics,
+            &mut missing_fields,
+            &mut invalid_status,
+        );
+
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("Incorrect schema_version"));
+    }
+
+    #[test]
+    fn test_outputs_are_stable_and_deterministic() {
+        let temp = get_temp_dir("stability");
+        let ds_root = temp.join("dataset");
+        fs::create_dir_all(&ds_root).unwrap();
+
+        // Write small chart features
+        let mut chart_file = File::create(ds_root.join("single-chart-features.v0.jsonl")).unwrap();
+        let chart = serde_json::json!({
+            "schema_version": "single-chart-features.v0",
+            "song_id": "song1",
+            "chart_id": "chart1",
+            "pack": "Pack1",
+            "title": "Title",
+            "artist": "Artist",
+            "song_type": "ARCADE",
+            "stepstype": "pump-single",
+            "mode": "Single",
+            "meter": 14,
+            "description": "s14",
+            "credit": "Credit",
+            "stepmaker_candidate": "Credit",
+            "timing_summary": {
+                "initial_bpm": 150.0,
+                "min_bpm": 150.0,
+                "max_bpm": 150.0,
+                "display_bpm": "150",
+                "offset": -0.1,
+                "has_timing_gimmicks": false
+            },
+            "measure_count": 80,
+            "row_count": 320,
+            "active_row_count": 160,
+            "empty_row_count": 160,
+            "tap_count": 200,
+            "hold_start_count": 10,
+            "hold_end_count": 10,
+            "jump_count": 15,
+            "triple_count": 0,
+            "quad_or_more_count": 0,
+            "center_note_count": 40,
+            "panel_counts": [30, 30, 40, 30, 30],
+            "density": {
+                "notes_per_measure": 2.5,
+                "active_rows_per_measure": 2.0,
+                "jumps_per_measure": 0.2,
+                "holds_per_measure": 0.1
+            },
+            "streams": {
+                "max_consecutive_active_rows": 8,
+                "estimated_stream_windows": 2
+            },
+            "rests": {
+                "empty_measure_count": 10,
+                "max_consecutive_empty_measures": 3,
+                "rest_measure_ratio": 0.125
+            },
+            "tech_estimates": {
+                "center_usage_ratio": 0.2,
+                "jump_ratio": 0.1,
+                "triple_ratio": 0.0,
+                "bracket_candidate_count": 0,
+                "twist_candidate_score": 0.05,
+                "stamina_score": 0.3,
+                "local_difficulty_estimate": 14.0
+            },
+            "flags": {
+                "has_mines": false,
+                "has_unsupported_rows": false,
+                "has_timing_gimmicks": false
+            },
+            "publicability_status": "private_derived"
+        });
+        write_jsonl_record(&mut chart_file, &chart).unwrap();
+        drop(chart_file);
+
+        // Run aggregator twice
+        let output1 = temp.join("output1");
+        let args1 = AppArgs {
+            dataset_root: ds_root.clone(),
+            output_root: output1.clone(),
+            pretty: false,
+            fail_fast: false,
+            min_sample_size: 10,
+            level_range: 1..=26,
+        };
+        let _ = run_aggregator(&args1).unwrap();
+
+        let output2 = temp.join("output2");
+        let args2 = AppArgs {
+            dataset_root: ds_root.clone(),
+            output_root: output2.clone(),
+            pretty: false,
+            fail_fast: false,
+            min_sample_size: 10,
+            level_range: 1..=26,
+        };
+        let _ = run_aggregator(&args2).unwrap();
+
+        // Compare all files
+        let files = [
+            "manifest.v0.json",
+            "single-level-profiles.v0.jsonl",
+            "single-pattern-family-profiles.v0.jsonl",
+            "single-style-archetype-profiles.v0.jsonl",
+            "single-guardrail-calibration.v0.json",
+            "diagnostics.v0.jsonl",
+        ];
+        for f in &files {
+            let content1 = fs::read(output1.join(f)).unwrap();
+            let content2 = fs::read(output2.join(f)).unwrap();
+            if *f == "manifest.v0.json" {
+                let mut v1: serde_json::Value = serde_json::from_slice(&content1).unwrap();
+                let mut v2: serde_json::Value = serde_json::from_slice(&content2).unwrap();
+                if let Some(obj) = v1.as_object_mut() {
+                    obj.remove("generated_at_utc");
+                    obj.remove("duration_seconds");
+                }
+                if let Some(obj) = v2.as_object_mut() {
+                    obj.remove("generated_at_utc");
+                    obj.remove("duration_seconds");
+                }
+                assert_eq!(
+                    v1, v2,
+                    "manifest.v0.json mismatches (excluding dynamic fields)"
+                );
+            } else {
+                assert_eq!(
+                    content1, content2,
+                    "File {} is not byte-for-byte identical!",
+                    f
+                );
+            }
+        }
+
+        let _ = fs::remove_dir_all(&temp);
+    }
+
+    #[test]
+    fn test_pattern_family_thresholds_calibration() {
+        let temp = get_temp_dir("family_thresholds");
+        let ds_root = temp.join("dataset");
+        fs::create_dir_all(&ds_root).unwrap();
+
+        // Write small chart features
+        let mut chart_file = File::create(ds_root.join("single-chart-features.v0.jsonl")).unwrap();
+        let chart = serde_json::json!({
+            "schema_version": "single-chart-features.v0",
+            "song_id": "song1",
+            "chart_id": "chart1",
+            "pack": "Pack1",
+            "title": "Title",
+            "artist": "Artist",
+            "song_type": "ARCADE",
+            "stepstype": "pump-single",
+            "mode": "Single",
+            "meter": 14,
+            "description": "s14",
+            "credit": "Credit",
+            "stepmaker_candidate": "Credit",
+            "timing_summary": {
+                "initial_bpm": 150.0,
+                "min_bpm": 150.0,
+                "max_bpm": 150.0,
+                "display_bpm": "150",
+                "offset": -0.1,
+                "has_timing_gimmicks": false
+            },
+            "measure_count": 80,
+            "row_count": 320,
+            "active_row_count": 160,
+            "empty_row_count": 160,
+            "tap_count": 200,
+            "hold_start_count": 10,
+            "hold_end_count": 10,
+            "jump_count": 15,
+            "triple_count": 0,
+            "quad_or_more_count": 0,
+            "center_note_count": 40,
+            "panel_counts": [30, 30, 40, 30, 30],
+            "density": {
+                "notes_per_measure": 2.5,
+                "active_rows_per_measure": 2.0,
+                "jumps_per_measure": 0.2,
+                "holds_per_measure": 0.1
+            },
+            "streams": {
+                "max_consecutive_active_rows": 8,
+                "estimated_stream_windows": 2
+            },
+            "rests": {
+                "empty_measure_count": 10,
+                "max_consecutive_empty_measures": 3,
+                "rest_measure_ratio": 0.125
+            },
+            "tech_estimates": {
+                "center_usage_ratio": 0.2,
+                "jump_ratio": 0.1,
+                "triple_ratio": 0.0,
+                "bracket_candidate_count": 0,
+                "twist_candidate_score": 0.05,
+                "stamina_score": 0.3,
+                "local_difficulty_estimate": 14.0
+            },
+            "flags": {
+                "has_mines": false,
+                "has_unsupported_rows": false,
+                "has_timing_gimmicks": false
+            },
+            "publicability_status": "private_derived"
+        });
+        write_jsonl_record(&mut chart_file, &chart).unwrap();
+        drop(chart_file);
+
+        let args = AppArgs {
+            dataset_root: ds_root,
+            output_root: temp.join("output"),
+            pretty: false,
+            fail_fast: false,
+            min_sample_size: 10,
+            level_range: 1..=26,
+        };
+
+        let _ = run_aggregator(&args).unwrap();
+
+        let calib_content = fs::read_to_string(
+            args.output_root
+                .join("single-guardrail-calibration.v0.json"),
+        )
+        .unwrap();
+        let val: serde_json::Value = serde_json::from_str(&calib_content).unwrap();
+
+        assert!(val.get("pattern_family_thresholds").is_some());
+        let fam_thresh = &val["pattern_family_thresholds"];
+        assert!(fam_thresh.get("stream").is_some());
+        assert_eq!(
+            fam_thresh["stream"]["classification_rule"].as_str(),
+            Some("stream_score >= 0.50")
+        );
 
         let _ = fs::remove_dir_all(&temp);
     }

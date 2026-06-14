@@ -390,10 +390,12 @@ fn compute_sha256_hex(s: &str) -> String {
 }
 
 fn compute_hash(s: &str) -> String {
-    let mut hasher = Sha256::new();
-    hasher.update(s.as_bytes());
-    let result = hasher.finalize();
-    hex::encode(&result[..8]) // 16 hex chars
+    let mut hash: u64 = 0xcbf29ce484222325;
+    for &byte in s.as_bytes() {
+        hash ^= byte as u64;
+        hash = hash.wrapping_mul(0x100000001b3);
+    }
+    format!("{:016x}", hash)
 }
 
 fn has_gimmick_content(val: &str) -> bool {
@@ -1028,13 +1030,13 @@ pub fn run_factory(args: &AppArgs) -> Result<Manifest, String> {
                                 let mut window_rows = Vec::new();
                                 for m in start_measure..=end_measure {
                                     for row in &measures[m] {
-                                        window_rows.push(row.clone());
+                                        window_rows.push(row);
                                     }
                                 }
 
                                 let w_row_count = window_rows.len();
                                 let w_active_row_count =
-                                    window_rows.iter().filter(|r| is_active_row(r)).count();
+                                    window_rows.iter().filter(|r| is_active_row(*r)).count();
 
                                 if w_active_row_count >= 24 {
                                     estimated_stream_windows += 1;
@@ -1048,6 +1050,7 @@ pub fn run_factory(args: &AppArgs) -> Result<Manifest, String> {
                                 let mut w_bracket_count = 0;
 
                                 for row in &window_rows {
+                                    let row = *row;
                                     let mut active_in_row = 0;
                                     let mut active_indices = Vec::new();
                                     for (i, c) in row.chars().enumerate() {
@@ -1102,6 +1105,7 @@ pub fn run_factory(args: &AppArgs) -> Result<Manifest, String> {
                                 let mut w_total_triplets = 0;
                                 let mut w_single_notes = Vec::new();
                                 for row in &window_rows {
+                                    let row = *row;
                                     let active_indices: Vec<usize> = row
                                         .chars()
                                         .enumerate()
@@ -1149,6 +1153,7 @@ pub fn run_factory(args: &AppArgs) -> Result<Manifest, String> {
                                 let mut normalized_rows = Vec::new();
                                 let mut mirrored_rows = Vec::new();
                                 for row in &window_rows {
+                                    let row = *row;
                                     let mut norm = String::new();
                                     let mut mirr = String::new();
                                     let chars: Vec<char> = row.chars().collect();
@@ -1181,8 +1186,11 @@ pub fn run_factory(args: &AppArgs) -> Result<Manifest, String> {
                                     if h1 < h2 { h1.clone() } else { h2 };
 
                                 // Repeated row motif score
-                                let w_active_rows: Vec<&String> =
-                                    window_rows.iter().filter(|r| is_active_row(r)).collect();
+                                let w_active_rows: Vec<&String> = window_rows
+                                    .iter()
+                                    .filter(|r| is_active_row(*r))
+                                    .copied()
+                                    .collect();
                                 let w_active_count = w_active_rows.len();
                                 let w_unique_count = if w_active_count > 0 {
                                     let mut unique = w_active_rows.clone();
