@@ -150,6 +150,7 @@ pub struct CalibratedPromptContext {
     pub guardrail_threshold_summary: GuardrailThresholdSummary,
     pub prompt_instructions: Vec<String>,
     pub warnings: Vec<String>,
+    pub continuity_context: Option<crate::section_continuity::ContinuityContextSummary>,
 }
 
 pub fn classify_browser_bpm_reconciliation_status(recon: &str) -> Option<bool> {

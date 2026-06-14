@@ -5,7 +5,9 @@ import {
   isPreviewStale,
   validateMeasureRange,
   groupValidationIssues,
-  getPatternFamilyLabel
+  getPatternFamilyLabel,
+  getMotifStrategyLabel,
+  getTransitionTypeLabel
 } from "../ProjectWorkspaceHelpers.ts";
 import type {
   PreviewParams,
@@ -113,7 +115,8 @@ test("isPreviewStale stale state checking", () => {
     useBrowserBpm: true,
     selectedSectionKey: "chorus_1",
     useCalibratedPromptContext: true,
-    patternFamilyTarget: "auto"
+    patternFamilyTarget: "auto",
+    useContinuityPlanning: true
   };
 
   const currentSame: PreviewParams = { ...snapshot };
@@ -127,6 +130,7 @@ test("isPreviewStale stale state checking", () => {
   const currentDiffSectionKey: PreviewParams = { ...snapshot, selectedSectionKey: "custom" };
   const currentDiffCalib: PreviewParams = { ...snapshot, useCalibratedPromptContext: false };
   const currentDiffTarget: PreviewParams = { ...snapshot, patternFamilyTarget: "stream" };
+  const currentDiffContinuity: PreviewParams = { ...snapshot, useContinuityPlanning: false };
 
   // Null snapshot -> not stale
   assert.strictEqual(isPreviewStale(null, snapshot), false);
@@ -163,6 +167,9 @@ test("isPreviewStale stale state checking", () => {
 
   // Changed patternFamilyTarget -> stale
   assert.strictEqual(isPreviewStale(snapshot, currentDiffTarget), true);
+
+  // Changed useContinuityPlanning -> stale
+  assert.strictEqual(isPreviewStale(snapshot, currentDiffContinuity), true);
 });
 
 test("getPatternFamilyLabel mappings", () => {
@@ -177,5 +184,19 @@ test("getPatternFamilyLabel mappings", () => {
   assert.strictEqual(getPatternFamilyLabel("center_control"), "Center Control");
   assert.strictEqual(getPatternFamilyLabel("stamina"), "Stamina");
   assert.strictEqual(getPatternFamilyLabel("unknown_family"), "Unknown Family");
+});
+
+test("getMotifStrategyLabel mappings", () => {
+  assert.strictEqual(getMotifStrategyLabel("introduce"), "Introduce");
+  assert.strictEqual(getMotifStrategyLabel("develop"), "Develop");
+  assert.strictEqual(getMotifStrategyLabel("final_burst"), "Final Burst");
+  assert.strictEqual(getMotifStrategyLabel("unknown_strategy"), "Unknown_strategy");
+});
+
+test("getTransitionTypeLabel mappings", () => {
+  assert.strictEqual(getTransitionTypeLabel("smooth_continue"), "Smooth Continue");
+  assert.strictEqual(getTransitionTypeLabel("density_ramp_up"), "Density Ramp Up");
+  assert.strictEqual(getTransitionTypeLabel("climax_entry"), "Climax Entry");
+  assert.strictEqual(getTransitionTypeLabel("unknown_transition"), "Unknown Transition");
 });
 

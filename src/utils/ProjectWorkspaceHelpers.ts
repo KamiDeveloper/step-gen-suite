@@ -9,6 +9,7 @@ export interface PreviewParams {
   selectedSectionKey: string;
   useCalibratedPromptContext: boolean;
   patternFamilyTarget: string;
+  useContinuityPlanning: boolean;
 }
 
 export interface IValidationIssue {
@@ -64,7 +65,8 @@ export function isPreviewStale(
     snapshot.useBrowserBpm !== current.useBrowserBpm ||
     snapshot.selectedSectionKey !== current.selectedSectionKey ||
     snapshot.useCalibratedPromptContext !== current.useCalibratedPromptContext ||
-    snapshot.patternFamilyTarget !== current.patternFamilyTarget
+    snapshot.patternFamilyTarget !== current.patternFamilyTarget ||
+    snapshot.useContinuityPlanning !== current.useContinuityPlanning
   );
 }
 
@@ -132,6 +134,59 @@ export function getPatternFamilyLabel(family: string): string {
     default:
       // Capitalize first letters as fallback
       return family
+        .split(/[_-]/)
+        .map((word) => word.charAt(0).toUpperCase() + word.slice(1).toLowerCase())
+        .join(" ");
+  }
+}
+
+/**
+ * Returns a human-friendly label for a given motif strategy.
+ */
+export function getMotifStrategyLabel(strategy: string): string {
+  const normalized = strategy.toLowerCase().trim();
+  switch (normalized) {
+    case "introduce":
+      return "Introduce";
+    case "develop":
+      return "Develop";
+    case "intensify":
+      return "Intensify";
+    case "contrast":
+      return "Contrast";
+    case "rest":
+      return "Rest";
+    case "callback":
+      return "Callback";
+    case "resolve":
+      return "Resolve";
+    case "final_burst":
+      return "Final Burst";
+    default:
+      return strategy.charAt(0).toUpperCase() + strategy.slice(1).toLowerCase();
+  }
+}
+
+/**
+ * Returns a human-friendly label for a given transition type.
+ */
+export function getTransitionTypeLabel(type: string): string {
+  const normalized = type.toLowerCase().trim();
+  switch (normalized) {
+    case "smooth_continue":
+      return "Smooth Continue";
+    case "density_ramp_up":
+      return "Density Ramp Up";
+    case "density_ramp_down":
+      return "Density Ramp Down";
+    case "contrast_break":
+      return "Contrast Break";
+    case "climax_entry":
+      return "Climax Entry";
+    case "final_resolution":
+      return "Final Resolution";
+    default:
+      return type
         .split(/[_-]/)
         .map((word) => word.charAt(0).toUpperCase() + word.slice(1).toLowerCase())
         .join(" ");

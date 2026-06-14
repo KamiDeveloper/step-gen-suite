@@ -5,6 +5,7 @@ pub mod gemini;
 pub mod generation_context;
 pub mod guardrail_calibration;
 pub mod music_analysis;
+pub mod section_continuity;
 pub mod settings;
 pub mod ssc;
 

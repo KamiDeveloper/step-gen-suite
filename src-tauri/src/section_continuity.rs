@@ -65,6 +65,12 @@ pub struct ContinuityContextSummary {
     pub transition_out: Option<TransitionGuidance>,
     pub neighbor_summary: NeighborSummaryGroup,
     pub warnings: Vec<String>,
+    pub current_primary_pattern_family: String,
+    pub current_secondary_pattern_families: Vec<String>,
+    pub current_avoid_pattern_families: Vec<String>,
+    pub current_intensity_band: String,
+    pub current_density_intent: String,
+    pub current_confidence: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -654,7 +660,6 @@ mod tests {
     use crate::biomechanics::PlayMode;
     use crate::music_analysis::{ChoreographicIntentMap, SectionFrame, SongAnalysisReport};
     use crate::ssc::parser::SscDocument;
-    use std::io::Write;
 
     fn make_mock_report() -> SongAnalysisReport {
         SongAnalysisReport {
@@ -1035,6 +1040,12 @@ mod tests {
                 next: None,
             },
             warnings: vec![],
+            current_primary_pattern_family: node.primary_pattern_family.clone(),
+            current_secondary_pattern_families: node.secondary_pattern_families.clone(),
+            current_avoid_pattern_families: node.avoid_pattern_families.clone(),
+            current_intensity_band: node.intensity_band.clone(),
+            current_density_intent: node.density_intent.clone(),
+            current_confidence: node.confidence.clone(),
         };
         let serialized = serde_json::to_string(&summary).unwrap();
         assert!(crate::generation_context::self_audit_prompt_context(&serialized).is_ok());
@@ -1166,6 +1177,7 @@ mod tests {
         .unwrap();
 
         assert!(!result.written);
+        mock_post.assert_async().await;
 
         let doc = SscDocument::parse(&temp_ssc_path).unwrap();
         assert!(doc.charts.is_empty());
@@ -1212,5 +1224,55 @@ mod tests {
         assert!(result.unwrap_err().contains("fingerprint"));
 
         let _ = std::fs::remove_file(temp_ssc_path);
+    }
+
+    #[test]
+    fn test_continuity_context_includes_current_effective_family_and_intensity() {
+        let report = make_mock_report();
+        let plan = build_song_continuity_plan(
+            10,
+            PlayMode::Single,
+            Some(&report),
+            None,
+            None,
+            "sec_verse",
+            8,
+            24,
+        );
+        let node = &plan.sections[1];
+        let summary = ContinuityContextSummary {
+            enabled: true,
+            section_index: node.section_index,
+            section_count: plan.section_count,
+            global_arc: plan.global_arc.arc_type.clone(),
+            current_motif_strategy: node.motif_strategy.clone(),
+            transition_in: Some(node.transition_in.clone()),
+            transition_out: Some(node.transition_out.clone()),
+            neighbor_summary: NeighborSummaryGroup {
+                previous: None,
+                next: None,
+            },
+            warnings: vec![],
+            current_primary_pattern_family: node.primary_pattern_family.clone(),
+            current_secondary_pattern_families: node.secondary_pattern_families.clone(),
+            current_avoid_pattern_families: node.avoid_pattern_families.clone(),
+            current_intensity_band: node.intensity_band.clone(),
+            current_density_intent: node.density_intent.clone(),
+            current_confidence: node.confidence.clone(),
+        };
+        assert_eq!(summary.current_primary_pattern_family, "stream");
+        assert_eq!(summary.current_intensity_band, "low");
+        assert_eq!(summary.current_density_intent, "low");
+        assert_eq!(summary.current_confidence, "medium");
+
+        let serialized = serde_json::to_value(&summary).unwrap();
+        assert!(serialized.get("current_primary_pattern_family").is_some());
+        assert!(serialized
+            .get("current_secondary_pattern_families")
+            .is_some());
+        assert!(serialized.get("current_avoid_pattern_families").is_some());
+        assert!(serialized.get("current_intensity_band").is_some());
+        assert!(serialized.get("current_density_intent").is_some());
+        assert!(serialized.get("current_confidence").is_some());
     }
 }

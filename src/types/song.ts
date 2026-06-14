@@ -112,6 +112,84 @@ export interface ICalibrationContextSummary {
   error_count: number;
 }
 
+export interface ITransitionGuidance {
+  transition_type: string;
+  density_delta: string;
+  family_shift: string;
+  recommended_bridge: string;
+  warnings: string[];
+}
+
+export interface ISectionContinuityNode {
+  section_id: string;
+  section_index: number;
+  start_measure: number;
+  end_measure: number;
+  music_role: string;
+  piu_role: string;
+  density_intent: string;
+  intensity_band: string;
+  primary_pattern_family: string;
+  secondary_pattern_families: string[];
+  avoid_pattern_families: string[];
+  motif_strategy: string;
+  transition_in: ITransitionGuidance;
+  transition_out: ITransitionGuidance;
+  confidence: string;
+  evidence: string[];
+  warnings: string[];
+}
+
+export interface IGlobalArcSummary {
+  arc_type: string;
+  peak_section_ids: string[];
+  rest_section_ids: string[];
+  motif_policy: string;
+  density_curve: string[];
+}
+
+export interface ISongContinuityPlan {
+  schema_version: string;
+  play_mode: string;
+  target_level: number;
+  calibration_available: boolean;
+  section_count: number;
+  sections: ISectionContinuityNode[];
+  global_arc: IGlobalArcSummary;
+  warnings: string[];
+}
+
+export interface INeighborSummary {
+  section_id: string;
+  music_role: string;
+  piu_role: string;
+  intensity_band: string;
+  primary_family: string;
+}
+
+export interface INeighborSummaryGroup {
+  previous?: INeighborSummary | null;
+  next?: INeighborSummary | null;
+}
+
+export interface IContinuityContextSummary {
+  enabled: boolean;
+  section_index: number;
+  section_count: number;
+  global_arc: string;
+  current_motif_strategy: string;
+  transition_in?: ITransitionGuidance | null;
+  transition_out?: ITransitionGuidance | null;
+  neighbor_summary: INeighborSummaryGroup;
+  warnings: string[];
+  current_primary_pattern_family: string;
+  current_secondary_pattern_families: string[];
+  current_avoid_pattern_families: string[];
+  current_intensity_band: string;
+  current_density_intent: string;
+  current_confidence: string;
+}
+
 export interface IAppendChartResult {
   charts: IChartDetails[];
   validation: IValidatedChartSection;
@@ -125,6 +203,7 @@ export interface IAppendChartResult {
   calibrated_prompt_context_used?: boolean | null;
   pattern_family_targeting?: IPatternFamilyTargetingReport | null;
   calibration_context_summary?: ICalibrationContextSummary | null;
+  continuity_plan?: ISongContinuityPlan | null;
 }
 
 export interface IGeminiBiomechanicalState {

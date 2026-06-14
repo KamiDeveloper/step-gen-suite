@@ -24,7 +24,9 @@ import {
   isPreviewStale,
   validateMeasureRange,
   groupValidationIssues,
-  getPatternFamilyLabel
+  getPatternFamilyLabel,
+  getMotifStrategyLabel,
+  getTransitionTypeLabel
 } from "../utils/ProjectWorkspaceHelpers";
 import type { PreviewParams } from "../utils/ProjectWorkspaceHelpers";
 
@@ -100,6 +102,7 @@ export const ProjectWorkspace: React.FC<ProjectWorkspaceProps> = ({ onNavigate }
   const [useMusicAnalysis, setUseMusicAnalysis] = useState(true);
   const [useBrowserBpm, setUseBrowserBpm] = useState(true);
   const [useCalibratedPromptContext, setUseCalibratedPromptContext] = useState(true);
+  const [useContinuityPlanning, setUseContinuityPlanning] = useState(true);
   const [patternFocus, setPatternFocus] = useState<string>("auto");
   const [previewParamsSnapshot, setPreviewParamsSnapshot] = useState<PreviewParams | null>(null);
 
@@ -243,6 +246,7 @@ export const ProjectWorkspace: React.FC<ProjectWorkspaceProps> = ({ onNavigate }
     setFingerprintAfter(null);
     setAnalysisError(null);
     setError(null);
+    setUseContinuityPlanning(false);
 
     if (requestedPath) {
       let cancelled = false;
@@ -254,6 +258,7 @@ export const ProjectWorkspace: React.FC<ProjectWorkspaceProps> = ({ onNavigate }
             return;
           }
           setAnalysisReport(report);
+          setUseContinuityPlanning(!!report);
           if (report) {
             const lastSlash = requestedPath.lastIndexOf("/");
             const lastBackslash = requestedPath.lastIndexOf("\\");
@@ -271,6 +276,7 @@ export const ProjectWorkspace: React.FC<ProjectWorkspaceProps> = ({ onNavigate }
           console.warn("Failed to auto-load analysis report:", err);
           setAnalysisReport(null);
           setReportPath(null);
+          setUseContinuityPlanning(false);
         });
 
       return () => {
@@ -292,7 +298,8 @@ export const ProjectWorkspace: React.FC<ProjectWorkspaceProps> = ({ onNavigate }
         useBrowserBpm,
         selectedSectionKey,
         useCalibratedPromptContext,
-        patternFamilyTarget: patternFocus
+        patternFamilyTarget: patternFocus,
+        useContinuityPlanning
       };
       if (isPreviewStale(previewParamsSnapshot, currentParams)) {
         handleDiscardPreview();
@@ -309,6 +316,7 @@ export const ProjectWorkspace: React.FC<ProjectWorkspaceProps> = ({ onNavigate }
     selectedSectionKey,
     useCalibratedPromptContext,
     patternFocus,
+    useContinuityPlanning,
     previewParamsSnapshot
   ]);
 
@@ -413,6 +421,7 @@ export const ProjectWorkspace: React.FC<ProjectWorkspaceProps> = ({ onNavigate }
         browserBpmReconciliation: useBrowserBpm ? browserBpmReconciliationStr : undefined,
         useCalibratedPromptContext,
         patternFamilyTarget: patternFocus,
+        useContinuityPlanning,
       });
 
       if (!isActivePreview()) return;
@@ -427,7 +436,8 @@ export const ProjectWorkspace: React.FC<ProjectWorkspaceProps> = ({ onNavigate }
         useBrowserBpm,
         selectedSectionKey,
         useCalibratedPromptContext,
-        patternFamilyTarget: patternFocus
+        patternFamilyTarget: patternFocus,
+        useContinuityPlanning
       });
 
       // 3. Get file fingerprint AFTER preview
@@ -1104,6 +1114,16 @@ export const ProjectWorkspace: React.FC<ProjectWorkspaceProps> = ({ onNavigate }
                   />
                   <span>Use calibrated prompt context</span>
                 </label>
+
+                <label className={`context-checkbox-label ${!analysisReport ? "disabled" : ""}`}>
+                  <input
+                    type="checkbox"
+                    checked={useContinuityPlanning}
+                    onChange={(e) => setUseContinuityPlanning(e.target.checked)}
+                    disabled={!analysisReport || isLoading}
+                  />
+                  <span>Use continuity planning {analysisReport ? "(Available)" : "(Unavailable)"}</span>
+                </label>
               </div>
 
               {(() => {
@@ -1447,6 +1467,72 @@ export const ProjectWorkspace: React.FC<ProjectWorkspaceProps> = ({ onNavigate }
                     </div>
                   </div>
                 )}
+
+                {/* Continuity Plan Report */}
+                {previewResult.continuity_plan && (() => {
+                  const plan = previewResult.continuity_plan;
+                  const node = plan.sections?.find(s => s.section_id === previewParamsSnapshot?.sectionId);
+                  
+                  // Collect warnings from plan and node (if present)
+                  const warnings = [
+                    ...(plan.warnings || []),
+                    ...(node?.warnings || [])
+                  ];
+
+                  return (
+                    <div className={`validation-report-panel continuity-panel ${
+                      warnings.length > 0 ? "has-warnings" : "clean"
+                    }`}>
+                      <div className="validation-report-header">
+                        <span className="validation-report-summary validation-report-summary-flex">
+                          {warnings.length > 0 ? (
+                            <AlertTriangle size={16} className="text-warning-icon" />
+                          ) : (
+                            <CheckCircle size={16} className="text-success-icon" />
+                          )}
+                          <span>Multi-Section Continuity Plan</span>
+                        </span>
+                        <span className="validation-count-badge">
+                          {node 
+                            ? `Section ${node.section_index + 1} of ${plan.section_count}`
+                            : `Plan active (${plan.section_count} sections)`
+                          }
+                        </span>
+                      </div>
+
+                      <div className="validation-sections-wrapper calibration-sections-wrapper">
+                        {node ? (
+                          <>
+                            <div className="calibration-meta-row">
+                              <span>Motif Strategy: <strong>{getMotifStrategyLabel(node.motif_strategy)}</strong></span>
+                              <span>Primary Family: <strong>{getPatternFamilyLabel(node.primary_pattern_family)}</strong></span>
+                              <span>Intensity Band: <span className="level-badge">{node.intensity_band}</span></span>
+                            </div>
+                            <div className="calibration-meta-row margin-top-8">
+                              <span>Transition In: <strong>{getTransitionTypeLabel(node.transition_in.transition_type)}</strong></span>
+                              <span>Transition Out: <strong>{getTransitionTypeLabel(node.transition_out.transition_type)}</strong></span>
+                              <span>Global Arc: <strong>{plan.global_arc?.arc_type ? plan.global_arc.arc_type.toUpperCase() : "N/A"}</strong></span>
+                            </div>
+                          </>
+                        ) : (
+                          <p className="calibration-summary-text text-warning">
+                            No matching section found in the continuity plan (custom range generated).
+                          </p>
+                        )}
+
+                        {warnings.length > 0 && (
+                          <div className="validation-issues-list calibration-issues-list-margin">
+                            {warnings.map((w, idx) => (
+                              <div key={idx} className="issue-row-item warning">
+                                <span className="issue-message">[Continuity Warning] {w}</span>
+                              </div>
+                            ))}
+                          </div>
+                        )}
+                      </div>
+                    </div>
+                  );
+                })()}
 
                 {/* Validation Report */}
                 <div className={`validation-report-panel ${previewResult.validation.issues.some(i => i.severity === "Error")

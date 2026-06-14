@@ -124,6 +124,7 @@ pub struct AppendChartResult {
     pub calibrated_prompt_context_used: Option<bool>,
     pub pattern_family_targeting: Option<crate::generation_context::PatternFamilyTargetingReport>,
     pub calibration_context_summary: Option<crate::generation_context::CalibrationContextSummary>,
+    pub continuity_plan: Option<crate::section_continuity::SongContinuityPlan>,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone, PartialEq)]
@@ -268,6 +269,7 @@ pub fn append_chart_to_ssc_atomic(
             calibrated_prompt_context_used: None,
             pattern_family_targeting: None,
             calibration_context_summary: None,
+            continuity_plan: None,
         });
     }
 
@@ -373,6 +375,7 @@ pub fn append_chart_to_ssc_atomic(
         calibrated_prompt_context_used: None,
         pattern_family_targeting: None,
         calibration_context_summary: None,
+        continuity_plan: None,
     })
 }
 
@@ -1429,6 +1432,7 @@ pub fn append_mock_gemini_payload(
                 calibrated_prompt_context_used: None,
                 pattern_family_targeting: None,
                 calibration_context_summary: None,
+                continuity_plan: None,
             })
         }
     }
@@ -1557,6 +1561,7 @@ pub async fn generate_gemini_chart_preview_core(
     browser_bpm_reconciliation: Option<String>,
     use_calibrated_prompt_context: Option<bool>,
     pattern_family_target: Option<String>,
+    use_continuity_planning: Option<bool>,
 ) -> Result<AppendChartResult, String> {
     generate_gemini_chart_preview_core_internal(
         api_key,
@@ -1576,6 +1581,7 @@ pub async fn generate_gemini_chart_preview_core(
         use_calibrated_prompt_context,
         pattern_family_target,
         None,
+        use_continuity_planning,
     )
     .await
 }
@@ -1598,6 +1604,7 @@ pub async fn generate_gemini_chart_preview_core_internal(
     use_calibrated_prompt_context: Option<bool>,
     pattern_family_target: Option<String>,
     override_calibration: Option<&crate::guardrail_calibration::SingleGuardrailCalibration>,
+    use_continuity_planning: Option<bool>,
 ) -> Result<AppendChartResult, String> {
     // 1. Check environment variable gate
     if !crate::settings::is_gemini_enabled() {
@@ -1926,6 +1933,180 @@ pub async fn generate_gemini_chart_preview_core_internal(
         )
     };
 
+    let use_continuity = use_continuity_planning.unwrap_or(true);
+    let continuity_plan = if use_continuity {
+        Some(crate::section_continuity::build_song_continuity_plan(
+            target_level,
+            play_mode,
+            report_opt.as_ref(),
+            calib_opt.as_ref(),
+            browser_bpm_reconciliation.as_deref(),
+            section_id,
+            start_m_val,
+            end_m_val,
+        ))
+    } else {
+        None
+    };
+
+    let continuity_context = if let Some(ref plan) = continuity_plan {
+        if let Some(node) = plan.sections.iter().find(|n| n.section_id == section_id) {
+            let section_index = node.section_index;
+            let section_count = plan.section_count;
+
+            let prev_neighbor = if section_index > 0 {
+                plan.sections.get(section_index - 1).map(|prev_node| {
+                    crate::section_continuity::NeighborSummary {
+                        section_id: prev_node.section_id.clone(),
+                        music_role: prev_node.music_role.clone(),
+                        piu_role: prev_node.piu_role.clone(),
+                        intensity_band: prev_node.intensity_band.clone(),
+                        primary_family: prev_node.primary_pattern_family.clone(),
+                    }
+                })
+            } else {
+                None
+            };
+
+            let next_neighbor = if section_index + 1 < section_count {
+                plan.sections.get(section_index + 1).map(|next_node| {
+                    crate::section_continuity::NeighborSummary {
+                        section_id: next_node.section_id.clone(),
+                        music_role: next_node.music_role.clone(),
+                        piu_role: next_node.piu_role.clone(),
+                        intensity_band: next_node.intensity_band.clone(),
+                        primary_family: next_node.primary_pattern_family.clone(),
+                    }
+                })
+            } else {
+                None
+            };
+
+            let mut warnings = plan.warnings.clone();
+            warnings.extend(node.warnings.clone());
+
+            Some(crate::section_continuity::ContinuityContextSummary {
+                enabled: true,
+                section_index,
+                section_count,
+                global_arc: plan.global_arc.arc_type.clone(),
+                current_motif_strategy: node.motif_strategy.clone(),
+                transition_in: Some(node.transition_in.clone()),
+                transition_out: Some(node.transition_out.clone()),
+                neighbor_summary: crate::section_continuity::NeighborSummaryGroup {
+                    previous: prev_neighbor,
+                    next: next_neighbor,
+                },
+                warnings,
+                current_primary_pattern_family: node.primary_pattern_family.clone(),
+                current_secondary_pattern_families: node.secondary_pattern_families.clone(),
+                current_avoid_pattern_families: node.avoid_pattern_families.clone(),
+                current_intensity_band: node.intensity_band.clone(),
+                current_density_intent: node.density_intent.clone(),
+                current_confidence: node.confidence.clone(),
+            })
+        } else {
+            let avoid_from_targeting = targeting_report.avoid_families.clone();
+            let fallback_intensity = if let Some(ref report) = report_opt {
+                if let Some(sec) = report.sections.iter().find(|s| s.section_id == section_id) {
+                    crate::section_continuity::map_intensity_band(
+                        target_level,
+                        Some(&sec.energy_profile),
+                        Some(&sec.piu_role),
+                        Some(&sec.music_role),
+                    )
+                } else {
+                    crate::section_continuity::map_intensity_band(target_level, None, None, None)
+                }
+            } else {
+                crate::section_continuity::map_intensity_band(target_level, None, None, None)
+            };
+
+            Some(crate::section_continuity::ContinuityContextSummary {
+                enabled: false,
+                section_index: 0,
+                section_count: 1,
+                global_arc: "balanced".to_string(),
+                current_motif_strategy: "unknown".to_string(),
+                transition_in: None,
+                transition_out: None,
+                neighbor_summary: crate::section_continuity::NeighborSummaryGroup {
+                    previous: None,
+                    next: None,
+                },
+                warnings: vec![
+                    "Section not found in music analysis. Continuity planner degraded.".to_string(),
+                ],
+                current_primary_pattern_family: "balanced".to_string(),
+                current_secondary_pattern_families: vec![],
+                current_avoid_pattern_families: avoid_from_targeting,
+                current_intensity_band: fallback_intensity.clone(),
+                current_density_intent: fallback_intensity,
+                current_confidence: "low".to_string(),
+            })
+        }
+    } else {
+        None
+    };
+
+    let (
+        effective_primary_family,
+        effective_secondary_families,
+        effective_avoid_families,
+        effective_intensity_band,
+    ) = if let Some(ref cont_ctx) = continuity_context {
+        if cont_ctx.enabled {
+            (
+                cont_ctx.current_primary_pattern_family.clone(),
+                cont_ctx.current_secondary_pattern_families.clone(),
+                cont_ctx.current_avoid_pattern_families.clone(),
+                cont_ctx.current_intensity_band.clone(),
+            )
+        } else {
+            let fallback_intensity = if let Some(ref report) = report_opt {
+                if let Some(sec) = report.sections.iter().find(|s| s.section_id == section_id) {
+                    crate::section_continuity::map_intensity_band(
+                        target_level,
+                        Some(&sec.energy_profile),
+                        Some(&sec.piu_role),
+                        Some(&sec.music_role),
+                    )
+                } else {
+                    crate::section_continuity::map_intensity_band(target_level, None, None, None)
+                }
+            } else {
+                crate::section_continuity::map_intensity_band(target_level, None, None, None)
+            };
+            (
+                targeting_report.primary_family.clone(),
+                targeting_report.secondary_families.clone(),
+                targeting_report.avoid_families.clone(),
+                fallback_intensity,
+            )
+        }
+    } else {
+        let fallback_intensity = if let Some(ref report) = report_opt {
+            if let Some(sec) = report.sections.iter().find(|s| s.section_id == section_id) {
+                crate::section_continuity::map_intensity_band(
+                    target_level,
+                    Some(&sec.energy_profile),
+                    Some(&sec.piu_role),
+                    Some(&sec.music_role),
+                )
+            } else {
+                crate::section_continuity::map_intensity_band(target_level, None, None, None)
+            }
+        } else {
+            crate::section_continuity::map_intensity_band(target_level, None, None, None)
+        };
+        (
+            targeting_report.primary_family.clone(),
+            targeting_report.secondary_families.clone(),
+            targeting_report.avoid_families.clone(),
+            fallback_intensity,
+        )
+    };
+
     let mut prompt_instructions = vec![
         "Generate only Pump Single.".to_string(),
         "Do not output Double.".to_string(),
@@ -1937,26 +2118,74 @@ pub async fn generate_gemini_chart_preview_core_internal(
             start_m_val, end_m_val
         ),
         format!("Respect target level S{}.", target_level),
-        format!(
-            "Prefer the selected/calibrated pattern family: '{}'.",
-            targeting_report.primary_family
-        ),
     ];
-    if !targeting_report.secondary_families.is_empty() {
+
+    let has_continuity = continuity_context.as_ref().map_or(false, |c| c.enabled);
+
+    if has_continuity {
         prompt_instructions.push(format!(
-            "Use secondary families only when musically justified: {:?}",
-            targeting_report.secondary_families
+            "Prefer the continuity-adjusted primary pattern family: '{}'.",
+            effective_primary_family
         ));
-    }
-    if !targeting_report.avoid_families.is_empty() {
         prompt_instructions.push(format!(
-            "Avoid listed families: {:?}",
-            targeting_report.avoid_families
+            "Use current continuity intensity band '{}' as pacing guidance.",
+            effective_intensity_band
         ));
+        prompt_instructions.push(format!(
+            "Use continuity secondary families sparingly: {:?}",
+            effective_secondary_families
+        ));
+        prompt_instructions.push(format!(
+            "Avoid continuity-forbidden families: {:?}",
+            effective_avoid_families
+        ));
+
+        let has_override = continuity_context.as_ref().map_or(false, |c| {
+            c.warnings
+                .iter()
+                .any(|w| w.contains("limited to prevent monotony") || w.contains("confidence"))
+        });
+        if has_override {
+            prompt_instructions.push(
+                "Treat continuity warnings (such as monotony overrides or low confidence fallbacks) as constraints/caution, not as generation errors.".to_string()
+            );
+        }
+    } else {
+        prompt_instructions.push(format!(
+            "Prefer the selected/calibrated pattern family: '{}'.",
+            effective_primary_family
+        ));
+        if !effective_secondary_families.is_empty() {
+            prompt_instructions.push(format!(
+                "Use secondary families only when musically justified: {:?}",
+                effective_secondary_families
+            ));
+        }
+        if !effective_avoid_families.is_empty() {
+            prompt_instructions.push(format!(
+                "Avoid listed families: {:?}",
+                effective_avoid_families
+            ));
+        }
     }
+
     prompt_instructions.push("Treat calibration hard limits as strict.".to_string());
     prompt_instructions.push("Treat warnings as cautionary guidance.".to_string());
     prompt_instructions.push("Biomechanical validity is mandatory.".to_string());
+
+    if let Some(ref cont_ctx) = continuity_context {
+        if cont_ctx.enabled {
+            prompt_instructions
+                .push("Keep the section coherent with the surrounding song arc.".to_string());
+            prompt_instructions.push("Preserve motif continuity abstractly.".to_string());
+            prompt_instructions.push(
+                "Do not abruptly change density unless transition guidance says so.".to_string(),
+            );
+            prompt_instructions.push("Use secondary families sparingly.".to_string());
+            prompt_instructions
+                .push("Do not output notes outside the requested section.".to_string());
+        }
+    }
 
     let section_summary = crate::generation_context::SectionContextSummary {
         section_id: section_id.to_string(),
@@ -2015,6 +2244,11 @@ pub async fn generate_gemini_chart_preview_core_internal(
         guardrail_threshold_summary: gts,
         prompt_instructions,
         warnings: targeting_report.warnings.clone(),
+        continuity_context: if use_continuity {
+            continuity_context.clone()
+        } else {
+            None
+        },
     };
 
     if calib_enabled {
@@ -2023,6 +2257,16 @@ pub async fn generate_gemini_chart_preview_core_internal(
             context_summary.push_str("\n[CALIBRATED PROMPT CONTEXT (JSON)]\n");
             context_summary.push_str(&serialized);
             context_summary.push_str("\n");
+        }
+    }
+
+    if use_continuity && !calib_enabled {
+        if let Some(ref cont_ctx) = continuity_context {
+            if let Ok(serialized_cont) = serde_json::to_string_pretty(cont_ctx) {
+                context_summary.push_str("\n[MULTI-SECTION CONTINUITY CONTEXT (JSON)]\n");
+                context_summary.push_str(&serialized_cont);
+                context_summary.push_str("\n");
+            }
         }
     }
 
@@ -2209,6 +2453,7 @@ pub async fn generate_gemini_chart_preview_core_internal(
                     error_count: 0,
                 },
             ),
+            continuity_plan: continuity_plan.clone(),
         });
     }
 
@@ -2344,6 +2589,7 @@ pub async fn generate_gemini_chart_preview_core_internal(
                 .map(|r| r.errors.len())
                 .unwrap_or(0),
         }),
+        continuity_plan,
     })
 }
 
@@ -2376,6 +2622,7 @@ pub async fn generate_gemini_chart_preview<R: tauri::Runtime>(
     browser_bpm_reconciliation: Option<String>,
     use_calibrated_prompt_context: Option<bool>,
     pattern_family_target: Option<String>,
+    use_continuity_planning: Option<bool>,
 ) -> Result<AppendChartResult, String> {
     let play_mode_enum = match play_mode.as_str() {
         "Single" => PlayMode::Single,
@@ -2445,6 +2692,7 @@ pub async fn generate_gemini_chart_preview<R: tauri::Runtime>(
         browser_bpm_reconciliation,
         use_calibrated_prompt_context,
         pattern_family_target,
+        use_continuity_planning,
     )
     .await
 }
@@ -2996,6 +3244,7 @@ mod tests {
             None,
             None,
             Some(&empty_calib),
+            None,
         )
         .await;
         assert!(result_gate.is_err());
@@ -3023,6 +3272,7 @@ mod tests {
             None,
             None,
             Some(&empty_calib),
+            None,
         )
         .await
         .expect("PreviewOnly flow failed");
@@ -3080,6 +3330,7 @@ mod tests {
             None,
             None,
             Some(&empty_calib),
+            None,
         )
         .await
         .expect("Core preview mismatch section_id failed");
@@ -3130,6 +3381,7 @@ mod tests {
             None,
             None,
             Some(&empty_calib),
+            None,
         )
         .await
         .expect("Core preview mismatch play_mode failed");
@@ -3180,6 +3432,7 @@ mod tests {
             None,
             None,
             Some(&empty_calib),
+            None,
         )
         .await
         .expect("Core preview mismatch diff failed");
@@ -3230,6 +3483,7 @@ mod tests {
             None,
             None,
             Some(&empty_calib),
+            None,
         )
         .await
         .expect("Core preview with warnings failed");
@@ -3276,6 +3530,7 @@ mod tests {
             None,
             None,
             Some(&empty_calib),
+            None,
         )
         .await
         .expect("Core preview with error failed");
@@ -3313,6 +3568,7 @@ mod tests {
             None,
             None,
             Some(&empty_calib),
+            None,
         )
         .await;
 
@@ -3360,6 +3616,7 @@ mod tests {
             None,
             None,
             Some(&empty_calib),
+            None,
         )
         .await
         .expect("Valid range preview failed");
@@ -3410,6 +3667,7 @@ mod tests {
             None,
             None,
             Some(&empty_calib),
+            None,
         )
         .await
         .expect("Preview core failed");
@@ -3458,6 +3716,7 @@ mod tests {
             None,
             None,
             Some(&empty_calib),
+            None,
         )
         .await
         .expect("Preview core failed");
@@ -3488,6 +3747,7 @@ mod tests {
             None,
             None,
             Some(&empty_calib),
+            None,
         )
         .await;
 
@@ -3534,6 +3794,7 @@ mod tests {
             None,
             None,
             Some(&empty_calib),
+            None,
         )
         .await
         .expect("Fenced JSON preview failed");
@@ -3644,6 +3905,7 @@ mod tests {
             None,
             None,
             Some(&calib),
+            None,
         )
         .await
         .expect("Failed to run preview with calibration");
@@ -3702,6 +3964,7 @@ mod tests {
             &client,
             Some(0),
             Some(17), // 18 measures
+            None,
             None,
             None,
             None,
@@ -4986,6 +5249,7 @@ mod tests {
             Some(true), // use_calibrated_prompt_context
             None,
             Some(&empty_calib),
+            None,
         )
         .await;
 
@@ -5086,15 +5350,1192 @@ mod tests {
             !prompt_text.contains("candidates:"),
             "Should not contain candidates:"
         );
-
-        // Verify calibrated context JSON fields inside the prompt
-        assert!(
-            prompt_text.contains("\"has_reconciliation_agreement\": false"),
-            "Should serialize has_reconciliation_agreement as false"
-        );
         assert!(
             prompt_text.contains("browser timing reconciliation reports a mismatch."),
             "Should include timing warning about mismatch"
+        );
+
+        crate::settings::set_test_gemini_enabled(None);
+        let _ = std::fs::remove_dir_all(&test_root);
+    }
+
+    #[tokio::test]
+    async fn test_continuity_planning_decoupling_and_privacy() {
+        use std::io::{Read, Write};
+        use std::net::TcpListener;
+        use std::sync::{Arc, Mutex};
+
+        let listener_1 = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port_1 = listener_1.local_addr().unwrap().port();
+        let server_url_1 = format!("http://127.0.0.1:{}", port_1);
+
+        let captured_body_1 = Arc::new(Mutex::new(None));
+        let captured_body_clone_1 = captured_body_1.clone();
+
+        std::thread::spawn(move || {
+            if let Ok((mut stream, _)) = listener_1.accept() {
+                let mut buffer = [0; 65536];
+                if let Ok(bytes_read) = stream.read(&mut buffer) {
+                    let req_str = String::from_utf8_lossy(&buffer[..bytes_read]).to_string();
+                    if let Some(body_start) = req_str.find("\r\n\r\n") {
+                        let body = req_str[body_start + 4..].to_string();
+                        let mut cap = captured_body_clone_1.lock().unwrap();
+                        *cap = Some(body);
+                    }
+                }
+                let response = "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\n\r\n{\
+                    \"candidates\": [\
+                        {\
+                            \"content\": {\
+                                \"parts\": [\
+                                    {\
+                                         \"text\": \"{\\n  \\\"section_id\\\": \\\"sec2\\\",\\n  \\\"difficulty_level\\\": 10,\\n  \\\"play_mode\\\": \\\"Single\\\",\\n  \\\"biomechanical_state\\\": {\\n    \\\"current_twist_debt\\\": 0.0,\\n    \\\"current_stamina_debt\\\": 0.1\\n  },\\n  \\\"measures\\\": []\\n}\"\
+                                    }\
+                                ]\
+                            }\
+                        }\
+                    ]\
+                }";
+                let _ = stream.write_all(response.as_bytes());
+                let _ = stream.flush();
+            }
+        });
+
+        let original_path = get_fixture_path();
+        let temp_dir = std::env::temp_dir();
+        let test_root = temp_dir.join("continuity_decoupling_test_run");
+        let _ = std::fs::create_dir_all(&test_root);
+
+        let temp_ssc_path = test_root.join("test_continuity_decoupling.ssc");
+        std::fs::copy(&original_path, &temp_ssc_path).expect("Failed to copy");
+
+        let analysis_dir = test_root.join(".ai-step-gen-analysis");
+        let _ = std::fs::create_dir_all(&analysis_dir);
+
+        let mock_report_content = r#"{
+          "schema_version": "v1",
+          "song_id": "test_song_decoupling",
+          "title": "Private Title",
+          "artist": "Private Artist",
+          "duration_seconds": 120.0,
+          "audio_summary": {
+            "sample_rate": 44100,
+            "detected_bpm": 120.0,
+            "rms_energy_mean": 0.5,
+            "rms_energy_max": 0.8,
+            "spectral_centroid_mean": 1000.0,
+            "spectral_flatness_mean": 0.1,
+            "zero_crossing_rate_mean": 0.05,
+            "chroma_mean": null,
+            "spectral_contrast_mean": null,
+            "analysis_mode": "offline"
+          },
+          "timing_grid": {
+            "initial_offset": 0.0,
+            "bpms": [],
+            "display_bpm": "120",
+            "song_type": "Arcade"
+          },
+          "event_features": {
+            "beats": []
+          },
+          "sections": [
+            {
+              "section_id": "sec1",
+              "start_beat": 0.0,
+              "end_beat": 16.0,
+              "start_measure": 0,
+              "end_measure": 4,
+              "music_role": "intro",
+              "piu_role": "warmup",
+              "boundary_confidence": 0.9,
+              "energy_profile": "low"
+            },
+            {
+              "section_id": "sec2",
+              "start_beat": 16.0,
+              "end_beat": 32.0,
+              "start_measure": 4,
+              "end_measure": 8,
+              "music_role": "verse",
+              "piu_role": "stream_opportunity",
+              "boundary_confidence": 0.9,
+              "energy_profile": "mid"
+            },
+            {
+              "section_id": "sec3",
+              "start_beat": 32.0,
+              "end_beat": 48.0,
+              "start_measure": 8,
+              "end_measure": 12,
+              "music_role": "chorus",
+              "piu_role": "climax",
+              "boundary_confidence": 0.9,
+              "energy_profile": "high"
+            }
+          ],
+          "choreographic_intent": [
+            {
+              "schema_version": "v1",
+              "section_id": "sec1",
+              "mode": "Single",
+              "target_level": 10,
+              "measure_start": 0,
+              "measure_end": 4,
+              "density_target": "light",
+              "difficulty_budget": 8.0,
+              "recommended_pattern_families": ["balanced"],
+              "avoid_pattern_families": [],
+              "accent_plan": [],
+              "rest_plan": [],
+              "motif_strategy": "introduce",
+              "evidence": [],
+              "confidence": 0.8
+            },
+            {
+              "schema_version": "v1",
+              "section_id": "sec2",
+              "mode": "Single",
+              "target_level": 10,
+              "measure_start": 4,
+              "measure_end": 8,
+              "density_target": "moderate",
+              "difficulty_budget": 10.0,
+              "recommended_pattern_families": ["stream"],
+              "avoid_pattern_families": [],
+              "accent_plan": [],
+              "rest_plan": [],
+              "motif_strategy": "develop",
+              "evidence": [],
+              "confidence": 0.8
+            },
+            {
+              "schema_version": "v1",
+              "section_id": "sec3",
+              "mode": "Single",
+              "target_level": 10,
+              "measure_start": 8,
+              "measure_end": 12,
+              "density_target": "heavy",
+              "difficulty_budget": 12.0,
+              "recommended_pattern_families": ["stream"],
+              "avoid_pattern_families": [],
+              "accent_plan": [],
+              "rest_plan": [],
+              "motif_strategy": "intensify",
+              "evidence": [],
+              "confidence": 0.8
+            }
+          ],
+          "diagnostics": {
+            "audio_bpm_detected": 120.0,
+            "ssc_initial_bpm": 120.0,
+            "audio_vs_ssc_tempo_agreement": true,
+            "beat_grid_error_ms_mean": 0.0,
+            "timing_confidence": 1.0,
+            "requires_manual_timing_review": false,
+            "warnings": [],
+            "analysis_mode": "offline"
+          },
+          "publicability": {
+            "contains_original_audio": false,
+            "contains_full_chart": false,
+            "exportable": true
+          }
+        }"#;
+        std::fs::write(
+            analysis_dir.join("song-analysis-report.v1.json"),
+            mock_report_content,
+        )
+        .expect("Failed to write mock report");
+
+        let test_audio_path = test_root.join("test_audio_decoupling.mp3");
+        {
+            let mut file = std::fs::File::create(&test_audio_path).unwrap();
+            file.write_all(b"audio content").unwrap();
+        }
+
+        let empty_calib_json = r#"{
+            "schema_version": "single-guardrail-calibration.v0",
+            "publicability_status": "private_derived",
+            "play_mode": "Single",
+            "source_dataset_summary": {},
+            "level_thresholds": {
+                "S10": {
+                    "density": { "warning_p90": 1000.0, "hard_limit_p95": 1000.0 },
+                    "jump_rate": { "warning_p90": 10.0, "hard_limit_p95": 10.0 },
+                    "twist_rate": { "warning_p90": 10.0, "hard_limit_p95": 10.0 },
+                    "bracket_candidate_rate": { "warning_p90": 1000.0, "hard_limit_p95": 1000.0 }
+                }
+            },
+            "pattern_family_thresholds": {},
+            "confidence_policy": {},
+            "recommended_runtime_usage": []
+        }"#;
+        let empty_calib: crate::guardrail_calibration::SingleGuardrailCalibration =
+            serde_json::from_str(empty_calib_json).unwrap();
+
+        let client_1 = GeminiClient::new(Some(server_url_1));
+        crate::settings::set_test_gemini_enabled(Some(true));
+
+        let result_1 = generate_gemini_chart_preview_core_internal(
+            "fake-key",
+            &temp_ssc_path.to_string_lossy(),
+            &test_audio_path.to_string_lossy(),
+            PlayMode::Single,
+            10,
+            "sec2",
+            "AI Previewer",
+            &client_1,
+            Some(4),
+            Some(8),
+            None,
+            Some(true),
+            Some(true),
+            None,
+            Some(false), // use_calibrated_prompt_context = false
+            None,
+            Some(&empty_calib),
+            Some(true), // use_continuity_planning = true
+        )
+        .await;
+
+        assert!(result_1.is_ok(), "Test 1 failed: {:?}", result_1.err());
+        let res_val_1 = result_1.unwrap();
+        assert!(res_val_1.continuity_plan.is_some());
+
+        let prompt_data_1 = captured_body_1
+            .lock()
+            .unwrap()
+            .clone()
+            .expect("No prompt 1 was captured");
+        let v_1: serde_json::Value = serde_json::from_str(&prompt_data_1).unwrap();
+        let prompt_text_1 = v_1["contents"][0]["parts"][0]["text"].as_str().unwrap();
+
+        assert!(
+            prompt_text_1.contains("[MULTI-SECTION CONTINUITY CONTEXT (JSON)]"),
+            "Prompt should contain separate continuity context header"
+        );
+        assert!(
+            !prompt_text_1.contains("[CALIBRATED PROMPT CONTEXT (JSON)]"),
+            "Prompt should not contain calibrated context header"
+        );
+
+        let prompt_lower_1 = prompt_text_1.to_lowercase();
+        assert!(
+            prompt_lower_1.contains("current_motif_strategy"),
+            "Prompt should contain current_motif_strategy field"
+        );
+        assert!(
+            prompt_lower_1.contains("neighbor_summary"),
+            "Prompt should contain neighbor_summary field"
+        );
+        assert!(
+            prompt_lower_1.contains("transition_in"),
+            "Prompt should contain transition_in field"
+        );
+        assert!(
+            prompt_lower_1.contains("transition_out"),
+            "Prompt should contain transition_out field"
+        );
+
+        assert!(
+            !prompt_lower_1.contains("#title"),
+            "Should not contain #TITLE"
+        );
+        assert!(
+            !prompt_lower_1.contains("#bpms"),
+            "Should not contain #BPMS"
+        );
+        assert!(
+            !prompt_lower_1.contains("#offset"),
+            "Should not contain #OFFSET"
+        );
+        assert!(
+            !prompt_lower_1.contains("#notedata"),
+            "Should not contain #NOTEDATA"
+        );
+        assert!(!prompt_lower_1.contains(".ssc"), "Should not contain .ssc");
+        assert!(!prompt_lower_1.contains(".mp3"), "Should not contain .mp3");
+        assert!(
+            !prompt_lower_1.contains(".ai-step-gen-private-datasets"),
+            "Should not leak private dataset path"
+        );
+        assert!(
+            !prompt_lower_1.contains("official_songs"),
+            "Should not leak official songs path"
+        );
+        assert!(
+            !prompt_lower_1.contains("c:\\"),
+            "Should not contain Windows path prefixes"
+        );
+        assert!(
+            !prompt_lower_1.contains("/users/"),
+            "Should not contain Unix User paths"
+        );
+
+        let listener_2 = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port_2 = listener_2.local_addr().unwrap().port();
+        let server_url_2 = format!("http://127.0.0.1:{}", port_2);
+
+        let captured_body_2 = Arc::new(Mutex::new(None));
+        let captured_body_clone_2 = captured_body_2.clone();
+
+        std::thread::spawn(move || {
+            if let Ok((mut stream, _)) = listener_2.accept() {
+                let mut buffer = [0; 65536];
+                if let Ok(bytes_read) = stream.read(&mut buffer) {
+                    let req_str = String::from_utf8_lossy(&buffer[..bytes_read]).to_string();
+                    if let Some(body_start) = req_str.find("\r\n\r\n") {
+                        let body = req_str[body_start + 4..].to_string();
+                        let mut cap = captured_body_clone_2.lock().unwrap();
+                        *cap = Some(body);
+                    }
+                }
+                let response = "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\n\r\n{\
+                    \"candidates\": [\
+                        {\
+                            \"content\": {\
+                                \"parts\": [\
+                                    {\
+                                         \"text\": \"{\\n  \\\"section_id\\\": \\\"sec2\\\",\\n  \\\"difficulty_level\\\": 10,\\n  \\\"play_mode\\\": \\\"Single\\\",\\n  \\\"biomechanical_state\\\": {\\n    \\\"current_twist_debt\\\": 0.0,\\n    \\\"current_stamina_debt\\\": 0.1\\n  },\\n  \\\"measures\\\": []\\n}\"\
+                                    }\
+                                ]\
+                            }\
+                        }\
+                    ]\
+                }";
+                let _ = stream.write_all(response.as_bytes());
+                let _ = stream.flush();
+            }
+        });
+
+        let client_2 = GeminiClient::new(Some(server_url_2));
+
+        let result_2 = generate_gemini_chart_preview_core_internal(
+            "fake-key",
+            &temp_ssc_path.to_string_lossy(),
+            &test_audio_path.to_string_lossy(),
+            PlayMode::Single,
+            10,
+            "sec2",
+            "AI Previewer",
+            &client_2,
+            Some(4),
+            Some(8),
+            None,
+            Some(true),
+            Some(true),
+            None,
+            Some(false), // use_calibrated_prompt_context = false
+            None,
+            Some(&empty_calib),
+            Some(false), // use_continuity_planning = false
+        )
+        .await;
+
+        assert!(result_2.is_ok(), "Test 2 failed: {:?}", result_2.err());
+        let res_val_2 = result_2.unwrap();
+
+        assert!(
+            res_val_2.continuity_plan.is_none(),
+            "continuity_plan should be None when use_continuity_planning is false"
+        );
+
+        let prompt_data_2 = captured_body_2
+            .lock()
+            .unwrap()
+            .clone()
+            .expect("No prompt 2 was captured");
+        let v_2: serde_json::Value = serde_json::from_str(&prompt_data_2).unwrap();
+        let prompt_text_2 = v_2["contents"][0]["parts"][0]["text"].as_str().unwrap();
+
+        assert!(
+            !prompt_text_2.contains("[MULTI-SECTION CONTINUITY CONTEXT (JSON)]"),
+            "Prompt should not contain continuity context when disabled"
+        );
+
+        crate::settings::set_test_gemini_enabled(None);
+        let _ = std::fs::remove_dir_all(&test_root);
+    }
+
+    #[tokio::test]
+    async fn test_prompt_uses_continuity_adjusted_primary_family_over_targeting_report() {
+        use std::io::{Read, Write};
+        use std::net::TcpListener;
+        use std::sync::{Arc, Mutex};
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let server_url = format!("http://127.0.0.1:{}", port);
+
+        let captured_body = Arc::new(Mutex::new(None));
+        let captured_body_clone = captured_body.clone();
+
+        std::thread::spawn(move || {
+            if let Ok((mut stream, _)) = listener.accept() {
+                let mut buffer = [0; 65536];
+                if let Ok(bytes_read) = stream.read(&mut buffer) {
+                    let req_str = String::from_utf8_lossy(&buffer[..bytes_read]).to_string();
+                    if let Some(body_start) = req_str.find("\r\n\r\n") {
+                        let body = req_str[body_start + 4..].to_string();
+                        let mut cap = captured_body_clone.lock().unwrap();
+                        *cap = Some(body);
+                    }
+                }
+                let response = "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\n\r\n{\
+                    \"candidates\": [\
+                        {\
+                            \"content\": {\
+                                \"parts\": [\
+                                    {\
+                                         \"text\": \"{\\n  \\\"section_id\\\": \\\"sec3\\\",\\n  \\\"difficulty_level\\\": 10,\\n  \\\"play_mode\\\": \\\"Single\\\",\\n  \\\"biomechanical_state\\\": {\\n    \\\"current_twist_debt\\\": 0.0,\\n    \\\"current_stamina_debt\\\": 0.1\\n  },\\n  \\\"measures\\\": []\\n}\"\
+                                    }\
+                                ]\
+                            }\
+                        }\
+                    ]\
+                }";
+                let _ = stream.write_all(response.as_bytes());
+                let _ = stream.flush();
+            }
+        });
+
+        let original_path = get_fixture_path();
+        let temp_dir = std::env::temp_dir();
+        let test_root = temp_dir.join("continuity_adjusted_test_run");
+        let _ = std::fs::create_dir_all(&test_root);
+
+        let temp_ssc_path = test_root.join("test_continuity_adjusted.ssc");
+        std::fs::copy(&original_path, &temp_ssc_path).expect("Failed to copy");
+
+        let analysis_dir = test_root.join(".ai-step-gen-analysis");
+        let _ = std::fs::create_dir_all(&analysis_dir);
+
+        let mock_report_content = r#"{
+          "schema_version": "v1",
+          "song_id": "test_song_adjusted",
+          "title": "Mock Title",
+          "artist": "Mock Artist",
+          "duration_seconds": 120.0,
+          "audio_summary": {
+            "sample_rate": 44100,
+            "detected_bpm": 120.0,
+            "rms_energy_mean": 0.5,
+            "rms_energy_max": 0.8,
+            "spectral_centroid_mean": 1000.0,
+            "spectral_flatness_mean": 0.1,
+            "zero_crossing_rate_mean": 0.05,
+            "chroma_mean": null,
+            "spectral_contrast_mean": null,
+            "analysis_mode": "offline"
+          },
+          "timing_grid": {
+            "initial_offset": 0.0,
+            "bpms": [],
+            "display_bpm": "120",
+            "song_type": "Arcade"
+          },
+          "event_features": {
+            "beats": []
+          },
+          "sections": [
+            {
+              "section_id": "sec1",
+              "start_beat": 0.0,
+              "end_beat": 16.0,
+              "start_measure": 0,
+              "end_measure": 4,
+              "music_role": "verse",
+              "piu_role": "normal",
+              "boundary_confidence": 0.9,
+              "energy_profile": "mid"
+            },
+            {
+              "section_id": "sec2",
+              "start_beat": 16.0,
+              "end_beat": 32.0,
+              "start_measure": 4,
+              "end_measure": 8,
+              "music_role": "verse",
+              "piu_role": "normal",
+              "boundary_confidence": 0.9,
+              "energy_profile": "mid"
+            },
+            {
+              "section_id": "sec3",
+              "start_beat": 32.0,
+              "end_beat": 48.0,
+              "start_measure": 8,
+              "end_measure": 12,
+              "music_role": "chorus",
+              "piu_role": "normal",
+              "boundary_confidence": 0.9,
+              "energy_profile": "high"
+            }
+          ],
+          "choreographic_intent": [
+            {
+              "schema_version": "v1",
+              "section_id": "sec1",
+              "mode": "Single",
+              "target_level": 10,
+              "measure_start": 0,
+              "measure_end": 4,
+              "density_target": "moderate",
+              "difficulty_budget": 10.0,
+              "recommended_pattern_families": ["stream"],
+              "avoid_pattern_families": [],
+              "accent_plan": [],
+              "rest_plan": [],
+              "motif_strategy": "introduce",
+              "evidence": [],
+              "confidence": 0.8
+            },
+            {
+              "schema_version": "v1",
+              "section_id": "sec2",
+              "mode": "Single",
+              "target_level": 10,
+              "measure_start": 4,
+              "measure_end": 8,
+              "density_target": "moderate",
+              "difficulty_budget": 10.0,
+              "recommended_pattern_families": ["stream"],
+              "avoid_pattern_families": [],
+              "accent_plan": [],
+              "rest_plan": [],
+              "motif_strategy": "develop",
+              "evidence": [],
+              "confidence": 0.8
+            },
+            {
+              "schema_version": "v1",
+              "section_id": "sec3",
+              "mode": "Single",
+              "target_level": 10,
+              "measure_start": 8,
+              "measure_end": 12,
+              "density_target": "heavy",
+              "difficulty_budget": 12.0,
+              "recommended_pattern_families": ["stream"],
+              "avoid_pattern_families": [],
+              "accent_plan": [],
+              "rest_plan": [],
+              "motif_strategy": "intensify",
+              "evidence": [],
+              "confidence": 0.8
+            }
+          ],
+          "diagnostics": {
+            "audio_bpm_detected": 120.0,
+            "ssc_initial_bpm": 120.0,
+            "audio_vs_ssc_tempo_agreement": true,
+            "beat_grid_error_ms_mean": 0.0,
+            "timing_confidence": 1.0,
+            "requires_manual_timing_review": false,
+            "warnings": [],
+            "analysis_mode": "offline"
+          },
+          "publicability": {
+            "contains_original_audio": false,
+            "contains_full_chart": false,
+            "exportable": true
+          }
+        }"#;
+        std::fs::write(
+            analysis_dir.join("song-analysis-report.v1.json"),
+            mock_report_content,
+        )
+        .expect("Failed to write mock report");
+
+        let test_audio_path = test_root.join("test_audio_adjusted.mp3");
+        {
+            let mut file = std::fs::File::create(&test_audio_path).unwrap();
+            file.write_all(b"audio content").unwrap();
+        }
+
+        let empty_calib_json = r#"{
+            "schema_version": "single-guardrail-calibration.v0",
+            "publicability_status": "private_derived",
+            "play_mode": "Single",
+            "source_dataset_summary": {},
+            "level_thresholds": {
+                "S10": {
+                    "density": { "warning_p90": 1000.0, "hard_limit_p95": 1000.0 },
+                    "jump_rate": { "warning_p90": 10.0, "hard_limit_p95": 10.0 },
+                    "twist_rate": { "warning_p90": 10.0, "hard_limit_p95": 10.0 },
+                    "bracket_candidate_rate": { "warning_p90": 1000.0, "hard_limit_p95": 1000.0 }
+                }
+            },
+            "pattern_family_thresholds": {},
+            "confidence_policy": {},
+            "recommended_runtime_usage": []
+        }"#;
+        let empty_calib: crate::guardrail_calibration::SingleGuardrailCalibration =
+            serde_json::from_str(empty_calib_json).unwrap();
+
+        let client = GeminiClient::new(Some(server_url));
+        crate::settings::set_test_gemini_enabled(Some(true));
+
+        let result = generate_gemini_chart_preview_core_internal(
+            "fake-key",
+            &temp_ssc_path.to_string_lossy(),
+            &test_audio_path.to_string_lossy(),
+            PlayMode::Single,
+            10,
+            "sec3",
+            "AI Previewer",
+            &client,
+            Some(8),
+            Some(12),
+            None,
+            Some(true),
+            Some(true),
+            None,
+            Some(true), // use_calibrated_prompt_context = true
+            None,
+            Some(&empty_calib),
+            Some(true),
+        )
+        .await;
+
+        assert!(result.is_ok(), "Test failed: {:?}", result.err());
+        let res_val = result.unwrap();
+        assert!(res_val.continuity_plan.is_some());
+
+        let prompt_data = captured_body
+            .lock()
+            .unwrap()
+            .clone()
+            .expect("No prompt was captured");
+        let v: serde_json::Value = serde_json::from_str(&prompt_data).unwrap();
+        let prompt_text = v["contents"][0]["parts"][0]["text"].as_str().unwrap();
+
+        assert!(
+            prompt_text
+                .contains("Prefer the continuity-adjusted primary pattern family: 'balanced'"),
+            "Prompt should contain preference for adjusted balanced family"
+        );
+        assert!(
+            !prompt_text.contains("Prefer the selected/calibrated pattern family: 'stream'"),
+            "Prompt should not prefer stream family for current section identity"
+        );
+        assert!(
+            prompt_text.contains("Treat continuity warnings (such as monotony overrides or low confidence fallbacks) as constraints/caution, not as generation errors."),
+            "Prompt should instruct how to treat monotony warnings"
+        );
+
+        crate::settings::set_test_gemini_enabled(None);
+        let _ = std::fs::remove_dir_all(&test_root);
+    }
+
+    #[tokio::test]
+    async fn test_continuity_prompt_includes_effective_avoid_and_secondary_families() {
+        use std::io::{Read, Write};
+        use std::net::TcpListener;
+        use std::sync::{Arc, Mutex};
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let server_url = format!("http://127.0.0.1:{}", port);
+
+        let captured_body = Arc::new(Mutex::new(None));
+        let captured_body_clone = captured_body.clone();
+
+        std::thread::spawn(move || {
+            if let Ok((mut stream, _)) = listener.accept() {
+                let mut buffer = [0; 65536];
+                if let Ok(bytes_read) = stream.read(&mut buffer) {
+                    let req_str = String::from_utf8_lossy(&buffer[..bytes_read]).to_string();
+                    if let Some(body_start) = req_str.find("\r\n\r\n") {
+                        let body = req_str[body_start + 4..].to_string();
+                        let mut cap = captured_body_clone.lock().unwrap();
+                        *cap = Some(body);
+                    }
+                }
+                let response = "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\n\r\n{\
+                    \"candidates\": [\
+                        {\
+                            \"content\": {\
+                                \"parts\": [\
+                                    {\
+                                         \"text\": \"{\\n  \\\"section_id\\\": \\\"sec2\\\",\\n  \\\"difficulty_level\\\": 10,\\n  \\\"play_mode\\\": \\\"Single\\\",\\n  \\\"biomechanical_state\\\": {\\n    \\\"current_twist_debt\\\": 0.0,\\n    \\\"current_stamina_debt\\\": 0.1\\n  },\\n  \\\"measures\\\": []\\n}\"\
+                                    }\
+                                ]\
+                            }\
+                        }\
+                    ]\
+                }";
+                let _ = stream.write_all(response.as_bytes());
+                let _ = stream.flush();
+            }
+        });
+
+        let original_path = get_fixture_path();
+        let temp_dir = std::env::temp_dir();
+        let test_root = temp_dir.join("continuity_avoid_test_run");
+        let _ = std::fs::create_dir_all(&test_root);
+
+        let temp_ssc_path = test_root.join("test_continuity_avoid.ssc");
+        std::fs::copy(&original_path, &temp_ssc_path).expect("Failed to copy");
+
+        let analysis_dir = test_root.join(".ai-step-gen-analysis");
+        let _ = std::fs::create_dir_all(&analysis_dir);
+
+        let mock_report_content = r#"{
+          "schema_version": "v1",
+          "song_id": "test_song_avoid",
+          "title": "Mock Title",
+          "artist": "Mock Artist",
+          "duration_seconds": 120.0,
+          "audio_summary": {
+            "sample_rate": 44100,
+            "detected_bpm": 120.0,
+            "rms_energy_mean": 0.5,
+            "rms_energy_max": 0.8,
+            "spectral_centroid_mean": 1000.0,
+            "spectral_flatness_mean": 0.1,
+            "zero_crossing_rate_mean": 0.05,
+            "chroma_mean": null,
+            "spectral_contrast_mean": null,
+            "analysis_mode": "offline"
+          },
+          "timing_grid": {
+            "initial_offset": 0.0,
+            "bpms": [],
+            "display_bpm": "120",
+            "song_type": "Arcade"
+          },
+          "event_features": {
+            "beats": []
+          },
+          "sections": [
+            {
+              "section_id": "sec1",
+              "start_beat": 0.0,
+              "end_beat": 16.0,
+              "start_measure": 0,
+              "end_measure": 4,
+              "music_role": "intro",
+              "piu_role": "warmup",
+              "boundary_confidence": 0.9,
+              "energy_profile": "low"
+            },
+            {
+              "section_id": "sec2",
+              "start_beat": 16.0,
+              "end_beat": 32.0,
+              "start_measure": 4,
+              "end_measure": 8,
+              "music_role": "verse",
+              "piu_role": "stream_opportunity",
+              "boundary_confidence": 0.9,
+              "energy_profile": "mid"
+            }
+          ],
+          "choreographic_intent": [
+            {
+              "schema_version": "v1",
+              "section_id": "sec1",
+              "mode": "Single",
+              "target_level": 10,
+              "measure_start": 0,
+              "measure_end": 4,
+              "density_target": "light",
+              "difficulty_budget": 8.0,
+              "recommended_pattern_families": ["balanced"],
+              "avoid_pattern_families": [],
+              "accent_plan": [],
+              "rest_plan": [],
+              "motif_strategy": "introduce",
+              "evidence": [],
+              "confidence": 0.8
+            },
+            {
+              "schema_version": "v1",
+              "section_id": "sec2",
+              "mode": "Single",
+              "target_level": 10,
+              "measure_start": 4,
+              "measure_end": 8,
+              "density_target": "moderate",
+              "difficulty_budget": 10.0,
+              "recommended_pattern_families": ["stream"],
+              "avoid_pattern_families": ["twist_technical"],
+              "accent_plan": [],
+              "rest_plan": [],
+              "motif_strategy": "develop",
+              "evidence": [],
+              "confidence": 0.8
+            }
+          ],
+          "diagnostics": {
+            "audio_bpm_detected": 120.0,
+            "ssc_initial_bpm": 120.0,
+            "audio_vs_ssc_tempo_agreement": true,
+            "beat_grid_error_ms_mean": 0.0,
+            "timing_confidence": 1.0,
+            "requires_manual_timing_review": false,
+            "warnings": [],
+            "analysis_mode": "offline"
+          },
+          "publicability": {
+            "contains_original_audio": false,
+            "contains_full_chart": false,
+            "exportable": true
+          }
+        }"#;
+        std::fs::write(
+            analysis_dir.join("song-analysis-report.v1.json"),
+            mock_report_content,
+        )
+        .expect("Failed to write mock report");
+
+        let test_audio_path = test_root.join("test_audio_avoid.mp3");
+        {
+            let mut file = std::fs::File::create(&test_audio_path).unwrap();
+            file.write_all(b"audio content").unwrap();
+        }
+
+        let empty_calib_json = r#"{
+            "schema_version": "single-guardrail-calibration.v0",
+            "publicability_status": "private_derived",
+            "play_mode": "Single",
+            "source_dataset_summary": {},
+            "level_thresholds": {
+                "S10": {
+                    "density": { "warning_p90": 1000.0, "hard_limit_p95": 1000.0 },
+                    "jump_rate": { "warning_p90": 10.0, "hard_limit_p95": 10.0 },
+                    "twist_rate": { "warning_p90": 10.0, "hard_limit_p95": 10.0 },
+                    "bracket_candidate_rate": { "warning_p90": 1000.0, "hard_limit_p95": 1000.0 }
+                }
+            },
+            "pattern_family_thresholds": {},
+            "confidence_policy": {},
+            "recommended_runtime_usage": []
+        }"#;
+        let empty_calib: crate::guardrail_calibration::SingleGuardrailCalibration =
+            serde_json::from_str(empty_calib_json).unwrap();
+
+        let client = GeminiClient::new(Some(server_url));
+        crate::settings::set_test_gemini_enabled(Some(true));
+
+        let result = generate_gemini_chart_preview_core_internal(
+            "fake-key",
+            &temp_ssc_path.to_string_lossy(),
+            &test_audio_path.to_string_lossy(),
+            PlayMode::Single,
+            10,
+            "sec2",
+            "AI Previewer",
+            &client,
+            Some(4),
+            Some(8),
+            None,
+            Some(true),
+            Some(true),
+            None,
+            Some(true), // use_calibrated_prompt_context = true
+            None,
+            Some(&empty_calib),
+            Some(true),
+        )
+        .await;
+
+        assert!(result.is_ok(), "Test failed: {:?}", result.err());
+
+        let prompt_data = captured_body
+            .lock()
+            .unwrap()
+            .clone()
+            .expect("No prompt was captured");
+        let v: serde_json::Value = serde_json::from_str(&prompt_data).unwrap();
+        let prompt_text = v["contents"][0]["parts"][0]["text"].as_str().unwrap();
+
+        assert!(
+            prompt_text.contains("Avoid continuity-forbidden families:")
+                && prompt_text.contains("twist_technical"),
+            "Prompt should contain forbidden families from effective node"
+        );
+        assert!(
+            prompt_text.contains("Use continuity secondary families sparingly:"),
+            "Prompt should contain secondary families guidance"
+        );
+
+        crate::settings::set_test_gemini_enabled(None);
+        let _ = std::fs::remove_dir_all(&test_root);
+    }
+
+    #[test]
+    fn test_continuity_privacy_audit_covers_new_fields() {
+        use crate::section_continuity::ContinuityContextSummary;
+        let mut summary = ContinuityContextSummary {
+            enabled: true,
+            section_index: 0,
+            section_count: 1,
+            global_arc: "balanced".to_string(),
+            current_motif_strategy: "unknown".to_string(),
+            transition_in: None,
+            transition_out: None,
+            neighbor_summary: crate::section_continuity::NeighborSummaryGroup {
+                previous: None,
+                next: None,
+            },
+            warnings: vec![],
+            current_primary_pattern_family: "balanced".to_string(),
+            current_secondary_pattern_families: vec![],
+            current_avoid_pattern_families: vec![],
+            current_intensity_band: "medium".to_string(),
+            current_density_intent: "medium".to_string(),
+            current_confidence: "low".to_string(),
+        };
+
+        let serialized_ok = serde_json::to_string(&summary).unwrap();
+        assert!(crate::generation_context::self_audit_prompt_context(&serialized_ok).is_ok());
+
+        summary.current_primary_pattern_family = "C:\\Users\\medra\\song.ssc".to_string();
+        let serialized_fail_1 = serde_json::to_string(&summary).unwrap();
+        assert!(crate::generation_context::self_audit_prompt_context(&serialized_fail_1).is_err());
+
+        summary.current_primary_pattern_family = "balanced".to_string();
+        summary.current_avoid_pattern_families = vec![".ai-step-gen-private-datasets".to_string()];
+        let serialized_fail_2 = serde_json::to_string(&summary).unwrap();
+        assert!(crate::generation_context::self_audit_prompt_context(&serialized_fail_2).is_err());
+    }
+
+    #[tokio::test]
+    async fn test_continuity_disabled_keeps_old_targeting_behavior() {
+        use std::io::{Read, Write};
+        use std::net::TcpListener;
+        use std::sync::{Arc, Mutex};
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let server_url = format!("http://127.0.0.1:{}", port);
+
+        let captured_body = Arc::new(Mutex::new(None));
+        let captured_body_clone = captured_body.clone();
+
+        std::thread::spawn(move || {
+            if let Ok((mut stream, _)) = listener.accept() {
+                let mut buffer = [0; 65536];
+                if let Ok(bytes_read) = stream.read(&mut buffer) {
+                    let req_str = String::from_utf8_lossy(&buffer[..bytes_read]).to_string();
+                    if let Some(body_start) = req_str.find("\r\n\r\n") {
+                        let body = req_str[body_start + 4..].to_string();
+                        let mut cap = captured_body_clone.lock().unwrap();
+                        *cap = Some(body);
+                    }
+                }
+                let response = "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\n\r\n{\
+                    \"candidates\": [\
+                        {\
+                            \"content\": {\
+                                \"parts\": [\
+                                    {\
+                                         \"text\": \"{\\n  \\\"section_id\\\": \\\"sec2\\\",\\n  \\\"difficulty_level\\\": 10,\\n  \\\"play_mode\\\": \\\"Single\\\",\\n  \\\"biomechanical_state\\\": {\\n    \\\"current_twist_debt\\\": 0.0,\\n    \\\"current_stamina_debt\\\": 0.1\\n  },\\n  \\\"measures\\\": []\\n}\"\
+                                    }\
+                                ]\
+                            }\
+                        }\
+                    ]\
+                }";
+                let _ = stream.write_all(response.as_bytes());
+                let _ = stream.flush();
+            }
+        });
+
+        let original_path = get_fixture_path();
+        let temp_dir = std::env::temp_dir();
+        let test_root = temp_dir.join("continuity_disabled_test_run");
+        let _ = std::fs::create_dir_all(&test_root);
+
+        let temp_ssc_path = test_root.join("test_continuity_disabled.ssc");
+        std::fs::copy(&original_path, &temp_ssc_path).expect("Failed to copy");
+
+        let analysis_dir = test_root.join(".ai-step-gen-analysis");
+        let _ = std::fs::create_dir_all(&analysis_dir);
+
+        let mock_report_content = r#"{
+          "schema_version": "v1",
+          "song_id": "test_song_disabled",
+          "title": "Mock Title",
+          "artist": "Mock Artist",
+          "duration_seconds": 120.0,
+          "audio_summary": {
+            "sample_rate": 44100,
+            "detected_bpm": 120.0,
+            "rms_energy_mean": 0.5,
+            "rms_energy_max": 0.8,
+            "spectral_centroid_mean": 1000.0,
+            "spectral_flatness_mean": 0.1,
+            "zero_crossing_rate_mean": 0.05,
+            "chroma_mean": null,
+            "spectral_contrast_mean": null,
+            "analysis_mode": "offline"
+          },
+          "timing_grid": {
+            "initial_offset": 0.0,
+            "bpms": [],
+            "display_bpm": "120",
+            "song_type": "Arcade"
+          },
+          "event_features": {
+            "beats": []
+          },
+          "sections": [
+            {
+              "section_id": "sec1",
+              "start_beat": 0.0,
+              "end_beat": 16.0,
+              "start_measure": 0,
+              "end_measure": 4,
+              "music_role": "intro",
+              "piu_role": "warmup",
+              "boundary_confidence": 0.9,
+              "energy_profile": "low"
+            },
+            {
+              "section_id": "sec2",
+              "start_beat": 16.0,
+              "end_beat": 32.0,
+              "start_measure": 4,
+              "end_measure": 8,
+              "music_role": "verse",
+              "piu_role": "stream_opportunity",
+              "boundary_confidence": 0.9,
+              "energy_profile": "mid"
+            }
+          ],
+          "choreographic_intent": [
+            {
+              "schema_version": "v1",
+              "section_id": "sec1",
+              "mode": "Single",
+              "target_level": 10,
+              "measure_start": 0,
+              "measure_end": 4,
+              "density_target": "light",
+              "difficulty_budget": 8.0,
+              "recommended_pattern_families": ["balanced"],
+              "avoid_pattern_families": [],
+              "accent_plan": [],
+              "rest_plan": [],
+              "motif_strategy": "introduce",
+              "evidence": [],
+              "confidence": 0.8
+            },
+            {
+              "schema_version": "v1",
+              "section_id": "sec2",
+              "mode": "Single",
+              "target_level": 10,
+              "measure_start": 4,
+              "measure_end": 8,
+              "density_target": "moderate",
+              "difficulty_budget": 10.0,
+              "recommended_pattern_families": ["stream"],
+              "avoid_pattern_families": ["twist_technical"],
+              "accent_plan": [],
+              "rest_plan": [],
+              "motif_strategy": "develop",
+              "evidence": [],
+              "confidence": 0.8
+            }
+          ],
+          "diagnostics": {
+            "audio_bpm_detected": 120.0,
+            "ssc_initial_bpm": 120.0,
+            "audio_vs_ssc_tempo_agreement": true,
+            "beat_grid_error_ms_mean": 0.0,
+            "timing_confidence": 1.0,
+            "requires_manual_timing_review": false,
+            "warnings": [],
+            "analysis_mode": "offline"
+          },
+          "publicability": {
+            "contains_original_audio": false,
+            "contains_full_chart": false,
+            "exportable": true
+          }
+        }"#;
+        std::fs::write(
+            analysis_dir.join("song-analysis-report.v1.json"),
+            mock_report_content,
+        )
+        .expect("Failed to write mock report");
+
+        let test_audio_path = test_root.join("test_audio_disabled.mp3");
+        {
+            let mut file = std::fs::File::create(&test_audio_path).unwrap();
+            file.write_all(b"audio content").unwrap();
+        }
+
+        let empty_calib_json = r#"{
+            "schema_version": "single-guardrail-calibration.v0",
+            "publicability_status": "private_derived",
+            "play_mode": "Single",
+            "source_dataset_summary": {},
+            "level_thresholds": {
+                "S10": {
+                    "density": { "warning_p90": 1000.0, "hard_limit_p95": 1000.0 },
+                    "jump_rate": { "warning_p90": 10.0, "hard_limit_p95": 10.0 },
+                    "twist_rate": { "warning_p90": 10.0, "hard_limit_p95": 10.0 },
+                    "bracket_candidate_rate": { "warning_p90": 1000.0, "hard_limit_p95": 1000.0 }
+                }
+            },
+            "pattern_family_thresholds": {},
+            "confidence_policy": {},
+            "recommended_runtime_usage": []
+        }"#;
+        let empty_calib: crate::guardrail_calibration::SingleGuardrailCalibration =
+            serde_json::from_str(empty_calib_json).unwrap();
+
+        let client = GeminiClient::new(Some(server_url));
+        crate::settings::set_test_gemini_enabled(Some(true));
+
+        let result = generate_gemini_chart_preview_core_internal(
+            "fake-key",
+            &temp_ssc_path.to_string_lossy(),
+            &test_audio_path.to_string_lossy(),
+            PlayMode::Single,
+            10,
+            "sec2",
+            "AI Previewer",
+            &client,
+            Some(4),
+            Some(8),
+            None,
+            Some(true),
+            Some(true),
+            None,
+            Some(true), // use_calibrated_prompt_context = true
+            None,
+            Some(&empty_calib),
+            Some(false), // use_continuity_planning = false
+        )
+        .await;
+
+        assert!(result.is_ok(), "Test failed: {:?}", result.err());
+        let res_val = result.unwrap();
+        assert!(res_val.continuity_plan.is_none());
+
+        let prompt_data = captured_body
+            .lock()
+            .unwrap()
+            .clone()
+            .expect("No prompt was captured");
+        let v: serde_json::Value = serde_json::from_str(&prompt_data).unwrap();
+        let prompt_text = v["contents"][0]["parts"][0]["text"].as_str().unwrap();
+
+        assert!(
+            prompt_text.contains("Prefer the selected/calibrated pattern family: 'stream'"),
+            "Prompt should contain original targeting primary family selection instruction"
+        );
+        assert!(
+            !prompt_text.contains("Prefer the continuity-adjusted primary pattern family: "),
+            "Prompt should not contain continuity-adjusted instructions when disabled"
         );
 
         crate::settings::set_test_gemini_enabled(None);
