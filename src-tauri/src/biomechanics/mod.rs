@@ -21,6 +21,8 @@ pub enum ValidationIssueType {
     DoubleStep,
     ConsecutiveJumps,
     InvalidGeminiStructure,
+    CalibrationGuardrailError,
+    CalibrationGuardrailWarning,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]

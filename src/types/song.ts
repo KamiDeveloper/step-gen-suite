@@ -45,7 +45,9 @@ export type ValidationIssueType =
   | "TripleTap"
   | "DoubleStep"
   | "ConsecutiveJumps"
-  | "InvalidGeminiStructure";
+  | "InvalidGeminiStructure"
+  | "CalibrationGuardrailError"
+  | "CalibrationGuardrailWarning";
 
 export interface IValidationIssue {
   measure_index: number;
@@ -61,6 +63,28 @@ export interface IValidatedChartSection {
   issues: IValidationIssue[];
 }
 
+export interface ICalibrationWarning {
+  issue_type: string;
+  message: string;
+}
+
+export interface ICalibrationError {
+  issue_type: string;
+  message: string;
+}
+
+export interface ICalibrationValidationReport {
+  calibration_available: boolean;
+  schema_version: string | null;
+  target_level: number | null;
+  level_confidence: string | null;
+  warnings: ICalibrationWarning[];
+  errors: ICalibrationError[];
+  matched_thresholds?: any | null;
+  pattern_family_signals?: any | null;
+  summary: string;
+}
+
 export interface IAppendChartResult {
   charts: IChartDetails[];
   validation: IValidatedChartSection;
@@ -70,6 +94,7 @@ export interface IAppendChartResult {
   raw_payload?: string | null;
   backup_path?: string | null;
   context_sources_used?: string[] | null;
+  calibration_report?: ICalibrationValidationReport | null;
 }
 
 export interface IGeminiBiomechanicalState {

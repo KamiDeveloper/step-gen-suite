@@ -1248,6 +1248,70 @@ export const ProjectWorkspace: React.FC<ProjectWorkspaceProps> = ({ onNavigate }
                   ) : null}
                 </div>
 
+                {/* Calibration Guardrails Report */}
+                {previewResult.calibration_report && (
+                  <div className={`validation-report-panel calibration-panel ${
+                    !previewResult.calibration_report.calibration_available
+                      ? "clean"
+                      : previewResult.calibration_report.errors.length > 0
+                        ? "has-errors"
+                        : previewResult.calibration_report.warnings.length > 0
+                          ? "has-warnings"
+                          : "clean"
+                  }`}>
+                    <div className="validation-report-header">
+                      <span className="validation-report-summary validation-report-summary-flex">
+                        {!previewResult.calibration_report.calibration_available ? (
+                          <CheckCircle size={16} className="text-success-icon" />
+                        ) : previewResult.calibration_report.errors.length > 0 ? (
+                          <AlertCircle size={16} className="text-danger-icon" />
+                        ) : previewResult.calibration_report.warnings.length > 0 ? (
+                          <AlertTriangle size={16} className="text-warning-icon" />
+                        ) : (
+                          <CheckCircle size={16} className="text-success-icon" />
+                        )}
+                        <span>Calibration Guardrails</span>
+                      </span>
+                      <span className="validation-count-badge">
+                        {previewResult.calibration_report.calibration_available ? (
+                          `${previewResult.calibration_report.errors.length} errors, ${previewResult.calibration_report.warnings.length} warnings`
+                        ) : (
+                          "Unavailable"
+                        )}
+                      </span>
+                    </div>
+
+                    <div className="validation-sections-wrapper calibration-sections-wrapper">
+                      <div className="calibration-meta-row">
+                        <span>Target Level: S{previewResult.calibration_report.target_level ?? targetLevel}</span>
+                        <span>Confidence: {previewResult.calibration_report.level_confidence || "N/A"}</span>
+                        <span>Source: local derived calibration</span>
+                      </div>
+                      <p className="calibration-summary-text">{previewResult.calibration_report.summary}</p>
+
+                      {previewResult.calibration_report.warnings.length > 0 && (
+                        <div className="validation-issues-list calibration-issues-list-margin">
+                          {previewResult.calibration_report.warnings.map((w, idx) => (
+                            <div key={idx} className="issue-row-item warning">
+                              <span className="issue-message">[{w.issue_type}] {w.message}</span>
+                            </div>
+                          ))}
+                        </div>
+                      )}
+
+                      {previewResult.calibration_report.errors.length > 0 && (
+                        <div className="validation-issues-list calibration-issues-list-margin">
+                          {previewResult.calibration_report.errors.map((e, idx) => (
+                            <div key={idx} className="issue-row-item error">
+                              <span className="issue-message">[{e.issue_type}] {e.message}</span>
+                            </div>
+                          ))}
+                        </div>
+                      )}
+                    </div>
+                  </div>
+                )}
+
                 {/* Validation Report */}
                 <div className={`validation-report-panel ${previewResult.validation.issues.some(i => i.severity === "Error")
                     ? "has-errors"

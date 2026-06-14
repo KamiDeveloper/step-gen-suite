@@ -120,6 +120,7 @@ pub struct AppendChartResult {
     pub raw_payload: Option<String>,
     pub backup_path: Option<String>,
     pub context_sources_used: Option<Vec<String>>,
+    pub calibration_report: Option<crate::guardrail_calibration::CalibrationValidationReport>,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone, PartialEq)]
@@ -260,6 +261,7 @@ pub fn append_chart_to_ssc_atomic(
             raw_payload: None,
             backup_path: None,
             context_sources_used: None,
+            calibration_report: None,
         });
     }
 
@@ -361,6 +363,7 @@ pub fn append_chart_to_ssc_atomic(
         raw_payload: None,
         backup_path,
         context_sources_used: None,
+        calibration_report: None,
     })
 }
 
@@ -1413,6 +1416,7 @@ pub fn append_mock_gemini_payload(
                 raw_payload: None,
                 backup_path: None,
                 context_sources_used: None,
+                calibration_report: None,
             })
         }
     }
@@ -1531,6 +1535,42 @@ pub async fn generate_gemini_chart_preview_core(
     play_mode: PlayMode,
     target_level: u32,
     section_id: &str,
+    author: &str,
+    client: &GeminiClient,
+    start_measure: Option<u32>,
+    end_measure: Option<u32>,
+    song_type: Option<String>,
+    use_music_analysis: Option<bool>,
+    use_browser_bpm: Option<bool>,
+    browser_bpm_reconciliation: Option<String>,
+) -> Result<AppendChartResult, String> {
+    generate_gemini_chart_preview_core_internal(
+        api_key,
+        ssc_path,
+        audio_path,
+        play_mode,
+        target_level,
+        section_id,
+        author,
+        client,
+        start_measure,
+        end_measure,
+        song_type,
+        use_music_analysis,
+        use_browser_bpm,
+        browser_bpm_reconciliation,
+        None,
+    )
+    .await
+}
+
+pub async fn generate_gemini_chart_preview_core_internal(
+    api_key: &str,
+    ssc_path: &str,
+    audio_path: &str,
+    play_mode: PlayMode,
+    target_level: u32,
+    section_id: &str,
     _author: &str,
     client: &GeminiClient,
     start_measure: Option<u32>,
@@ -1539,6 +1579,7 @@ pub async fn generate_gemini_chart_preview_core(
     use_music_analysis: Option<bool>,
     use_browser_bpm: Option<bool>,
     browser_bpm_reconciliation: Option<String>,
+    override_calibration: Option<&crate::guardrail_calibration::SingleGuardrailCalibration>,
 ) -> Result<AppendChartResult, String> {
     // 1. Check environment variable gate
     if !crate::settings::is_gemini_enabled() {
@@ -1900,6 +1941,7 @@ pub async fn generate_gemini_chart_preview_core(
             raw_payload: Some(clean_response),
             backup_path: None,
             context_sources_used: Some(context_sources_used.clone()),
+            calibration_report: None,
         });
     }
 
@@ -1927,6 +1969,68 @@ pub async fn generate_gemini_chart_preview_core(
             }
         }
     };
+
+    // 7.5 Calibration evaluation
+    let mut calibration_report = None;
+    let mut validation_result = validation_result;
+    if play_mode == PlayMode::Single {
+        let calib_opt = if let Some(cal) = override_calibration {
+            Some(cal.clone())
+        } else {
+            crate::guardrail_calibration::resolve_calibration_file(None)
+        };
+        if let Some(calib) = calib_opt {
+            let parsed_initial_bpm = bpms_val
+                .split(',')
+                .next()
+                .and_then(|part| part.split('=').nth(1))
+                .and_then(|val| val.trim().parse::<f64>().ok())
+                .unwrap_or(120.0);
+
+            let report = crate::guardrail_calibration::evaluate_section_against_calibration(
+                &payload,
+                &calib,
+                target_level,
+                parsed_initial_bpm,
+            );
+
+            // Append errors/warnings to validation issues
+            for err in &report.errors {
+                validation_result.issues.push(ValidationIssue {
+                    measure_index: 0,
+                    row_index: 0,
+                    severity: ValidationSeverity::Error,
+                    issue_type: ValidationIssueType::CalibrationGuardrailError,
+                    message: format!("[Calibration Error] {}", err.message),
+                });
+            }
+
+            for wrn in &report.warnings {
+                validation_result.issues.push(ValidationIssue {
+                    measure_index: 0,
+                    row_index: 0,
+                    severity: ValidationSeverity::Warning,
+                    issue_type: ValidationIssueType::CalibrationGuardrailWarning,
+                    message: format!("[Calibration Warning] {}", wrn.message),
+                });
+            }
+
+            calibration_report = Some(report);
+        } else {
+            calibration_report = Some(crate::guardrail_calibration::CalibrationValidationReport {
+                calibration_available: false,
+                schema_version: None,
+                target_level: Some(target_level),
+                level_confidence: None,
+                warnings: Vec::new(),
+                errors: Vec::new(),
+                matched_thresholds: None,
+                pattern_family_signals: None,
+                summary: "Calibración no disponible (archivo no encontrado o inválido)."
+                    .to_string(),
+            });
+        }
+    }
 
     let current_charts = list_charts(ssc_path.to_string())?;
     let written = false;
@@ -1958,6 +2062,7 @@ pub async fn generate_gemini_chart_preview_core(
         raw_payload: Some(clean_response),
         backup_path: None,
         context_sources_used: Some(context_sources_used),
+        calibration_report,
     })
 }
 
@@ -2530,6 +2635,26 @@ mod tests {
     async fn test_generate_gemini_chart_preview_flow() {
         let mut server = Server::new_async().await;
 
+        let empty_calib_json = r#"{
+            "schema_version": "single-guardrail-calibration.v0",
+            "publicability_status": "private_derived",
+            "play_mode": "Single",
+            "source_dataset_summary": {},
+            "level_thresholds": {
+                "S10": {
+                    "density": { "warning_p90": 1000.0, "hard_limit_p95": 1000.0 },
+                    "jump_rate": { "warning_p90": 10.0, "hard_limit_p95": 10.0 },
+                    "twist_rate": { "warning_p90": 10.0, "hard_limit_p95": 10.0 },
+                    "bracket_candidate_rate": { "warning_p90": 1000.0, "hard_limit_p95": 1000.0 }
+                }
+            },
+            "pattern_family_thresholds": {},
+            "confidence_policy": {},
+            "recommended_runtime_usage": []
+        }"#;
+        let empty_calib: crate::guardrail_calibration::SingleGuardrailCalibration =
+            serde_json::from_str(empty_calib_json).unwrap();
+
         // Mock Gemini response (Valid structured response)
         let mock_post = server.mock("POST", "/v1beta/models/gemini-3.5-flash:generateContent")
             .with_status(200)
@@ -2540,7 +2665,7 @@ mod tests {
                         "content": {
                             "parts": [
                                 {
-                                    "text": "{\n  \"section_id\": \"preview_section\",\n  \"difficulty_level\": 10,\n  \"play_mode\": \"Single\",\n  \"biomechanical_state\": {\n    \"current_twist_debt\": 0.0,\n    \"current_stamina_debt\": 0.1\n  },\n  \"measures\": [\n    {\n      \"measure_index\": 0,\n      \"subdivision\": 4,\n      \"rows\": [\n        \"10000\",\n        \"00100\",\n        \"00001\",\n        \"00100\"\n      ]\n    }\n  ]\n}"
+                                     "text": "{\n  \"section_id\": \"preview_section\",\n  \"difficulty_level\": 10,\n  \"play_mode\": \"Single\",\n  \"biomechanical_state\": {\n    \"current_twist_debt\": 0.0,\n    \"current_stamina_debt\": 0.1\n  },\n  \"measures\": [\n    {\n      \"measure_index\": 0,\n      \"subdivision\": 4,\n      \"rows\": [\n        \"10000\",\n        \"00100\",\n        \"00001\",\n        \"00100\"\n      ]\n    }\n  ]\n}"
                                 }
                             ]
                         }
@@ -2567,7 +2692,7 @@ mod tests {
 
         // Case 1: Env gate is NOT enabled -> should return error and NOT call Mock server
         crate::settings::set_test_gemini_enabled(Some(false));
-        let result_gate = generate_gemini_chart_preview_core(
+        let result_gate = generate_gemini_chart_preview_core_internal(
             "fake-key",
             &temp_ssc_path.to_string_lossy(),
             &test_audio_path.to_string_lossy(),
@@ -2582,6 +2707,7 @@ mod tests {
             None,
             None,
             None,
+            Some(&empty_calib),
         )
         .await;
         assert!(result_gate.is_err());
@@ -2591,7 +2717,7 @@ mod tests {
         crate::settings::set_test_gemini_enabled(Some(true));
 
         // Case 2: PreviewOnly valid flow
-        let result_preview = generate_gemini_chart_preview_core(
+        let result_preview = generate_gemini_chart_preview_core_internal(
             "fake-key",
             &temp_ssc_path.to_string_lossy(),
             &test_audio_path.to_string_lossy(),
@@ -2606,6 +2732,7 @@ mod tests {
             None,
             None,
             None,
+            Some(&empty_calib),
         )
         .await
         .expect("PreviewOnly flow failed");
@@ -2637,7 +2764,7 @@ mod tests {
             .create_async()
             .await;
 
-        let result_mismatch = generate_gemini_chart_preview_core(
+        let result_mismatch = generate_gemini_chart_preview_core_internal(
             "fake-key",
             &temp_ssc_path.to_string_lossy(),
             &test_audio_path.to_string_lossy(),
@@ -2652,6 +2779,7 @@ mod tests {
             None,
             None,
             None,
+            Some(&empty_calib),
         )
         .await
         .expect("Core preview mismatch section_id failed");
@@ -2684,7 +2812,7 @@ mod tests {
             .create_async()
             .await;
 
-        let result_mismatch_pm = generate_gemini_chart_preview_core(
+        let result_mismatch_pm = generate_gemini_chart_preview_core_internal(
             "fake-key",
             &temp_ssc_path.to_string_lossy(),
             &test_audio_path.to_string_lossy(),
@@ -2699,6 +2827,7 @@ mod tests {
             None,
             None,
             None,
+            Some(&empty_calib),
         )
         .await
         .expect("Core preview mismatch play_mode failed");
@@ -2731,7 +2860,7 @@ mod tests {
             .create_async()
             .await;
 
-        let result_mismatch_diff = generate_gemini_chart_preview_core(
+        let result_mismatch_diff = generate_gemini_chart_preview_core_internal(
             "fake-key",
             &temp_ssc_path.to_string_lossy(),
             &test_audio_path.to_string_lossy(),
@@ -2746,6 +2875,7 @@ mod tests {
             None,
             None,
             None,
+            Some(&empty_calib),
         )
         .await
         .expect("Core preview mismatch diff failed");
@@ -2778,7 +2908,7 @@ mod tests {
             .create_async()
             .await;
 
-        let result_warning = generate_gemini_chart_preview_core(
+        let result_warning = generate_gemini_chart_preview_core_internal(
             "fake-key",
             &temp_ssc_path.to_string_lossy(),
             &test_audio_path.to_string_lossy(),
@@ -2793,6 +2923,7 @@ mod tests {
             None,
             None,
             None,
+            Some(&empty_calib),
         )
         .await
         .expect("Core preview with warnings failed");
@@ -2821,7 +2952,7 @@ mod tests {
             .create_async()
             .await;
 
-        let result_error = generate_gemini_chart_preview_core(
+        let result_error = generate_gemini_chart_preview_core_internal(
             "fake-key",
             &temp_ssc_path.to_string_lossy(),
             &test_audio_path.to_string_lossy(),
@@ -2836,6 +2967,7 @@ mod tests {
             None,
             None,
             None,
+            Some(&empty_calib),
         )
         .await
         .expect("Core preview with error failed");
@@ -2855,7 +2987,7 @@ mod tests {
             .create_async()
             .await;
 
-        let result_bad_json = generate_gemini_chart_preview_core(
+        let result_bad_json = generate_gemini_chart_preview_core_internal(
             "fake-key",
             &temp_ssc_path.to_string_lossy(),
             &test_audio_path.to_string_lossy(),
@@ -2870,6 +3002,7 @@ mod tests {
             None,
             None,
             None,
+            Some(&empty_calib),
         )
         .await;
 
@@ -2899,7 +3032,7 @@ mod tests {
             .create_async()
             .await;
 
-        let result_valid_range = generate_gemini_chart_preview_core(
+        let result_valid_range = generate_gemini_chart_preview_core_internal(
             "fake-key",
             &temp_ssc_path.to_string_lossy(),
             &test_audio_path.to_string_lossy(),
@@ -2914,6 +3047,7 @@ mod tests {
             None,
             None,
             None,
+            Some(&empty_calib),
         )
         .await
         .expect("Valid range preview failed");
@@ -2946,7 +3080,7 @@ mod tests {
             .create_async()
             .await;
 
-        let result_missing_measures = generate_gemini_chart_preview_core(
+        let result_missing_measures = generate_gemini_chart_preview_core_internal(
             "fake-key",
             &temp_ssc_path.to_string_lossy(),
             &test_audio_path.to_string_lossy(),
@@ -2961,6 +3095,7 @@ mod tests {
             None,
             None,
             None,
+            Some(&empty_calib),
         )
         .await
         .expect("Preview core failed");
@@ -2991,7 +3126,7 @@ mod tests {
             .create_async()
             .await;
 
-        let result_incorrect_indices = generate_gemini_chart_preview_core(
+        let result_incorrect_indices = generate_gemini_chart_preview_core_internal(
             "fake-key",
             &temp_ssc_path.to_string_lossy(),
             &test_audio_path.to_string_lossy(),
@@ -3006,6 +3141,7 @@ mod tests {
             None,
             None,
             None,
+            Some(&empty_calib),
         )
         .await
         .expect("Preview core failed");
@@ -3018,7 +3154,7 @@ mod tests {
         }));
 
         // Case 12: end_measure < start_measure -> should return error before calling Gemini
-        let result_invalid_range_pre = generate_gemini_chart_preview_core(
+        let result_invalid_range_pre = generate_gemini_chart_preview_core_internal(
             "fake-key",
             &temp_ssc_path.to_string_lossy(),
             &test_audio_path.to_string_lossy(),
@@ -3033,6 +3169,7 @@ mod tests {
             None,
             None,
             None,
+            Some(&empty_calib),
         )
         .await;
 
@@ -3061,7 +3198,7 @@ mod tests {
             .create_async()
             .await;
 
-        let result_fenced = generate_gemini_chart_preview_core(
+        let result_fenced = generate_gemini_chart_preview_core_internal(
             "fake-key",
             &temp_ssc_path.to_string_lossy(),
             &test_audio_path.to_string_lossy(),
@@ -3076,6 +3213,7 @@ mod tests {
             None,
             None,
             None,
+            Some(&empty_calib),
         )
         .await
         .expect("Fenced JSON preview failed");
@@ -3087,6 +3225,126 @@ mod tests {
             .expect("raw_payload should be present");
         assert!(!raw_payload_clean.contains("```"));
         assert!(raw_payload_clean.contains("\"section_id\""));
+
+        // Clean up
+        crate::settings::set_test_gemini_enabled(None);
+        let _ = std::fs::remove_file(temp_ssc_path);
+        let _ = std::fs::remove_file(test_audio_path);
+    }
+
+    #[tokio::test]
+    async fn test_generate_gemini_chart_preview_with_synthetic_calibration() {
+        let mut server = Server::new_async().await;
+
+        // Mock Gemini response (exceeds density limit in calibration)
+        let mock_post = server.mock("POST", "/v1beta/models/gemini-3.5-flash:generateContent")
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(r#"{
+                "candidates": [
+                    {
+                        "content": {
+                            "parts": [
+                                {
+                                    "text": "{\n  \"section_id\": \"preview_section\",\n  \"difficulty_level\": 14,\n  \"play_mode\": \"Single\",\n  \"biomechanical_state\": {\n    \"current_twist_debt\": 0.0,\n    \"current_stamina_debt\": 0.1\n  },\n  \"measures\": [\n    {\n      \"measure_index\": 0,\n      \"subdivision\": 16,\n      \"rows\": [\n        \"10001\",\n        \"10001\",\n        \"10001\",\n        \"10001\",\n        \"10001\",\n        \"10001\",\n        \"10001\",\n        \"10001\",\n        \"10001\",\n        \"10001\",\n        \"10001\",\n        \"10001\",\n        \"10001\",\n        \"10001\",\n        \"10001\",\n        \"10001\"\n      ]\n    }\n  ]\n}"
+                                }
+                            ]
+                        }
+                    }
+                ]
+            }"#)
+            .create_async()
+            .await;
+
+        let original_path = get_fixture_path();
+        let temp_dir = std::env::temp_dir();
+        let temp_ssc_path = temp_dir.join("test_gemini_preview_calib.ssc");
+        std::fs::copy(&original_path, &temp_ssc_path).expect("Failed to copy");
+
+        let test_audio_path = temp_dir.join("test_audio_calib.mp3");
+        {
+            let mut file = std::fs::File::create(&test_audio_path).unwrap();
+            file.write_all(b"audio content").unwrap();
+        }
+
+        let client = GeminiClient::new(Some(server.url()));
+        crate::settings::set_test_gemini_enabled(Some(true));
+
+        // Let's create a synthetic calibration structure
+        let calib_json = r#"{
+            "schema_version": "single-guardrail-calibration.v0",
+            "publicability_status": "private_derived",
+            "play_mode": "Single",
+            "source_dataset_summary": {},
+            "level_thresholds": {
+                "S14": {
+                    "density": {
+                        "warning_p90": 10.0,
+                        "hard_limit_p95": 15.0,
+                        "typical_p50": 8.0
+                    },
+                    "jump_rate": {
+                        "warning_p90": 0.15,
+                        "hard_limit_p95": 0.20
+                    },
+                    "twist_rate": {
+                        "warning_p90": 0.10,
+                        "hard_limit_p95": 0.15
+                    },
+                    "bracket_candidate_rate": {
+                        "warning_p90": 30.0,
+                        "hard_limit_p95": 40.0
+                    }
+                }
+            },
+            "pattern_family_thresholds": {},
+            "confidence_policy": {},
+            "recommended_runtime_usage": []
+        }"#;
+
+        let calib: crate::guardrail_calibration::SingleGuardrailCalibration =
+            serde_json::from_str(calib_json).unwrap();
+
+        // 1 measure, 32 notes (density = 32.0 > p95 limit of 15.0) -> should produce calibration error
+        let result = generate_gemini_chart_preview_core_internal(
+            "fake-key",
+            &temp_ssc_path.to_string_lossy(),
+            &test_audio_path.to_string_lossy(),
+            PlayMode::Single,
+            14,
+            "preview_section",
+            "AI Previewer",
+            &client,
+            Some(0),
+            Some(0),
+            None,
+            None,
+            None,
+            None,
+            Some(&calib),
+        )
+        .await
+        .expect("Failed to run preview with calibration");
+
+        mock_post.assert_async().await;
+
+        // Verify that report is available and contains the error
+        let report = result
+            .calibration_report
+            .expect("No calibration report returned");
+        assert!(report.calibration_available);
+        assert_eq!(report.target_level, Some(14));
+        assert!(report
+            .errors
+            .iter()
+            .any(|e| e.issue_type == "DensityLimitExceeded"));
+
+        // Verify issues in validation result contain the calibration issue
+        assert!(result
+            .validation
+            .issues
+            .iter()
+            .any(|i| i.issue_type == ValidationIssueType::CalibrationGuardrailError));
 
         // Clean up
         crate::settings::set_test_gemini_enabled(None);

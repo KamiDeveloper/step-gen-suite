@@ -1207,6 +1207,39 @@
   border-color: #bbf7d0;
 }
 
+.calibration-panel {
+  margin-bottom: var(--spacing-16);
+}
+
+.validation-report-summary-flex {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.calibration-sections-wrapper {
+  font-size: 13px;
+}
+
+.calibration-meta-row {
+  display: flex;
+  gap: var(--spacing-16);
+  margin-bottom: var(--spacing-8);
+  color: var(--color-gravel);
+  font-size: 11px;
+  text-transform: uppercase;
+  font-weight: var(--font-weight-bold);
+}
+
+.calibration-summary-text {
+  margin: var(--spacing-4) 0 var(--spacing-8) 0;
+  color: var(--color-slate);
+}
+
+.calibration-issues-list-margin {
+  margin-top: var(--spacing-8);
+}
+
 .validation-report-header {
   display: flex;
   justify-content: space-between;
