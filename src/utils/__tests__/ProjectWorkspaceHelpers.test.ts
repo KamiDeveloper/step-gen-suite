@@ -10,7 +10,11 @@ import {
   getTransitionTypeLabel,
   getIntensityBandLabel,
   isSectionPlanStale,
-  sanitizeSectionOverrideNote
+  sanitizeSectionOverrideNote,
+  canRunMultiSectionBatch,
+  selectedSectionCountValidation,
+  isBatchStale,
+  getQueueStatusLabel
 } from "../ProjectWorkspaceHelpers.ts";
 import type {
   PreviewParams,
@@ -105,6 +109,9 @@ test("isAppendDisabled logic verification", () => {
 
   // Null preview -> disabled
   assert.strictEqual(isAppendDisabled(null, fingerprintOk1, fingerprintOk2, false), true);
+
+  // Session marked unsafe -> disabled
+  assert.strictEqual(isAppendDisabled(cleanPreview, fingerprintOk1, fingerprintOk2, false, true), true);
 });
 
 test("isPreviewStale stale state checking", () => {
@@ -269,5 +276,198 @@ test("sanitizeSectionOverrideNote security boundaries", () => {
   assert.strictEqual(sanitizeSectionOverrideNote("contains .mp3 extension").isValid, false);
   assert.strictEqual(sanitizeSectionOverrideNote("contains docs/official_songs inside").isValid, false);
 });
+
+test("canRunMultiSectionBatch validations", () => {
+  const plan = {
+    schema_version: "v1",
+    play_mode: "Single",
+    target_level: 10,
+    calibration_available: true,
+    section_count: 3,
+    sections: [
+      {
+        section_id: "sec1",
+        section_index: 0,
+        start_measure: 0,
+        end_measure: 4,
+        music_role: "intro",
+        piu_role: "warmup",
+        density_intent: "light",
+        intensity_band: "low",
+        primary_pattern_family: "balanced",
+        secondary_pattern_families: [],
+        avoid_pattern_families: [],
+        motif_strategy: "introduce",
+        transition_in: { transition_type: "smooth_continue", density_delta: "none", family_shift: "none", recommended_bridge: "", warnings: [] },
+        transition_out: { transition_type: "smooth_continue", density_delta: "none", family_shift: "none", recommended_bridge: "", warnings: [] },
+        confidence: "high",
+        evidence: [],
+        warnings: [],
+        enabled: true,
+      },
+      {
+        section_id: "sec2",
+        section_index: 1,
+        start_measure: 4,
+        end_measure: 8,
+        music_role: "verse",
+        piu_role: "stream_opportunity",
+        density_intent: "moderate",
+        intensity_band: "medium",
+        primary_pattern_family: "stream",
+        secondary_pattern_families: [],
+        avoid_pattern_families: [],
+        motif_strategy: "develop",
+        transition_in: { transition_type: "smooth_continue", density_delta: "none", family_shift: "none", recommended_bridge: "", warnings: [] },
+        transition_out: { transition_type: "smooth_continue", density_delta: "none", family_shift: "none", recommended_bridge: "", warnings: [] },
+        confidence: "high",
+        evidence: [],
+        warnings: [],
+        enabled: false, // disabled for testing
+      },
+      {
+        section_id: "sec3",
+        section_index: 2,
+        start_measure: 8,
+        end_measure: 12,
+        music_role: "chorus",
+        piu_role: "climax_run",
+        density_intent: "heavy",
+        intensity_band: "high",
+        primary_pattern_family: "stream",
+        secondary_pattern_families: [],
+        avoid_pattern_families: [],
+        motif_strategy: "intensify",
+        transition_in: { transition_type: "smooth_continue", density_delta: "none", family_shift: "none", recommended_bridge: "", warnings: [] },
+        transition_out: { transition_type: "smooth_continue", density_delta: "none", family_shift: "none", recommended_bridge: "", warnings: [] },
+        confidence: "high",
+        evidence: [],
+        warnings: [],
+        enabled: true,
+      }
+    ],
+    global_arc: { arc_type: "peak_climax", peak_section_ids: ["sec3"], rest_section_ids: [], motif_policy: "introduce", density_curve: [] },
+    warnings: [],
+  };
+
+  // Rejects empty selection
+  assert.strictEqual(canRunMultiSectionBatch([], plan).isValid, false);
+  assert.ok(canRunMultiSectionBatch([], plan).error?.includes("No hay secciones seleccionadas"));
+
+  // Rejects when no plan
+  assert.strictEqual(canRunMultiSectionBatch(["sec1"], null).isValid, false);
+  assert.ok(canRunMultiSectionBatch(["sec1"], null).error?.includes("no está cargado"));
+
+  // Rejects too many sections (limit 4)
+  assert.strictEqual(canRunMultiSectionBatch(["sec1", "sec2", "sec3", "sec4", "sec5"], plan).isValid, false);
+  assert.ok(canRunMultiSectionBatch(["sec1", "sec2", "sec3", "sec4", "sec5"], plan).error?.includes("máximo de 4"));
+
+  // Rejects disabled section
+  assert.strictEqual(canRunMultiSectionBatch(["sec1", "sec2"], plan).isValid, false);
+  assert.ok(canRunMultiSectionBatch(["sec1", "sec2"], plan).error?.includes("deshabilitadas"));
+
+  // Rejects unknown section
+  assert.strictEqual(canRunMultiSectionBatch(["sec1", "sec_unknown"], plan).isValid, false);
+  assert.ok(canRunMultiSectionBatch(["sec1", "sec_unknown"], plan).error?.includes("no encontrada"));
+
+  // Rejects non-chronological order
+  assert.strictEqual(canRunMultiSectionBatch(["sec3", "sec1"], plan).isValid, false);
+  assert.ok(canRunMultiSectionBatch(["sec3", "sec1"], plan).error?.includes("cronológicamente"));
+
+  // Rejects duplicate sections
+  assert.strictEqual(canRunMultiSectionBatch(["sec1", "sec1"], plan).isValid, false);
+  assert.ok(canRunMultiSectionBatch(["sec1", "sec1"], plan).error?.includes("duplicadas"));
+
+  // Plan with invalid bounds for testing
+  const planInvalidBounds = {
+    ...plan,
+    sections: [
+      {
+        ...plan.sections[0],
+        section_id: "sec_negative",
+        start_measure: -5,
+        end_measure: 5,
+        enabled: true,
+      },
+      {
+        ...plan.sections[0],
+        section_id: "sec_inverted",
+        start_measure: 5,
+        end_measure: 4,
+        enabled: true,
+      },
+      {
+        ...plan.sections[0],
+        section_id: "sec_too_long",
+        start_measure: 0,
+        end_measure: 18, // 19 measures
+        enabled: true,
+      }
+    ]
+  };
+
+  // Rejects negative measure bounds
+  assert.strictEqual(canRunMultiSectionBatch(["sec_negative"], planInvalidBounds).isValid, false);
+  assert.ok(canRunMultiSectionBatch(["sec_negative"], planInvalidBounds).error?.includes("valores negativos"));
+
+  // Rejects inverted bounds (start >= end)
+  assert.strictEqual(canRunMultiSectionBatch(["sec_inverted"], planInvalidBounds).isValid, false);
+  assert.ok(canRunMultiSectionBatch(["sec_inverted"], planInvalidBounds).error?.includes("inicio >= fin"));
+
+  // Rejects section > 16 measures
+  assert.strictEqual(canRunMultiSectionBatch(["sec_too_long"], planInvalidBounds).isValid, false);
+  assert.ok(canRunMultiSectionBatch(["sec_too_long"], planInvalidBounds).error?.includes("supera el límite máximo de 16 compases"));
+
+  // Valid selection
+  const validRes = canRunMultiSectionBatch(["sec1", "sec3"], plan);
+  assert.strictEqual(validRes.isValid, true);
+  assert.strictEqual(validRes.error, null);
+});
+
+test("selectedSectionCountValidation checking", () => {
+  assert.strictEqual(selectedSectionCountValidation(0), false);
+  assert.strictEqual(selectedSectionCountValidation(1), true);
+  assert.strictEqual(selectedSectionCountValidation(4), true);
+  assert.strictEqual(selectedSectionCountValidation(5), false);
+});
+
+test("isBatchStale checks", () => {
+  const snapshot = {
+    targetLevel: 10,
+    useCalibratedPromptContext: true,
+    useContinuityPlanning: true,
+    patternFamilyTarget: "stream",
+    selectedSectionIds: ["sec1", "sec3"],
+    overrides: [
+      {
+        section_id: "sec1",
+        enabled: true,
+        primary_pattern_family: "stamina",
+      }
+    ],
+  };
+
+  const currentSame = { ...snapshot };
+  const currentDiffLevel = { ...snapshot, targetLevel: 11 };
+  const currentDiffCalib = { ...snapshot, useCalibratedPromptContext: false };
+  const currentDiffIds = { ...snapshot, selectedSectionIds: ["sec1"] };
+
+  assert.strictEqual(isBatchStale(null, snapshot), false);
+  assert.strictEqual(isBatchStale(snapshot, currentSame), false);
+  assert.strictEqual(isBatchStale(snapshot, currentDiffLevel), true);
+  assert.strictEqual(isBatchStale(snapshot, currentDiffCalib), true);
+  assert.strictEqual(isBatchStale(snapshot, currentDiffIds), true);
+});
+
+test("getQueueStatusLabel mappings", () => {
+  assert.strictEqual(getQueueStatusLabel("queued"), "En cola");
+  assert.strictEqual(getQueueStatusLabel("running"), "Generando...");
+  assert.strictEqual(getQueueStatusLabel("succeeded"), "Completado");
+  assert.strictEqual(getQueueStatusLabel("warning"), "Con Advertencias");
+  assert.strictEqual(getQueueStatusLabel("failed"), "Fallido");
+  assert.strictEqual(getQueueStatusLabel("skipped"), "Omitido");
+  assert.strictEqual(getQueueStatusLabel("custom_status"), "custom_status");
+});
+
 
 

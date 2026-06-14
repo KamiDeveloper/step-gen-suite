@@ -11,14 +11,17 @@ import {
   ChevronRight,
   Layers,
   Sparkles,
-  FileJson
+  FileJson,
+  Info
 } from "lucide-react";
 import {
   IAppendChartResult,
   IFileFingerprint,
   IAssetStatus,
   ISectionPlanOverride,
-  ISongContinuityPlan
+  ISongContinuityPlan,
+  IMultiSectionGenerationResult,
+  ISectionPreviewQueueItem
 } from "../types/song";
 import { SongAnalysisReport, AnalysisCommandResult } from "../types/musicAnalysis";
 import { analyzeBrowserBpmFromArrayBuffer } from "../features/music-analysis/browser-bpm/analyzeBrowserBpmFromBuffer";
@@ -35,7 +38,11 @@ import {
   getTransitionTypeLabel,
   getIntensityBandLabel,
   isSectionPlanStale,
-  sanitizeSectionOverrideNote
+  sanitizeSectionOverrideNote,
+  canRunMultiSectionBatch,
+  isBatchStale,
+  getQueueStatusLabel,
+  selectedSectionCountValidation
 } from "../utils/ProjectWorkspaceHelpers";
 import type { PreviewParams } from "../utils/ProjectWorkspaceHelpers";
 
@@ -120,6 +127,12 @@ export const ProjectWorkspace: React.FC<ProjectWorkspaceProps> = ({ onNavigate }
   const [overrides, setOverrides] = useState<ISectionPlanOverride[]>([]);
   const [selectedSectionForOverride, setSelectedSectionForOverride] = useState<string | null>(null);
   const [sectionPlanSnapshotOverrides, setSectionPlanSnapshotOverrides] = useState<ISectionPlanOverride[] | null>(null);
+
+  // Multi-Section batch queue states
+  const [selectedSectionIdsForBatch, setSelectedSectionIdsForBatch] = useState<string[]>([]);
+  const [queueResult, setQueueResult] = useState<IMultiSectionGenerationResult | null>(null);
+  const [isQueueRunning, setIsQueueRunning] = useState(false);
+  const [queueSnapshot, setQueueSnapshot] = useState<any | null>(null);
 
   // Preview result states
   const [previewResult, setPreviewResult] = useState<IAppendChartResult | null>(null);
@@ -266,6 +279,10 @@ export const ProjectWorkspace: React.FC<ProjectWorkspaceProps> = ({ onNavigate }
     setOverrides([]);
     setSelectedSectionForOverride(null);
     setSectionPlanSnapshotOverrides(null);
+    setSelectedSectionIdsForBatch([]);
+    setQueueResult(null);
+    setIsQueueRunning(false);
+    setQueueSnapshot(null);
 
     if (requestedPath) {
       let cancelled = false;
@@ -644,6 +661,138 @@ export const ProjectWorkspace: React.FC<ProjectWorkspaceProps> = ({ onNavigate }
     setFingerprintBefore(null);
     setFingerprintAfter(null);
   };
+
+  const handleInspectQueueItem = (item: ISectionPreviewQueueItem) => {
+    if (!item.preview_payload || !currentSong) return;
+
+    const validationIssues: any[] = [];
+    item.validation_errors.forEach((msg) => {
+      validationIssues.push({
+        measure_index: 0,
+        row_index: 0,
+        severity: "Error",
+        issue_type: "InvalidGeminiStructure",
+        message: msg,
+      });
+    });
+    item.validation_warnings.forEach((msg) => {
+      validationIssues.push({
+        measure_index: 0,
+        row_index: 0,
+        severity: "Warning",
+        issue_type: "DoubleStep",
+        message: msg,
+      });
+    });
+
+    const parsedPayload = item.preview_payload;
+    const notesParts = parsedPayload.measures.map((measure) => measure.rows.join("\n"));
+    const notes_raw = notesParts.join(",\n") + "\n;";
+
+    const fakeResult: IAppendChartResult = {
+      charts: currentSong.charts,
+      validation: {
+        play_mode: parsedPayload.play_mode,
+        difficulty_level: parsedPayload.difficulty_level,
+        issues: validationIssues,
+      },
+      written: false,
+      message: item.error_message || "Preview inspected from multi-section queue.",
+      generated_notes: notes_raw,
+      raw_payload: JSON.stringify(parsedPayload),
+      context_sources_used: ["ContinuityPlan", "SlidingWindowContext"],
+      calibrated_prompt_context_used: useCalibratedPromptContext,
+      pattern_family_targeting: item.pattern_family_targeting || null,
+      calibration_context_summary: item.calibration_summary || null,
+      continuity_plan: sectionPlan,
+    };
+
+    setPreviewResult(fakeResult);
+    setFingerprintBefore(queueResult?.fingerprint_before || null);
+    setFingerprintAfter(queueResult?.fingerprint_after || null);
+  };
+
+  const handleGenerateMultiSectionPreviews = async () => {
+    if (!currentSong) return;
+    const planValidation = canRunMultiSectionBatch(selectedSectionIdsForBatch, sectionPlan);
+    if (!planValidation.isValid) {
+      setError(planValidation.error);
+      return;
+    }
+    if (!passphrase.trim()) {
+      setError("Please enter your unlock passphrase to decrypt the API Key.");
+      return;
+    }
+
+    setIsQueueRunning(true);
+    setQueueResult(null);
+    setQueueSnapshot(null);
+    setError(null);
+
+    const activeSnapshot = {
+      targetLevel,
+      useCalibratedPromptContext,
+      useContinuityPlanning,
+      patternFamilyTarget: patternFocus,
+      selectedSectionIds: [...selectedSectionIdsForBatch],
+      overrides: [...overrides],
+    };
+
+    try {
+      const result = await invoke<IMultiSectionGenerationResult>("generate_gemini_multi_section_preview_queue", {
+        passphrase: passphrase.trim(),
+        request: {
+          ssc_path: currentSong.ssc_path,
+          audio_path: currentSong.audio_path || null,
+          target_level: targetLevel,
+          selected_section_ids: selectedSectionIdsForBatch,
+          overrides: overrides.length > 0 ? overrides : null,
+          use_calibrated_prompt_context: useCalibratedPromptContext,
+          use_continuity_planning: useContinuityPlanning,
+          pattern_family_target: patternFocus === "auto" ? null : patternFocus,
+        },
+      });
+
+      setQueueResult(result);
+      setQueueSnapshot(activeSnapshot);
+
+      if (result.session_status === "unsafe_to_append" || result.unsafe_to_append || !result.fingerprint_match) {
+        setError("Fingerprint mismatch detected! The .ssc file was modified during batch generation. The session is unsafe.");
+      }
+    } catch (err: any) {
+      console.error("Multi-section batch generation error:", err);
+      setError("Batch generation failed: " + err.toString());
+    } finally {
+      setIsQueueRunning(false);
+    }
+  };
+
+  // Discard queue results if parameters change and become stale
+  useEffect(() => {
+    if (queueSnapshot && queueResult) {
+      const currentSnapshot = {
+        targetLevel,
+        useCalibratedPromptContext,
+        useContinuityPlanning,
+        patternFamilyTarget: patternFocus,
+        selectedSectionIds: selectedSectionIdsForBatch,
+        overrides,
+      };
+      if (isBatchStale(queueSnapshot, currentSnapshot)) {
+        setQueueResult(null);
+        setQueueSnapshot(null);
+      }
+    }
+  }, [
+    targetLevel,
+    useCalibratedPromptContext,
+    useContinuityPlanning,
+    patternFocus,
+    selectedSectionIdsForBatch,
+    overrides,
+    queueSnapshot,
+    queueResult,
+  ]);
 
   // Developer tools handlers
   const handleDevAppendLocalStub = () => {
@@ -1096,13 +1245,15 @@ export const ProjectWorkspace: React.FC<ProjectWorkspaceProps> = ({ onNavigate }
                 )}
 
                 {sectionPlan ? (
-                  <div className="section-plan-layout">
+                  <>
+                    <div className="section-plan-layout">
                     {/* Left: compact sections table */}
                     <div className="section-plan-table-wrapper">
                       <table className="workspace-table">
                         <thead>
                           <tr>
                             <th className="section-plan-col-act">Act</th>
+                            <th className="section-plan-col-act">Batch</th>
                             <th>Section ID</th>
                             <th>Measures</th>
                             <th>Role</th>
@@ -1118,6 +1269,7 @@ export const ProjectWorkspace: React.FC<ProjectWorkspaceProps> = ({ onNavigate }
                             const secOverride = overrides.find(o => o.section_id === sec.section_id);
                             const isEnabled = secOverride?.enabled !== false;
                             const warningsCount = sec.warnings.length;
+                            const isCheckedInBatch = selectedSectionIdsForBatch.includes(sec.section_id);
 
                             return (
                               <tr 
@@ -1139,6 +1291,20 @@ export const ProjectWorkspace: React.FC<ProjectWorkspaceProps> = ({ onNavigate }
                                     type="checkbox"
                                     checked={isEnabled}
                                     onChange={(e) => handleApplyOverride(sec.section_id, { enabled: e.target.checked })}
+                                  />
+                                </td>
+                                <td className="section-plan-cell-center" onClick={(e) => e.stopPropagation()}>
+                                  <input
+                                    type="checkbox"
+                                    checked={isCheckedInBatch}
+                                    disabled={!isEnabled}
+                                    onChange={(e) => {
+                                      if (e.target.checked) {
+                                        setSelectedSectionIdsForBatch(prev => prev.includes(sec.section_id) ? prev : [...prev, sec.section_id]);
+                                      } else {
+                                        setSelectedSectionIdsForBatch(prev => prev.filter(id => id !== sec.section_id));
+                                      }
+                                    }}
                                   />
                                 </td>
                                 <td><strong>{sec.section_id}</strong></td>
@@ -1287,6 +1453,173 @@ export const ProjectWorkspace: React.FC<ProjectWorkspaceProps> = ({ onNavigate }
                       })()}
                     </div>
                   </div>
+
+                  {/* Batch Generation Control and Queue Dashboard */}
+                  <div className="batch-generation-container">
+                    <h5 className="batch-generation-title">Multi-Section Batch Preview Generation</h5>
+                    
+                    <div className="batch-generation-banner">
+                      <Info size={14} className="icon-mr text-info-icon" />
+                      <span>API Warning: This action calls Gemini once per selected section. All generated previews reside in memory and will not modify disk files.</span>
+                    </div>
+
+                    <div className="batch-generation-controls">
+                      <div className="batch-status-summary">
+                        <span>Selected sections: <strong>{selectedSectionIdsForBatch.length}</strong> / 4</span>
+                        {selectedSectionIdsForBatch.length > 0 && (
+                          <button
+                            type="button"
+                            className="btn-ghost-pill btn-sm-contained btn-danger-text"
+                            onClick={() => setSelectedSectionIdsForBatch([])}
+                          >
+                            Clear Selection
+                          </button>
+                        )}
+                      </div>
+
+                      {/* Display validation warning if any */}
+                      {(() => {
+                        const countOk = selectedSectionCountValidation(selectedSectionIdsForBatch.length);
+                        if (selectedSectionIdsForBatch.length > 0) {
+                          if (!countOk) {
+                            return (
+                              <div className="batch-validation-alert error">
+                                ⚠ Please select between 1 and 4 sections.
+                              </div>
+                            );
+                          }
+                          const batchValidation = canRunMultiSectionBatch(selectedSectionIdsForBatch, sectionPlan);
+                          if (!batchValidation.isValid) {
+                            return (
+                              <div className="batch-validation-alert error">
+                                ⚠ {batchValidation.error}
+                              </div>
+                            );
+                          }
+                        }
+                        return null;
+                      })()}
+
+                      <button
+                        type="button"
+                        className="btn-primary-pill btn-sm-contained btn-generate-batch"
+                        onClick={handleGenerateMultiSectionPreviews}
+                        disabled={
+                          isQueueRunning ||
+                          selectedSectionIdsForBatch.length === 0 ||
+                          !selectedSectionCountValidation(selectedSectionIdsForBatch.length) ||
+                          !canRunMultiSectionBatch(selectedSectionIdsForBatch, sectionPlan).isValid
+                        }
+                      >
+                        {isQueueRunning ? "Generating Selected Previews..." : "Generate Selected Section Previews"}
+                      </button>
+                    </div>
+
+                    {/* Queue Results list */}
+                    {(isQueueRunning || queueResult) && (
+                      <div className="batch-queue-panel">
+                        <div className="batch-queue-header">
+                          <h6 className="batch-queue-title">
+                            {isQueueRunning ? "Batch Generation Progress" : "Batch Previews Queue"}
+                          </h6>
+                          {queueResult && (() => {
+                            const isUnsafe = queueResult.session_status === "unsafe_to_append" || queueResult.unsafe_to_append || !queueResult.fingerprint_match;
+                            const displayStatus = isUnsafe ? "unsafe_to_append" : queueResult.session_status;
+                            const displayText = isUnsafe ? "UNSAFE" : queueResult.session_status.toUpperCase();
+                            return (
+                              <span className={`batch-session-status ${displayStatus}`}>
+                                Session Status: {displayText}
+                              </span>
+                            );
+                          })()}
+                        </div>
+
+                        {(queueResult?.unsafe_to_append || queueResult?.fingerprint_match === false || queueResult?.session_status === "unsafe_to_append") && (
+                          <div className="warning-box section-plan-warning">
+                            <AlertTriangle size={14} className="icon-mr text-warning-icon" />
+                            <span>Fingerprint Mismatch or Unsafe State: The .ssc file was changed during generation or verification failed. Appending is locked.</span>
+                          </div>
+                        )}
+
+                        <div className="batch-queue-items">
+                          {isQueueRunning && !queueResult && (
+                            <div className="batch-queue-loading">
+                              <div className="spinner"></div>
+                              <span>Running batch preview generation (sequential concurrency = 1)...</span>
+                            </div>
+                          )}
+
+                          {queueResult?.items.map((item) => {
+                            const hasPayload = !!item.preview_payload;
+                            const isSucceeded = item.status === "succeeded";
+                            const isWarning = item.status === "warning";
+
+                            return (
+                              <div key={item.section_id} className={`queue-item-card ${item.status}`}>
+                                <div className="queue-item-header">
+                                  <div className="queue-item-info">
+                                    <span className="queue-item-id">{item.section_id}</span>
+                                    <span className="queue-item-range">(M.{item.range_summary})</span>
+                                  </div>
+                                  <span className={`queue-status-badge ${item.status}`}>
+                                    {getQueueStatusLabel(item.status)}
+                                  </span>
+                                </div>
+
+                                <div className="queue-item-body">
+                                  {item.continuity_summary && (
+                                    <div className="queue-item-meta">
+                                      <span>Family: <strong>{getPatternFamilyLabel(item.continuity_summary.current_primary_pattern_family)}</strong></span>
+                                      <span>Intensity: <strong>{getIntensityBandLabel(item.continuity_summary.current_intensity_band)}</strong></span>
+                                      <span>Motif: <strong>{getMotifStrategyLabel(item.continuity_summary.current_motif_strategy)}</strong></span>
+                                    </div>
+                                  )}
+
+                                  {item.generated_abstract_summary && (
+                                    <div className="queue-item-summary">
+                                      <span>Rows: {item.generated_abstract_summary.row_count} ({item.generated_abstract_summary.non_empty_row_count} active)</span>
+                                      <span>Density Band: {item.generated_abstract_summary.approximate_density_band.toUpperCase()}</span>
+                                      <span>Jumps: {item.generated_abstract_summary.jump_like_event_count} | Holds: {item.generated_abstract_summary.hold_like_event_count} | Brackets: {item.generated_abstract_summary.bracket_like_event_count}</span>
+                                    </div>
+                                  )}
+
+                                  {(item.validation_errors.length > 0 || item.validation_warnings.length > 0) && (
+                                    <div className="queue-item-issues">
+                                      {item.validation_errors.map((err, i) => (
+                                        <div key={i} className="queue-issue error">⚠ {err}</div>
+                                      ))}
+                                      {item.validation_warnings.map((warn, i) => (
+                                        <div key={i} className="queue-issue warning">⚠ {warn}</div>
+                                      ))}
+                                    </div>
+                                  )}
+
+                                  {item.error_message && (
+                                    <div className="queue-item-error">
+                                      Error: {item.error_message}
+                                    </div>
+                                  )}
+                                </div>
+
+                                <div className="queue-item-footer">
+                                  {(isSucceeded || isWarning) && hasPayload && (
+                                    <button
+                                      type="button"
+                                      className="btn-ghost-pill btn-sm-contained btn-inspect-queue-item"
+                                      onClick={() => handleInspectQueueItem(item)}
+                                    >
+                                      Inspect Preview
+                                    </button>
+                                  )}
+                                </div>
+                              </div>
+                            );
+                          })}
+                        </div>
+                      </div>
+                    )}
+                  </div>
+                  </>
                 ) : (
                   <div className="placeholder-state-card placeholder-state-card-compact">
                     <span className="placeholder-text-main">No plan loaded</span>
@@ -2017,6 +2350,18 @@ export const ProjectWorkspace: React.FC<ProjectWorkspaceProps> = ({ onNavigate }
                   <div className="commit-meta-text">
                     <h5 className="commit-box-title">Apply Generated Chart</h5>
                     {(() => {
+                      const isQueueUnsafe = queueResult !== null && (
+                        queueResult.unsafe_to_append ||
+                        queueResult.fingerprint_match === false ||
+                        queueResult.session_status === "unsafe_to_append"
+                      );
+                      if (isQueueUnsafe) {
+                        return (
+                          <p className="caption-text-gravel text-missing">
+                            * Committing blocked: Batch session is unsafe (fingerprint mismatch or unsafe state).
+                          </p>
+                        );
+                      }
                       const { errors, warnings } = groupValidationIssues(previewResult.validation.issues);
                       if (errors.length > 0) {
                         return (
@@ -2057,7 +2402,17 @@ export const ProjectWorkspace: React.FC<ProjectWorkspaceProps> = ({ onNavigate }
                   <button
                     className="btn-primary-pill btn-success-glow"
                     onClick={handleCommitChart}
-                    disabled={isAppendDisabled(previewResult, fingerprintBefore, fingerprintAfter, isLoading)}
+                    disabled={isAppendDisabled(
+                      previewResult,
+                      fingerprintBefore,
+                      fingerprintAfter,
+                      isLoading,
+                      queueResult !== null && (
+                        queueResult.unsafe_to_append ||
+                        queueResult.fingerprint_match === false ||
+                        queueResult.session_status === "unsafe_to_append"
+                      )
+                    )}
                   >
                     Añadir preview aprobado al SSC (escribe en disco)
                   </button>

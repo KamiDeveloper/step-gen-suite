@@ -35,8 +35,10 @@ export function isAppendDisabled(
   previewResult: { validation?: { issues: IValidationIssue[] } } | null,
   fingerprintBefore: IFileFingerprint | null,
   fingerprintAfter: IFileFingerprint | null,
-  isLoading: boolean
+  isLoading: boolean,
+  isSessionUnsafe?: boolean
 ): boolean {
+  if (isSessionUnsafe) return true;
   if (!previewResult) return true;
   if (isLoading) return true;
   if (!fingerprintBefore || !fingerprintAfter) return true;
@@ -325,4 +327,145 @@ export function sanitizeSectionOverrideNote(note: string): { isValid: boolean; e
 
   return { isValid: true, error: null };
 }
+
+export interface BatchSnapshot {
+  targetLevel: number;
+  useCalibratedPromptContext: boolean;
+  useContinuityPlanning: boolean;
+  patternFamilyTarget: string;
+  selectedSectionIds: string[];
+  overrides: ISectionPlanOverride[];
+}
+
+export function canRunMultiSectionBatch(
+  selectedSectionIds: string[],
+  plan: ISongContinuityPlan | null
+): { isValid: boolean; error: string | null } {
+  if (!plan) {
+    return { isValid: false, error: "El plan de continuidad no está cargado." };
+  }
+  if (selectedSectionIds.length === 0) {
+    return { isValid: false, error: "No hay secciones seleccionadas." };
+  }
+  if (selectedSectionIds.length > 4) {
+    return { isValid: false, error: "Se permite un máximo de 4 secciones por lote." };
+  }
+
+  // Check duplicate IDs
+  const seen = new Set<string>();
+  for (const id of selectedSectionIds) {
+    if (seen.has(id)) {
+      return { isValid: false, error: "No se permiten secciones duplicadas en la selección." };
+    }
+    seen.add(id);
+  }
+
+  // Find all nodes
+  const nodes: (any | undefined)[] = [];
+  for (const id of selectedSectionIds) {
+    const found = plan.sections.find((s) => s.section_id === id);
+    if (!found) {
+      return { isValid: false, error: `Sección seleccionada '${id}' no encontrada en el plan.` };
+    }
+    nodes.push(found);
+  }
+
+  // Check all are enabled
+  if (nodes.some((n) => n && !n.enabled)) {
+    return { isValid: false, error: "Una o más secciones seleccionadas están deshabilitadas." };
+  }
+
+  // Check negative bounds, start >= end, and section length > 16
+  for (const node of nodes) {
+    if (node) {
+      if (node.start_measure < 0 || node.end_measure < 0) {
+        return {
+          isValid: false,
+          error: `La sección '${node.section_id}' tiene límites de compás inválidos (valores negativos).`
+        };
+      }
+      if (node.start_measure >= node.end_measure) {
+        return {
+          isValid: false,
+          error: `La sección '${node.section_id}' tiene límites de compás inválidos (inicio >= fin).`
+        };
+      }
+      const sectionLen = node.end_measure - node.start_measure + 1;
+      if (sectionLen > 16) {
+        return {
+          isValid: false,
+          error: `La sección '${node.section_id}' supera el límite máximo de 16 compases (longitud: ${sectionLen}).`
+        };
+      }
+    }
+  }
+
+  // Check chronological order by measure
+  let lastStart = -1;
+  for (const node of nodes) {
+    if (node) {
+      if (node.start_measure < lastStart) {
+        return { isValid: false, error: "Las secciones seleccionadas deben estar ordenadas cronológicamente por compás." };
+      }
+      lastStart = node.start_measure;
+    }
+  }
+
+  // Check total measures <= 64
+  let totalMeasures = 0;
+  for (const node of nodes) {
+    if (node) {
+      totalMeasures += (node.end_measure - node.start_measure + 1);
+    }
+  }
+  if (totalMeasures > 64) {
+    return { isValid: false, error: `El total de compases (${totalMeasures}) supera el límite de 64.` };
+  }
+
+  return { isValid: true, error: null };
+}
+
+export function selectedSectionCountValidation(count: number): boolean {
+  return count > 0 && count <= 4;
+}
+
+export function isBatchStale(
+  snapshot: BatchSnapshot | null,
+  current: BatchSnapshot
+): boolean {
+  if (!snapshot) return false;
+
+  if (snapshot.targetLevel !== current.targetLevel) return true;
+  if (snapshot.useCalibratedPromptContext !== current.useCalibratedPromptContext) return true;
+  if (snapshot.useContinuityPlanning !== current.useContinuityPlanning) return true;
+  if (snapshot.patternFamilyTarget !== current.patternFamilyTarget) return true;
+
+  if (snapshot.selectedSectionIds.length !== current.selectedSectionIds.length) return true;
+  const sSorted = [...snapshot.selectedSectionIds].sort();
+  const cSorted = [...current.selectedSectionIds].sort();
+  if (sSorted.some((id, idx) => id !== cSorted[idx])) return true;
+
+  return isSectionPlanStale(snapshot.overrides, current.overrides);
+}
+
+export function getQueueStatusLabel(status: string): string {
+  switch (status.toLowerCase()) {
+    case "queued":
+      return "En cola";
+    case "running":
+      return "Generando...";
+    case "succeeded":
+      return "Completado";
+    case "warning":
+      return "Con Advertencias";
+    case "failed":
+      return "Fallido";
+    case "skipped":
+      return "Omitido";
+    default:
+      return status;
+  }
+}
+
+import type { ISongContinuityPlan } from "../types/song.ts";
 

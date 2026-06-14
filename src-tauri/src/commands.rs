@@ -1626,6 +1626,7 @@ pub async fn generate_gemini_chart_preview_core_internal(
         override_calibration,
         use_continuity_planning,
         None,
+        None,
     )
     .await
 }
@@ -1650,6 +1651,7 @@ pub async fn generate_gemini_chart_preview_core_internal_with_overrides(
     override_calibration: Option<&crate::guardrail_calibration::SingleGuardrailCalibration>,
     use_continuity_planning: Option<bool>,
     overrides: Option<Vec<crate::section_continuity::SectionPlanOverride>>,
+    sliding_window_context: Option<serde_json::Value>,
 ) -> Result<AppendChartResult, String> {
     // Validate overrides and check if the requested section is disabled
     if let Some(ref ovs) = overrides {
@@ -2344,6 +2346,15 @@ pub async fn generate_gemini_chart_preview_core_internal_with_overrides(
         }
     }
 
+    if let Some(ref sliding_ctx) = sliding_window_context {
+        context_sources_used.push("SlidingWindowContext".to_string());
+        if let Ok(serialized) = serde_json::to_string_pretty(sliding_ctx) {
+            context_summary.push_str("\n[SLIDING WINDOW CONTEXT (JSON)]\n");
+            context_summary.push_str(&serialized);
+            context_summary.push_str("\n");
+        }
+    }
+
     // 4. Construct prompt
     let prompt_text = format!(
         "Eres un stepmaker experto de Pump It Up. Genera un chart coreográfico de Pump It Up para la sección '{}' de la canción. \
@@ -2770,6 +2781,19 @@ pub async fn generate_gemini_chart_preview<R: tauri::Runtime>(
         None,
         use_continuity_planning,
         overrides,
+        None,
+    )
+    .await
+}
+
+#[tauri::command]
+pub async fn generate_gemini_multi_section_preview_queue<R: tauri::Runtime>(
+    app_handle: tauri::AppHandle<R>,
+    passphrase: String,
+    request: crate::multi_section_orchestration::MultiSectionGenerationRequest,
+) -> Result<crate::multi_section_orchestration::MultiSectionGenerationResult, String> {
+    crate::multi_section_orchestration::generate_gemini_multi_section_preview_queue_impl(
+        app_handle, passphrase, request,
     )
     .await
 }
@@ -6881,6 +6905,7 @@ mod tests {
             Some(&empty_calib),
             Some(true),
             Some(overrides),
+            None,
         )
         .await;
 
@@ -7099,6 +7124,7 @@ mod tests {
             None,
             Some(true),
             Some(overrides),
+            None,
         )
         .await;
 

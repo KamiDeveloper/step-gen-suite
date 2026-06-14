@@ -4,6 +4,7 @@ pub mod credentials;
 pub mod gemini;
 pub mod generation_context;
 pub mod guardrail_calibration;
+pub mod multi_section_orchestration;
 pub mod music_analysis;
 pub mod section_continuity;
 pub mod settings;
@@ -23,6 +24,7 @@ pub fn run() {
             commands::append_mock_gemini_payload,
             commands::append_approved_gemini_payload,
             commands::generate_gemini_chart_preview,
+            commands::generate_gemini_multi_section_preview_queue,
             commands::build_single_continuity_plan_preview,
             commands::get_file_fingerprint,
             commands::validate_folder_name,

@@ -248,3 +248,59 @@ export interface IFileFingerprint {
   sha256: string;
   modified_time: number;
 }
+
+export interface IMultiSectionGenerationRequest {
+  ssc_path: string;
+  audio_path?: string | null;
+  target_level: number;
+  selected_section_ids: string[];
+  overrides?: ISectionPlanOverride[] | null;
+  use_calibrated_prompt_context: boolean;
+  use_continuity_planning: boolean;
+  pattern_family_target?: string | null;
+}
+
+export interface IGeneratedSectionAbstractSummary {
+  row_count: number;
+  non_empty_row_count: number;
+  approximate_density_band: string;
+  jump_like_event_count: number;
+  hold_like_event_count: number;
+  bracket_like_event_count: number;
+  primary_family: string;
+  issue_count: number;
+}
+
+export interface ISectionPreviewQueueItem {
+  section_id: string;
+  section_index: number;
+  status: string;
+  range_summary: string;
+  continuity_summary?: IContinuityContextSummary | null;
+  pattern_family_targeting?: IPatternFamilyTargetingReport | null;
+  calibration_summary?: ICalibrationContextSummary | null;
+  preview_payload?: IGeminiPayload | null;
+  validation_errors: string[];
+  validation_warnings: string[];
+  generated_abstract_summary?: IGeneratedSectionAbstractSummary | null;
+  error_message?: string | null;
+}
+
+export interface IMultiSectionGenerationResult {
+  schema_version: string;
+  written: boolean;
+  preview_only: boolean;
+  session_id: string;
+  target_level: number;
+  sections_requested: number;
+  sections_generated: number;
+  sections_failed: number;
+  session_status: string;
+  fingerprint_before?: IFileFingerprint | null;
+  fingerprint_after?: IFileFingerprint | null;
+  fingerprint_match: boolean;
+  unsafe_to_append: boolean;
+  items: ISectionPreviewQueueItem[];
+  warnings: string[];
+  errors: string[];
+}
