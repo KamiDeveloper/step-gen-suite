@@ -2891,3 +2891,62 @@ details[open] .accordion-icon {
   font-size: 12px;
 }
 
+/* Inline Style Replacements for Calibrated Context */
+.margin-top-16 {
+  margin-top: 1rem;
+}
+.select-dark-override {
+  background: #1e293b;
+  color: #f8fafc;
+  border: 1px solid #475569;
+}
+.bpm-diagnostics-grid-calib {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
+  gap: 0.75rem;
+  margin-bottom: 0.75rem;
+}
+.bpm-diagnostics-card-calib {
+  padding: 0.5rem 0.75rem;
+}
+.bpm-diagnostics-value-calib {
+  font-size: 0.95rem;
+}
+.bpm-diagnostics-value-calib-primary {
+  font-size: 0.95rem;
+  color: #38bdf8;
+}
+.bpm-diagnostics-value-calib-warning {
+  font-size: 0.95rem;
+  color: #fbbf24;
+}
+.bpm-diagnostics-value-calib-success {
+  font-size: 0.95rem;
+  color: #10b981;
+}
+.caption-text-gravel-calib {
+  font-size: 0.75rem;
+  margin-top: 2px;
+}
+.pattern-targeting-detail-container {
+  font-size: 0.85rem;
+  display: flex;
+  flex-direction: column;
+  gap: 0.5rem;
+}
+.margin-left-4 {
+  margin-left: 4px;
+}
+.avoid-badge-calib {
+  margin-left: 4px;
+  padding: 1px 6px;
+  border-radius: 4px;
+  font-size: 0.75rem;
+}
+.targeting-evidence-list {
+  margin: 4px 0 0 16px;
+  padding: 0;
+  list-style-type: disc;
+}
+
+

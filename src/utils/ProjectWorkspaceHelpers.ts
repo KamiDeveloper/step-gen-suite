@@ -7,6 +7,8 @@ export interface PreviewParams {
   useMusicAnalysis: boolean;
   useBrowserBpm: boolean;
   selectedSectionKey: string;
+  useCalibratedPromptContext: boolean;
+  patternFamilyTarget: string;
 }
 
 export interface IValidationIssue {
@@ -60,7 +62,9 @@ export function isPreviewStale(
     snapshot.songType !== current.songType ||
     snapshot.useMusicAnalysis !== current.useMusicAnalysis ||
     snapshot.useBrowserBpm !== current.useBrowserBpm ||
-    snapshot.selectedSectionKey !== current.selectedSectionKey
+    snapshot.selectedSectionKey !== current.selectedSectionKey ||
+    snapshot.useCalibratedPromptContext !== current.useCalibratedPromptContext ||
+    snapshot.patternFamilyTarget !== current.patternFamilyTarget
   );
 }
 
@@ -99,3 +103,38 @@ export function groupValidationIssues(issues: IValidationIssue[]): {
   const warnings = issues.filter((i) => i.severity === "Warning");
   return { errors, warnings };
 }
+
+/**
+ * Returns a human-friendly label for a given pattern family name.
+ */
+export function getPatternFamilyLabel(family: string): string {
+  const normalized = family.toLowerCase().trim();
+  switch (normalized) {
+    case "auto":
+      return "Auto";
+    case "balanced":
+      return "Balanced";
+    case "stream":
+      return "Stream";
+    case "jump_accent":
+    case "jump_accents":
+      return "Jump Accents";
+    case "twist_technical":
+      return "Twist Technical";
+    case "bracket_technical":
+      return "Bracket Technical";
+    case "hold_control":
+      return "Hold Control";
+    case "center_control":
+      return "Center Control";
+    case "stamina":
+      return "Stamina";
+    default:
+      // Capitalize first letters as fallback
+      return family
+        .split(/[_-]/)
+        .map((word) => word.charAt(0).toUpperCase() + word.slice(1).toLowerCase())
+        .join(" ");
+  }
+}
+

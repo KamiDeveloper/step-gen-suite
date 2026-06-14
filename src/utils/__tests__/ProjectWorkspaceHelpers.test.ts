@@ -4,7 +4,8 @@ import {
   isAppendDisabled,
   isPreviewStale,
   validateMeasureRange,
-  groupValidationIssues
+  groupValidationIssues,
+  getPatternFamilyLabel
 } from "../ProjectWorkspaceHelpers.ts";
 import type {
   PreviewParams,
@@ -110,7 +111,9 @@ test("isPreviewStale stale state checking", () => {
     songType: "Arcade",
     useMusicAnalysis: true,
     useBrowserBpm: true,
-    selectedSectionKey: "chorus_1"
+    selectedSectionKey: "chorus_1",
+    useCalibratedPromptContext: true,
+    patternFamilyTarget: "auto"
   };
 
   const currentSame: PreviewParams = { ...snapshot };
@@ -122,6 +125,8 @@ test("isPreviewStale stale state checking", () => {
   const currentDiffMA: PreviewParams = { ...snapshot, useMusicAnalysis: false };
   const currentDiffBB: PreviewParams = { ...snapshot, useBrowserBpm: false };
   const currentDiffSectionKey: PreviewParams = { ...snapshot, selectedSectionKey: "custom" };
+  const currentDiffCalib: PreviewParams = { ...snapshot, useCalibratedPromptContext: false };
+  const currentDiffTarget: PreviewParams = { ...snapshot, patternFamilyTarget: "stream" };
 
   // Null snapshot -> not stale
   assert.strictEqual(isPreviewStale(null, snapshot), false);
@@ -152,4 +157,25 @@ test("isPreviewStale stale state checking", () => {
 
   // Changed selectedSectionKey -> stale
   assert.strictEqual(isPreviewStale(snapshot, currentDiffSectionKey), true);
+
+  // Changed useCalibratedPromptContext -> stale
+  assert.strictEqual(isPreviewStale(snapshot, currentDiffCalib), true);
+
+  // Changed patternFamilyTarget -> stale
+  assert.strictEqual(isPreviewStale(snapshot, currentDiffTarget), true);
 });
+
+test("getPatternFamilyLabel mappings", () => {
+  assert.strictEqual(getPatternFamilyLabel("auto"), "Auto");
+  assert.strictEqual(getPatternFamilyLabel("balanced"), "Balanced");
+  assert.strictEqual(getPatternFamilyLabel("stream"), "Stream");
+  assert.strictEqual(getPatternFamilyLabel("jump_accent"), "Jump Accents");
+  assert.strictEqual(getPatternFamilyLabel("jump_accents"), "Jump Accents");
+  assert.strictEqual(getPatternFamilyLabel("twist_technical"), "Twist Technical");
+  assert.strictEqual(getPatternFamilyLabel("bracket_technical"), "Bracket Technical");
+  assert.strictEqual(getPatternFamilyLabel("hold_control"), "Hold Control");
+  assert.strictEqual(getPatternFamilyLabel("center_control"), "Center Control");
+  assert.strictEqual(getPatternFamilyLabel("stamina"), "Stamina");
+  assert.strictEqual(getPatternFamilyLabel("unknown_family"), "Unknown Family");
+});
+

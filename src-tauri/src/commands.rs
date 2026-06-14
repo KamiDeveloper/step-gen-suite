@@ -121,6 +121,9 @@ pub struct AppendChartResult {
     pub backup_path: Option<String>,
     pub context_sources_used: Option<Vec<String>>,
     pub calibration_report: Option<crate::guardrail_calibration::CalibrationValidationReport>,
+    pub calibrated_prompt_context_used: Option<bool>,
+    pub pattern_family_targeting: Option<crate::generation_context::PatternFamilyTargetingReport>,
+    pub calibration_context_summary: Option<crate::generation_context::CalibrationContextSummary>,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone, PartialEq)]
@@ -262,6 +265,9 @@ pub fn append_chart_to_ssc_atomic(
             backup_path: None,
             context_sources_used: None,
             calibration_report: None,
+            calibrated_prompt_context_used: None,
+            pattern_family_targeting: None,
+            calibration_context_summary: None,
         });
     }
 
@@ -364,6 +370,9 @@ pub fn append_chart_to_ssc_atomic(
         backup_path,
         context_sources_used: None,
         calibration_report: None,
+        calibrated_prompt_context_used: None,
+        pattern_family_targeting: None,
+        calibration_context_summary: None,
     })
 }
 
@@ -1417,6 +1426,9 @@ pub fn append_mock_gemini_payload(
                 backup_path: None,
                 context_sources_used: None,
                 calibration_report: None,
+                calibrated_prompt_context_used: None,
+                pattern_family_targeting: None,
+                calibration_context_summary: None,
             })
         }
     }
@@ -1543,6 +1555,8 @@ pub async fn generate_gemini_chart_preview_core(
     use_music_analysis: Option<bool>,
     use_browser_bpm: Option<bool>,
     browser_bpm_reconciliation: Option<String>,
+    use_calibrated_prompt_context: Option<bool>,
+    pattern_family_target: Option<String>,
 ) -> Result<AppendChartResult, String> {
     generate_gemini_chart_preview_core_internal(
         api_key,
@@ -1559,6 +1573,8 @@ pub async fn generate_gemini_chart_preview_core(
         use_music_analysis,
         use_browser_bpm,
         browser_bpm_reconciliation,
+        use_calibrated_prompt_context,
+        pattern_family_target,
         None,
     )
     .await
@@ -1579,6 +1595,8 @@ pub async fn generate_gemini_chart_preview_core_internal(
     use_music_analysis: Option<bool>,
     use_browser_bpm: Option<bool>,
     browser_bpm_reconciliation: Option<String>,
+    use_calibrated_prompt_context: Option<bool>,
+    pattern_family_target: Option<String>,
     override_calibration: Option<&crate::guardrail_calibration::SingleGuardrailCalibration>,
 ) -> Result<AppendChartResult, String> {
     // 1. Check environment variable gate
@@ -1617,23 +1635,20 @@ pub async fn generate_gemini_chart_preview_core_internal(
         }
     }
 
-    let mut title_val = String::new();
-    let mut artist_val = String::new();
-    let mut bpms_val = String::new();
-    let mut offset_val = 0.0;
-
+    let mut initial_bpm = 120.0;
     if let Ok(doc) = SscDocument::parse(ssc_p) {
         for tag in &doc.global_tags {
             if let Some(ref key) = tag.key {
-                if key == "TITLE" {
-                    title_val = tag.value.clone();
-                } else if key == "ARTIST" {
-                    artist_val = tag.value.clone();
-                } else if key == "BPMS" {
-                    bpms_val = tag.value.clone();
-                } else if key == "OFFSET" {
-                    if let Ok(val) = tag.value.trim().parse::<f64>() {
-                        offset_val = val;
+                if key == "BPMS" {
+                    if let Some(first_bpm) = tag
+                        .value
+                        .split(',')
+                        .next()
+                        .and_then(|p| p.split('=').nth(1))
+                    {
+                        if let Ok(val) = first_bpm.trim().parse::<f64>() {
+                            initial_bpm = val;
+                        }
                     }
                 }
             }
@@ -1641,25 +1656,11 @@ pub async fn generate_gemini_chart_preview_core_internal(
     }
 
     if let Some(ref report) = report_opt {
-        if title_val.is_empty() {
-            title_val = report.title.clone();
+        if initial_bpm == 120.0 {
+            if let Some(&(_beat, bpm)) = report.timing_grid.bpms.first() {
+                initial_bpm = bpm;
+            }
         }
-        if artist_val.is_empty() {
-            artist_val = report.artist.clone();
-        }
-        if bpms_val.is_empty() {
-            bpms_val = report
-                .timing_grid
-                .bpms
-                .iter()
-                .map(|(b, bpm)| format!("{}={}", b, bpm))
-                .collect::<Vec<_>>()
-                .join(",");
-        }
-        if offset_val == 0.0 {
-            offset_val = report.timing_grid.initial_offset;
-        }
-
         // If start/end measures are not specified, try to find them in the section boundaries
         if start_m.is_none() || end_m.is_none() {
             if let Some(sec) = report.sections.iter().find(|s| s.section_id == section_id) {
@@ -1702,15 +1703,7 @@ pub async fn generate_gemini_chart_preview_core_internal(
 
     // Construct prompt context hierarchy
     let mut context_summary = String::new();
-    let mut context_sources_used = vec!["SSC timing".to_string()];
-
-    // Add SSC timing to context
-    context_summary
-        .push_str("\n[CONTRATO DE TIEMPO Y METADATOS (Ground Truth del archivo .ssc)]\n");
-    context_summary.push_str(&format!("- Título de la Canción: {}\n", title_val));
-    context_summary.push_str(&format!("- Artista: {}\n", artist_val));
-    context_summary.push_str(&format!("- BPM de timing (#BPMS): {}\n", bpms_val));
-    context_summary.push_str(&format!("- Offset (#OFFSET): {} (Nota: Este offset es solo para contexto de sincronización, NO debe ser modificado por Gemini)\n", offset_val));
+    let mut context_sources_used = vec!["Sanitized timing metadata".to_string()];
 
     // 2. Music Analysis Engine
     let use_ma = use_music_analysis.unwrap_or(true);
@@ -1718,10 +1711,14 @@ pub async fn generate_gemini_chart_preview_core_internal(
         if let Some(ref report) = report_opt {
             context_sources_used.push("Music Analysis".to_string());
             context_summary.push_str("\n[CONTEXTO DE ANÁLISIS MUSICAL (Music Analysis Engine)]\n");
-            context_summary.push_str(&format!(
-                "- Duración: {} segundos\n",
-                report.duration_seconds
-            ));
+            let duration_bucket = if report.duration_seconds < 90.0 {
+                "short"
+            } else if report.duration_seconds <= 180.0 {
+                "medium"
+            } else {
+                "long"
+            };
+            context_summary.push_str(&format!("- Longitud de la Canción: {}\n", duration_bucket));
             if let Some(sec) = report.sections.iter().find(|s| s.section_id == section_id) {
                 context_summary.push_str(&format!(
                     "- Rol de la Sección Rítmica: {} (Rol PIU: {})\n",
@@ -1762,18 +1759,270 @@ pub async fn generate_gemini_chart_preview_core_internal(
         context_sources_used.push("Manual user inputs".to_string());
     }
 
-    // 3. Browser BPM
+    // 3. Browser tempo diagnostics
     let use_bb = use_browser_bpm.unwrap_or(true);
     if use_bb {
         if let Some(ref recon) = browser_bpm_reconciliation {
             if !recon.trim().is_empty() {
-                context_sources_used.push("Browser BPM".to_string());
+                context_sources_used.push("Browser tempo".to_string());
                 context_summary.push_str("\n[DIAGNÓSTICOS AUXILIARES DE BPM EN NAVEGADOR]\n");
+                let agreement =
+                    crate::generation_context::classify_browser_bpm_reconciliation_status(recon);
+                let agreed_str = match agreement {
+                    Some(true) => "Agreed with sheet timing",
+                    Some(false) => "Mismatch or manual review suggested",
+                    None => "No conclusive browser timing evidence",
+                };
                 context_summary.push_str(&format!(
                     "- Reconciliación de BPM del Navegador: {}\n",
-                    recon
+                    agreed_str
                 ));
             }
+        }
+    }
+
+    let calib_opt = if let Some(cal) = override_calibration {
+        Some(cal.clone())
+    } else {
+        crate::guardrail_calibration::resolve_calibration_file(None)
+    };
+
+    let target_mode_str = pattern_family_target
+        .clone()
+        .unwrap_or_else(|| "auto".to_string());
+    let requested_mode =
+        crate::generation_context::PatternFamilyTargetMode::from_str(&target_mode_str);
+
+    let targeting_report = crate::generation_context::resolve_pattern_family_targeting(
+        target_level,
+        play_mode,
+        requested_mode,
+        report_opt.as_ref(),
+        section_id,
+        calib_opt.as_ref(),
+        browser_bpm_reconciliation.as_deref(),
+    );
+
+    let calib_enabled = use_calibrated_prompt_context.unwrap_or(true);
+    let level_key = format!("S{}", target_level);
+    let (dg, gts) = if let Some(ref calib) = calib_opt {
+        if let Some(threshold) = calib.level_thresholds.get(&level_key) {
+            let density_p50 = threshold
+                .density
+                .get("typical_p50")
+                .copied()
+                .unwrap_or(target_level as f64 * 2.5);
+            let density_p90 = threshold
+                .density
+                .get("warning_p90")
+                .copied()
+                .unwrap_or(target_level as f64 * 4.0);
+            let density_p95 = threshold
+                .density
+                .get("hard_limit_p95")
+                .copied()
+                .unwrap_or(target_level as f64 * 5.0);
+
+            let jump_p90 = threshold
+                .jump_rate
+                .get("warning_p90")
+                .copied()
+                .unwrap_or(0.10);
+            let jump_p95 = threshold
+                .jump_rate
+                .get("hard_limit_p95")
+                .copied()
+                .unwrap_or(0.15);
+
+            let twist_p90 = threshold
+                .twist_rate
+                .get("warning_p90")
+                .copied()
+                .unwrap_or(0.10);
+            let twist_p95 = threshold
+                .twist_rate
+                .get("hard_limit_p95")
+                .copied()
+                .unwrap_or(0.15);
+
+            let bracket_p90 = threshold
+                .bracket_candidate_rate
+                .get("warning_p90")
+                .copied()
+                .unwrap_or(10.0);
+            let bracket_p95 = threshold
+                .bracket_candidate_rate
+                .get("hard_limit_p95")
+                .copied()
+                .unwrap_or(15.0);
+
+            (
+                crate::generation_context::DensityGuidance {
+                    min_recommended: (density_p50 * 0.75).round(),
+                    max_recommended: (density_p50 * 1.25).round(),
+                    warning_threshold_p90: density_p90,
+                    hard_limit_p95: density_p95,
+                    evidence: format!("Calibración estadística del corpus (p50 typical: {:.2}, p90 warning: {:.2})", density_p50, density_p90),
+                },
+                crate::generation_context::GuardrailThresholdSummary {
+                    density_p90,
+                    density_p95,
+                    jump_rate_p90: jump_p90,
+                    jump_rate_p95: jump_p95,
+                    twist_rate_p90: twist_p90,
+                    twist_rate_p95: twist_p95,
+                    bracket_rate_p90: bracket_p90,
+                    bracket_rate_p95: bracket_p95,
+                }
+            )
+        } else {
+            let min_rec = (target_level as f64 * 1.5 - 2.0).max(1.0);
+            let max_rec = (target_level as f64 * 3.5 + 4.0).max(6.0);
+            let p90 = (target_level as f64 * 4.0 + 6.0).max(10.0);
+            let p95 = (target_level as f64 * 5.0 + 8.0).max(12.0);
+            (
+                crate::generation_context::DensityGuidance {
+                    min_recommended: min_rec,
+                    max_recommended: max_rec,
+                    warning_threshold_p90: p90,
+                    hard_limit_p95: p95,
+                    evidence: "Heurística por nivel (nivel no calibrado en dataset)".to_string(),
+                },
+                crate::generation_context::GuardrailThresholdSummary {
+                    density_p90: p90,
+                    density_p95: p95,
+                    jump_rate_p90: 0.10,
+                    jump_rate_p95: 0.15,
+                    twist_rate_p90: 0.10,
+                    twist_rate_p95: 0.15,
+                    bracket_rate_p90: 10.0,
+                    bracket_rate_p95: 15.0,
+                },
+            )
+        }
+    } else {
+        let min_rec = (target_level as f64 * 1.5 - 2.0).max(1.0);
+        let max_rec = (target_level as f64 * 3.5 + 4.0).max(6.0);
+        let p90 = (target_level as f64 * 4.0 + 6.0).max(10.0);
+        let p95 = (target_level as f64 * 5.0 + 8.0).max(12.0);
+        (
+            crate::generation_context::DensityGuidance {
+                min_recommended: min_rec,
+                max_recommended: max_rec,
+                warning_threshold_p90: p90,
+                hard_limit_p95: p95,
+                evidence: "Heurística por nivel (calibración no disponible)".to_string(),
+            },
+            crate::generation_context::GuardrailThresholdSummary {
+                density_p90: p90,
+                density_p95: p95,
+                jump_rate_p90: 0.10,
+                jump_rate_p95: 0.15,
+                twist_rate_p90: 0.10,
+                twist_rate_p95: 0.15,
+                bracket_rate_p90: 10.0,
+                bracket_rate_p95: 15.0,
+            },
+        )
+    };
+
+    let mut prompt_instructions = vec![
+        "Generate only Pump Single.".to_string(),
+        "Do not output Double.".to_string(),
+        "Do not output timing tags.".to_string(),
+        "Do not output gimmicks.".to_string(),
+        "Do not modify timing, BPM, offset, stops, delays, or warps.".to_string(),
+        format!(
+            "Stay within requested section (measures {} to {}).",
+            start_m_val, end_m_val
+        ),
+        format!("Respect target level S{}.", target_level),
+        format!(
+            "Prefer the selected/calibrated pattern family: '{}'.",
+            targeting_report.primary_family
+        ),
+    ];
+    if !targeting_report.secondary_families.is_empty() {
+        prompt_instructions.push(format!(
+            "Use secondary families only when musically justified: {:?}",
+            targeting_report.secondary_families
+        ));
+    }
+    if !targeting_report.avoid_families.is_empty() {
+        prompt_instructions.push(format!(
+            "Avoid listed families: {:?}",
+            targeting_report.avoid_families
+        ));
+    }
+    prompt_instructions.push("Treat calibration hard limits as strict.".to_string());
+    prompt_instructions.push("Treat warnings as cautionary guidance.".to_string());
+    prompt_instructions.push("Biomechanical validity is mandatory.".to_string());
+
+    let section_summary = crate::generation_context::SectionContextSummary {
+        section_id: section_id.to_string(),
+        start_measure: start_m_val,
+        end_measure: end_m_val,
+        num_measures,
+        song_type: s_type_val.clone(),
+        music_role: report_opt.as_ref().and_then(|r| {
+            r.sections
+                .iter()
+                .find(|s| s.section_id == section_id)
+                .map(|s| s.music_role.clone())
+        }),
+        piu_role: report_opt.as_ref().and_then(|r| {
+            r.sections
+                .iter()
+                .find(|s| s.section_id == section_id)
+                .map(|s| s.piu_role.clone())
+        }),
+        energy_profile: report_opt.as_ref().and_then(|r| {
+            r.sections
+                .iter()
+                .find(|s| s.section_id == section_id)
+                .map(|s| s.energy_profile.clone())
+        }),
+        density_target: report_opt.as_ref().and_then(|r| {
+            r.choreographic_intent
+                .iter()
+                .find(|i| i.section_id == section_id)
+                .map(|i| i.density_target.clone())
+        }),
+    };
+
+    let agreement = browser_bpm_reconciliation.as_ref().and_then(|recon| {
+        crate::generation_context::classify_browser_bpm_reconciliation_status(recon)
+    });
+    let mut timing_warnings = Vec::new();
+    if agreement == Some(false) {
+        timing_warnings.push("Browser timing reconciliation reports a mismatch.".to_string());
+    }
+    let timing_summary = crate::generation_context::TimingContextSummary {
+        has_reconciliation_agreement: agreement,
+        timing_warnings,
+    };
+
+    let cal_ctx = crate::generation_context::CalibratedPromptContext {
+        schema_version: "v0".to_string(),
+        enabled: calib_enabled,
+        calibration_available: calib_opt.is_some(),
+        target_level: target_level as u8,
+        play_mode: "single".to_string(),
+        section: section_summary,
+        timing: timing_summary,
+        density_guidance: dg,
+        pattern_family_targeting: targeting_report.clone(),
+        guardrail_threshold_summary: gts,
+        prompt_instructions,
+        warnings: targeting_report.warnings.clone(),
+    };
+
+    if calib_enabled {
+        context_sources_used.push("Calibration".to_string());
+        if let Ok(serialized) = serde_json::to_string_pretty(&cal_ctx) {
+            context_summary.push_str("\n[CALIBRATED PROMPT CONTEXT (JSON)]\n");
+            context_summary.push_str(&serialized);
+            context_summary.push_str("\n");
         }
     }
 
@@ -1815,7 +2064,7 @@ pub async fn generate_gemini_chart_preview_core_internal(
          5. Triple Taps: En niveles < 16, evita triples. En niveles 16+ se permiten como Brackets (puntero-talón).\n\
          6. Alternancia de pies: Evita double-steps rápidos (Jack rápido) en la misma flecha consecutivamente en streams de subdivision 16+.\n\
          7. Giros y torso (Twists): Si el chart exige cruces que rotan el torso, asegúrate de proveer un contra-giro (untwist) de retorno inmediato para neutralizar la cadera. Evita giros de espaldas (180°) en compases rápidos a menos de que terminen con una flecha neutral como el centro amarillo.\n\
-         8. GIMMICK RESTRICTION: No generes ni incluyas marcas de tiempo, etiquetas de metadatos ni gimmicks (#SPEEDS, #SCROLLS, #STOPS, #DELAYS, #WARPS, #FAKES) en las filas ni en el payload JSON. El output debe constar únicamente de las filas de notas limpias con caracteres permitidos.\n\
+         8. GIMMICK RESTRICTION: No generes ni incluyas marcas de tiempo, etiquetas de metadatos ni gimmicks (cambios de velocidad, stops, delays, warps, fakes) en las filas ni en el payload JSON. El output debe constar únicamente de las filas de notas limpias con caracteres permitidos.\n\
          9. GUIAS DE DIFICULTAD POR NIVELES:\n\
             - Niveles 1-7: Patrones muy dispersos, simples, sin cruces ni giros complicados, principalmente negras y corcheas.\n\
             - Niveles 8-13: Streams y jumps básicos, crossovers sencillos, velocidad moderada.\n\
@@ -1827,6 +2076,9 @@ pub async fn generate_gemini_chart_preview_core_internal(
         section_id, target_level, play_mode, start_m_val,
         num_measures, start_m_val, end_m_val
     );
+
+    // Privacy self-audit
+    crate::generation_context::self_audit_prompt_context(&prompt_text)?;
 
     // 5. Invoke Gemini API
     let audio_file_path = Path::new(audio_path);
@@ -1942,6 +2194,21 @@ pub async fn generate_gemini_chart_preview_core_internal(
             backup_path: None,
             context_sources_used: Some(context_sources_used.clone()),
             calibration_report: None,
+            calibrated_prompt_context_used: Some(calib_enabled),
+            pattern_family_targeting: Some(targeting_report.clone()),
+            calibration_context_summary: Some(
+                crate::generation_context::CalibrationContextSummary {
+                    available: calib_opt.is_some(),
+                    target_level: format!("S{}", target_level),
+                    level_confidence: if target_level >= 25 {
+                        "low".to_string()
+                    } else {
+                        "high".to_string()
+                    },
+                    warning_count: targeting_report.warnings.len(),
+                    error_count: 0,
+                },
+            ),
         });
     }
 
@@ -1980,12 +2247,7 @@ pub async fn generate_gemini_chart_preview_core_internal(
             crate::guardrail_calibration::resolve_calibration_file(None)
         };
         if let Some(calib) = calib_opt {
-            let parsed_initial_bpm = bpms_val
-                .split(',')
-                .next()
-                .and_then(|part| part.split('=').nth(1))
-                .and_then(|val| val.trim().parse::<f64>().ok())
-                .unwrap_or(120.0);
+            let parsed_initial_bpm = initial_bpm;
 
             let report = crate::guardrail_calibration::evaluate_section_against_calibration(
                 &payload,
@@ -2062,7 +2324,26 @@ pub async fn generate_gemini_chart_preview_core_internal(
         raw_payload: Some(clean_response),
         backup_path: None,
         context_sources_used: Some(context_sources_used),
-        calibration_report,
+        calibration_report: calibration_report.clone(),
+        calibrated_prompt_context_used: Some(calib_enabled),
+        pattern_family_targeting: Some(targeting_report),
+        calibration_context_summary: Some(crate::generation_context::CalibrationContextSummary {
+            available: calib_opt.is_some(),
+            target_level: format!("S{}", target_level),
+            level_confidence: if target_level >= 25 {
+                "low".to_string()
+            } else {
+                "high".to_string()
+            },
+            warning_count: calibration_report
+                .as_ref()
+                .map(|r| r.warnings.len())
+                .unwrap_or(0),
+            error_count: calibration_report
+                .as_ref()
+                .map(|r| r.errors.len())
+                .unwrap_or(0),
+        }),
     })
 }
 
@@ -2093,6 +2374,8 @@ pub async fn generate_gemini_chart_preview<R: tauri::Runtime>(
     use_music_analysis: Option<bool>,
     use_browser_bpm: Option<bool>,
     browser_bpm_reconciliation: Option<String>,
+    use_calibrated_prompt_context: Option<bool>,
+    pattern_family_target: Option<String>,
 ) -> Result<AppendChartResult, String> {
     let play_mode_enum = match play_mode.as_str() {
         "Single" => PlayMode::Single,
@@ -2160,6 +2443,8 @@ pub async fn generate_gemini_chart_preview<R: tauri::Runtime>(
         use_music_analysis,
         use_browser_bpm,
         browser_bpm_reconciliation,
+        use_calibrated_prompt_context,
+        pattern_family_target,
     )
     .await
 }
@@ -2657,6 +2942,7 @@ mod tests {
 
         // Mock Gemini response (Valid structured response)
         let mock_post = server.mock("POST", "/v1beta/models/gemini-3.5-flash:generateContent")
+            .match_body(mockito::Matcher::Regex("CALIBRATED PROMPT CONTEXT".to_string()))
             .with_status(200)
             .with_header("content-type", "application/json")
             .with_body(r#"{
@@ -2707,6 +2993,8 @@ mod tests {
             None,
             None,
             None,
+            None,
+            None,
             Some(&empty_calib),
         )
         .await;
@@ -2732,6 +3020,8 @@ mod tests {
             None,
             None,
             None,
+            None,
+            None,
             Some(&empty_calib),
         )
         .await
@@ -2739,6 +3029,14 @@ mod tests {
 
         mock_post.assert_async().await;
         assert!(!result_preview.written);
+        assert!(result_preview
+            .calibrated_prompt_context_used
+            .unwrap_or(false));
+        assert!(result_preview.pattern_family_targeting.is_some());
+        assert!(result_preview.calibration_context_summary.is_some());
+        let targeting = result_preview.pattern_family_targeting.as_ref().unwrap();
+        assert_eq!(targeting.requested_mode, "auto");
+        assert_eq!(targeting.primary_family, "balanced");
         assert_eq!(
             result_preview.message,
             "Preview content generated and validated successfully without writing to disk."
@@ -2775,6 +3073,8 @@ mod tests {
             &client,
             Some(0),
             Some(0),
+            None,
+            None,
             None,
             None,
             None,
@@ -2827,6 +3127,8 @@ mod tests {
             None,
             None,
             None,
+            None,
+            None,
             Some(&empty_calib),
         )
         .await
@@ -2871,6 +3173,8 @@ mod tests {
             &client,
             Some(0),
             Some(0),
+            None,
+            None,
             None,
             None,
             None,
@@ -2923,6 +3227,8 @@ mod tests {
             None,
             None,
             None,
+            None,
+            None,
             Some(&empty_calib),
         )
         .await
@@ -2967,6 +3273,8 @@ mod tests {
             None,
             None,
             None,
+            None,
+            None,
             Some(&empty_calib),
         )
         .await
@@ -2998,6 +3306,8 @@ mod tests {
             &client,
             Some(0),
             Some(0),
+            None,
+            None,
             None,
             None,
             None,
@@ -3043,6 +3353,8 @@ mod tests {
             &client,
             Some(32),
             Some(33),
+            None,
+            None,
             None,
             None,
             None,
@@ -3095,6 +3407,8 @@ mod tests {
             None,
             None,
             None,
+            None,
+            None,
             Some(&empty_calib),
         )
         .await
@@ -3141,6 +3455,8 @@ mod tests {
             None,
             None,
             None,
+            None,
+            None,
             Some(&empty_calib),
         )
         .await
@@ -3165,6 +3481,8 @@ mod tests {
             &client,
             Some(33),
             Some(32),
+            None,
+            None,
             None,
             None,
             None,
@@ -3207,6 +3525,8 @@ mod tests {
             "preview_section",
             "AI Previewer",
             &client,
+            None,
+            None,
             None,
             None,
             None,
@@ -3321,6 +3641,8 @@ mod tests {
             None,
             None,
             None,
+            None,
+            None,
             Some(&calib),
         )
         .await
@@ -3380,6 +3702,8 @@ mod tests {
             &client,
             Some(0),
             Some(17), // 18 measures
+            None,
+            None,
             None,
             None,
             None,
@@ -4476,6 +4800,304 @@ mod tests {
 
         // Cleanup
         clear_audio_read_grants();
+        let _ = std::fs::remove_dir_all(&test_root);
+    }
+
+    #[tokio::test]
+    async fn test_generated_prompt_has_no_title_artist_or_raw_timing() {
+        use std::io::{Read, Write};
+        use std::net::TcpListener;
+        use std::sync::{Arc, Mutex};
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let server_url = format!("http://127.0.0.1:{}", port);
+
+        let captured_body = Arc::new(Mutex::new(None));
+        let captured_body_clone = captured_body.clone();
+
+        std::thread::spawn(move || {
+            if let Ok((mut stream, _)) = listener.accept() {
+                let mut buffer = [0; 65536];
+                if let Ok(bytes_read) = stream.read(&mut buffer) {
+                    let req_str = String::from_utf8_lossy(&buffer[..bytes_read]).to_string();
+                    if let Some(body_start) = req_str.find("\r\n\r\n") {
+                        let body = req_str[body_start + 4..].to_string();
+                        let mut cap = captured_body_clone.lock().unwrap();
+                        *cap = Some(body);
+                    }
+                }
+
+                // Return valid response
+                let response = "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\n\r\n{\
+                    \"candidates\": [\
+                        {\
+                            \"content\": {\
+                                \"parts\": [\
+                                    {\
+                                         \"text\": \"{\\n  \\\"section_id\\\": \\\"preview_section\\\",\\n  \\\"difficulty_level\\\": 10,\\n  \\\"play_mode\\\": \\\"Single\\\",\\n  \\\"biomechanical_state\\\": {\\n    \\\"current_twist_debt\\\": 0.0,\\n    \\\"current_stamina_debt\\\": 0.1\\n  },\\n  \\\"measures\\\": [\\n    {\\n      \\\"measure_index\\\": 0,\\n      \\\"subdivision\\\": 4,\\n      \\\"rows\\\": [\\n        \\\"10000\\\",\\n        \\\"00100\\\",\\n        \\\"00001\\\",\\n        \\\"00100\\\"\\n      ]\\n    }\\n  ]\\n}\"\
+                                    }\
+                                ]\
+                            }\
+                        }\
+                    ]\
+                }";
+                let _ = stream.write_all(response.as_bytes());
+                let _ = stream.flush();
+            }
+        });
+
+        let empty_calib_json = r#"{
+            "schema_version": "single-guardrail-calibration.v0",
+            "publicability_status": "private_derived",
+            "play_mode": "Single",
+            "source_dataset_summary": {},
+            "level_thresholds": {
+                "S10": {
+                    "density": { "warning_p90": 1000.0, "hard_limit_p95": 1000.0 },
+                    "jump_rate": { "warning_p90": 10.0, "hard_limit_p95": 10.0 },
+                    "twist_rate": { "warning_p90": 10.0, "hard_limit_p95": 10.0 },
+                    "bracket_candidate_rate": { "warning_p90": 1000.0, "hard_limit_p95": 1000.0 }
+                }
+            },
+            "pattern_family_thresholds": {},
+            "confidence_policy": {},
+            "recommended_runtime_usage": []
+        }"#;
+        let empty_calib: crate::guardrail_calibration::SingleGuardrailCalibration =
+            serde_json::from_str(empty_calib_json).unwrap();
+
+        let original_path = get_fixture_path();
+        let temp_dir = std::env::temp_dir();
+        let test_root = temp_dir.join("prompt_privacy_test_run");
+        let _ = std::fs::create_dir_all(&test_root);
+
+        let temp_ssc_path = test_root.join("test_gemini_prompt_privacy.ssc");
+        std::fs::copy(&original_path, &temp_ssc_path).expect("Failed to copy");
+
+        // Write a mock song analysis report to verify duration bucket and section intentions
+        let analysis_dir = test_root.join(".ai-step-gen-analysis");
+        let _ = std::fs::create_dir_all(&analysis_dir);
+        let mock_report_content = r#"{
+          "schema_version": "v1",
+          "song_id": "test_song_privacy",
+          "title": "Private Title",
+          "artist": "Private Artist",
+          "duration_seconds": 120.0,
+          "audio_summary": {
+            "sample_rate": 44100,
+            "detected_bpm": 120.0,
+            "rms_energy_mean": 0.5,
+            "rms_energy_max": 0.8,
+            "spectral_centroid_mean": 1000.0,
+            "spectral_flatness_mean": 0.1,
+            "zero_crossing_rate_mean": 0.05,
+            "chroma_mean": null,
+            "spectral_contrast_mean": null,
+            "analysis_mode": "offline"
+          },
+          "timing_grid": {
+            "initial_offset": 0.0,
+            "bpms": [],
+            "display_bpm": "120",
+            "song_type": "Arcade"
+          },
+          "event_features": {
+            "beats": []
+          },
+          "sections": [
+            {
+              "section_id": "preview_section",
+              "start_beat": 0.0,
+              "end_beat": 16.0,
+              "start_measure": 0,
+              "end_measure": 4,
+              "music_role": "verse",
+              "piu_role": "stream_opportunity",
+              "boundary_confidence": 0.9,
+              "energy_profile": "mid"
+            }
+          ],
+          "choreographic_intent": [
+            {
+              "schema_version": "v1",
+              "section_id": "preview_section",
+              "mode": "Single",
+              "target_level": 10,
+              "measure_start": 0,
+              "measure_end": 4,
+              "density_target": "moderate",
+              "difficulty_budget": 10.0,
+              "recommended_pattern_families": ["stream"],
+              "avoid_pattern_families": ["jump_accent"],
+              "accent_plan": [],
+              "rest_plan": [],
+              "motif_strategy": "motif",
+              "evidence": [],
+              "confidence": 0.8
+            }
+          ],
+          "diagnostics": {
+            "audio_bpm_detected": 120.0,
+            "ssc_initial_bpm": 120.0,
+            "audio_vs_ssc_tempo_agreement": true,
+            "beat_grid_error_ms_mean": 0.0,
+            "timing_confidence": 1.0,
+            "requires_manual_timing_review": false,
+            "warnings": [],
+            "analysis_mode": "offline"
+          },
+          "publicability": {
+            "contains_original_audio": false,
+            "contains_full_chart": false,
+            "exportable": true
+          }
+        }"#;
+        std::fs::write(
+            analysis_dir.join("song-analysis-report.v1.json"),
+            mock_report_content,
+        )
+        .expect("Failed to write mock report");
+
+        let test_audio_path = test_root.join("test_audio_privacy.mp3");
+        {
+            let mut file = std::fs::File::create(&test_audio_path).unwrap();
+            file.write_all(b"audio content").unwrap();
+        }
+
+        let client = GeminiClient::new(Some(server_url));
+        crate::settings::set_test_gemini_enabled(Some(true));
+
+        let result = generate_gemini_chart_preview_core_internal(
+            "fake-key",
+            &temp_ssc_path.to_string_lossy(),
+            &test_audio_path.to_string_lossy(),
+            PlayMode::Single,
+            10,
+            "preview_section",
+            "AI Previewer",
+            &client,
+            Some(0),
+            Some(0),
+            None,
+            Some(true), // use_music_analysis
+            Some(true), // use_browser_bpm
+            Some("Status: disagrees, Canonical BPM: 120, Browser BPM: 130".to_string()),
+            Some(true), // use_calibrated_prompt_context
+            None,
+            Some(&empty_calib),
+        )
+        .await;
+
+        assert!(
+            result.is_ok(),
+            "Preview generation returned an error: {:?}",
+            result.err()
+        );
+
+        let prompt_data = captured_body
+            .lock()
+            .unwrap()
+            .clone()
+            .expect("No prompt was captured");
+
+        let v: serde_json::Value = serde_json::from_str(&prompt_data).unwrap();
+        let prompt_text = v["contents"][0]["parts"][0]["text"]
+            .as_str()
+            .unwrap()
+            .to_lowercase();
+
+        // Ensure no forbidden StepMania tags are in the prompt
+        assert!(!prompt_text.contains("#title"), "Should not contain #TITLE");
+        assert!(
+            !prompt_text.contains("#artist"),
+            "Should not contain #ARTIST"
+        );
+        assert!(!prompt_text.contains("#bpms"), "Should not contain #BPMS");
+        assert!(
+            !prompt_text.contains("#offset"),
+            "Should not contain #OFFSET"
+        );
+        assert!(!prompt_text.contains("#stops"), "Should not contain #STOPS");
+        assert!(
+            !prompt_text.contains("#delays"),
+            "Should not contain #DELAYS"
+        );
+        assert!(!prompt_text.contains("#warps"), "Should not contain #WARPS");
+        assert!(
+            !prompt_text.contains("#notedata"),
+            "Should not contain #NOTEDATA"
+        );
+
+        // Ensure no title or artist content context labels (Spanish or English)
+        assert!(
+            !prompt_text.contains("título de la canción"),
+            "Should not contain title context labels"
+        );
+        assert!(
+            !prompt_text.contains("título"),
+            "Should not contain title label"
+        );
+        assert!(
+            !prompt_text.contains("artista"),
+            "Should not contain artist label"
+        );
+
+        // Ensure no raw timing or duration words are present
+        assert!(
+            !prompt_text.contains("duración:"),
+            "Should not contain Duración:"
+        );
+        assert!(
+            !prompt_text.contains("segundos"),
+            "Should not contain segundos"
+        );
+        assert!(
+            !prompt_text.contains("120.0 segundos"),
+            "Should not contain exact seconds duration value"
+        );
+
+        // Ensure duration is bucketized
+        assert!(
+            prompt_text.contains("- longitud de la canción: medium"),
+            "Should contain duration bucket 'medium'"
+        );
+
+        // Ensure browser BPM disagrees reconciliation is correctly classified and formatted
+        assert!(
+            prompt_text.contains("mismatch or manual review suggested"),
+            "Should suggest mismatch/manual review"
+        );
+        assert!(
+            !prompt_text.contains("agreed with sheet timing"),
+            "Should not contain agreed status"
+        );
+
+        // Ensure no raw BPM terms are in the prompt context
+        assert!(
+            !prompt_text.contains("canonical bpm"),
+            "Should not contain canonical bpm"
+        );
+        assert!(
+            !prompt_text.contains("browser bpm"),
+            "Should not contain browser bpm"
+        );
+        assert!(
+            !prompt_text.contains("candidates:"),
+            "Should not contain candidates:"
+        );
+
+        // Verify calibrated context JSON fields inside the prompt
+        assert!(
+            prompt_text.contains("\"has_reconciliation_agreement\": false"),
+            "Should serialize has_reconciliation_agreement as false"
+        );
+        assert!(
+            prompt_text.contains("browser timing reconciliation reports a mismatch."),
+            "Should include timing warning about mismatch"
+        );
+
+        crate::settings::set_test_gemini_enabled(None);
         let _ = std::fs::remove_dir_all(&test_root);
     }
 }

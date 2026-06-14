@@ -23,7 +23,8 @@ import {
   isAppendDisabled,
   isPreviewStale,
   validateMeasureRange,
-  groupValidationIssues
+  groupValidationIssues,
+  getPatternFamilyLabel
 } from "../utils/ProjectWorkspaceHelpers";
 import type { PreviewParams } from "../utils/ProjectWorkspaceHelpers";
 
@@ -98,6 +99,8 @@ export const ProjectWorkspace: React.FC<ProjectWorkspaceProps> = ({ onNavigate }
   const [selectedSectionKey, setSelectedSectionKey] = useState<string>("custom");
   const [useMusicAnalysis, setUseMusicAnalysis] = useState(true);
   const [useBrowserBpm, setUseBrowserBpm] = useState(true);
+  const [useCalibratedPromptContext, setUseCalibratedPromptContext] = useState(true);
+  const [patternFocus, setPatternFocus] = useState<string>("auto");
   const [previewParamsSnapshot, setPreviewParamsSnapshot] = useState<PreviewParams | null>(null);
 
   // Preview result states
@@ -287,7 +290,9 @@ export const ProjectWorkspace: React.FC<ProjectWorkspaceProps> = ({ onNavigate }
         songType,
         useMusicAnalysis,
         useBrowserBpm,
-        selectedSectionKey
+        selectedSectionKey,
+        useCalibratedPromptContext,
+        patternFamilyTarget: patternFocus
       };
       if (isPreviewStale(previewParamsSnapshot, currentParams)) {
         handleDiscardPreview();
@@ -302,6 +307,8 @@ export const ProjectWorkspace: React.FC<ProjectWorkspaceProps> = ({ onNavigate }
     useMusicAnalysis,
     useBrowserBpm,
     selectedSectionKey,
+    useCalibratedPromptContext,
+    patternFocus,
     previewParamsSnapshot
   ]);
 
@@ -404,6 +411,8 @@ export const ProjectWorkspace: React.FC<ProjectWorkspaceProps> = ({ onNavigate }
         useMusicAnalysis,
         useBrowserBpm,
         browserBpmReconciliation: useBrowserBpm ? browserBpmReconciliationStr : undefined,
+        useCalibratedPromptContext,
+        patternFamilyTarget: patternFocus,
       });
 
       if (!isActivePreview()) return;
@@ -416,7 +425,9 @@ export const ProjectWorkspace: React.FC<ProjectWorkspaceProps> = ({ onNavigate }
         songType: songTypeVal,
         useMusicAnalysis,
         useBrowserBpm,
-        selectedSectionKey
+        selectedSectionKey,
+        useCalibratedPromptContext,
+        patternFamilyTarget: patternFocus
       });
 
       // 3. Get file fingerprint AFTER preview
@@ -1041,7 +1052,29 @@ export const ProjectWorkspace: React.FC<ProjectWorkspaceProps> = ({ onNavigate }
                 </p>
               )}
 
-              <div className="context-checkbox-row">
+              <div className="form-row-compact margin-top-16">
+                <div className="form-group-contained">
+                  <label className="form-label-dark">Pattern Focus</label>
+                  <select
+                    className="input-contained select-dark select-dark-override"
+                    value={patternFocus}
+                    onChange={(e) => setPatternFocus(e.target.value)}
+                    disabled={isLoading}
+                  >
+                    <option value="auto">Auto</option>
+                    <option value="balanced">Balanced</option>
+                    <option value="stream">Stream</option>
+                    <option value="jump_accent">Jump Accents</option>
+                    <option value="twist_technical">Twist Technical</option>
+                    <option value="bracket_technical">Bracket Technical</option>
+                    <option value="hold_control">Hold Control</option>
+                    <option value="center_control">Center Control</option>
+                    <option value="stamina">Stamina</option>
+                  </select>
+                </div>
+              </div>
+
+              <div className="context-checkbox-row margin-top-16">
                 <label className={`context-checkbox-label ${!analysisReport ? "disabled" : ""}`}>
                   <input
                     type="checkbox"
@@ -1060,6 +1093,16 @@ export const ProjectWorkspace: React.FC<ProjectWorkspaceProps> = ({ onNavigate }
                     disabled={!workspaceBpmReport || isLoading}
                   />
                   <span>Use Browser BPM Diagnostics {workspaceBpmReport ? "(Available)" : "(Unavailable)"}</span>
+                </label>
+
+                <label className="context-checkbox-label">
+                  <input
+                    type="checkbox"
+                    checked={useCalibratedPromptContext}
+                    onChange={(e) => setUseCalibratedPromptContext(e.target.checked)}
+                    disabled={isLoading}
+                  />
+                  <span>Use calibrated prompt context</span>
                 </label>
               </div>
 
@@ -1086,7 +1129,7 @@ export const ProjectWorkspace: React.FC<ProjectWorkspaceProps> = ({ onNavigate }
                         <span className="intent-guide-label">Recommended Patterns:</span>{" "}
                         {matchedIntent.recommended_pattern_families.map((p, i) => (
                           <span key={i} className="analysis-badge-recommend intent-badge">
-                            {p.replace('_', ' ')}
+                            {getPatternFamilyLabel(p)}
                           </span>
                         ))}
                       </div>
@@ -1095,7 +1138,7 @@ export const ProjectWorkspace: React.FC<ProjectWorkspaceProps> = ({ onNavigate }
                           <span className="intent-guide-label">Patterns to Avoid:</span>{" "}
                           {matchedIntent.avoid_pattern_families.map((p, i) => (
                             <span key={i} className="analysis-badge-avoid intent-badge">
-                              {p.replace('_', ' ')}
+                              {getPatternFamilyLabel(p)}
                             </span>
                           ))}
                         </div>
@@ -1247,6 +1290,99 @@ export const ProjectWorkspace: React.FC<ProjectWorkspaceProps> = ({ onNavigate }
                     </div>
                   ) : null}
                 </div>
+
+                {/* Calibrated Prompt Context Summary */}
+                {(previewResult.pattern_family_targeting || previewResult.calibration_context_summary) && (
+                  <div className="validation-report-panel calibration-panel clean">
+                    <div className="validation-report-header">
+                      <span className="validation-report-summary validation-report-summary-flex">
+                        <Sparkles size={16} className="text-slate-icon" />
+                        <span>Calibrated Prompt Context Summary</span>
+                      </span>
+                      {previewResult.calibrated_prompt_context_used && (
+                        <span className="context-source-tag">Calibrated Context Used</span>
+                      )}
+                    </div>
+                    
+                    <div className="validation-sections-wrapper calibration-sections-wrapper">
+                      <div className="bpm-diagnostics-grid-calib">
+                        {previewResult.calibration_context_summary && (
+                          <div className="bpm-diagnostics-card bpm-diagnostics-card-calib">
+                            <span className="bpm-diagnostics-label">Calibration Engine</span>
+                            <span className="bpm-diagnostics-value bpm-diagnostics-value-calib">
+                              {previewResult.calibration_context_summary.available ? "Available" : "Unavailable"}
+                            </span>
+                            {previewResult.calibration_context_summary.available && (
+                              <div className="caption-text-gravel caption-text-gravel-calib">
+                                Level: {previewResult.calibration_context_summary.target_level} ({previewResult.calibration_context_summary.level_confidence} conf)
+                                <br />
+                                {previewResult.calibration_context_summary.warning_count} warnings, {previewResult.calibration_context_summary.error_count} errors
+                              </div>
+                            )}
+                          </div>
+                        )}
+
+                        {previewResult.pattern_family_targeting && (
+                          <>
+                            <div className="bpm-diagnostics-card bpm-diagnostics-card-calib">
+                              <span className="bpm-diagnostics-label">Primary Pattern Focus</span>
+                              <span className="bpm-diagnostics-value bpm-diagnostics-value-calib-primary">
+                                {getPatternFamilyLabel(previewResult.pattern_family_targeting.primary_family)}
+                              </span>
+                              <div className="caption-text-gravel caption-text-gravel-calib">
+                                Confidence: {previewResult.pattern_family_targeting.confidence}
+                              </div>
+                            </div>
+
+                            <div className="bpm-diagnostics-card bpm-diagnostics-card-calib">
+                              <span className="bpm-diagnostics-label">Targeting Warnings</span>
+                              <span className={`bpm-diagnostics-value ${previewResult.pattern_family_targeting.warnings.length > 0 ? "bpm-diagnostics-value-calib-warning" : "bpm-diagnostics-value-calib-success"}`}>
+                                {previewResult.pattern_family_targeting.warnings.length} Warnings
+                              </span>
+                            </div>
+                          </>
+                        )}
+                      </div>
+
+                      {previewResult.pattern_family_targeting && (
+                        <div className="pattern-targeting-detail-container">
+                          <div>
+                            <strong>Secondary Families:</strong>{" "}
+                            {previewResult.pattern_family_targeting.secondary_families.length > 0 ? (
+                              previewResult.pattern_family_targeting.secondary_families.map((fam, i) => (
+                                <span key={i} className="context-source-tag margin-left-4">{getPatternFamilyLabel(fam)}</span>
+                              ))
+                            ) : (
+                              <span className="caption-text-gravel">None</span>
+                            )}
+                          </div>
+
+                          <div>
+                            <strong>Avoid Families:</strong>{" "}
+                            {previewResult.pattern_family_targeting.avoid_families.length > 0 ? (
+                              previewResult.pattern_family_targeting.avoid_families.map((fam, i) => (
+                                <span key={i} className="analysis-badge-avoid avoid-badge-calib">{getPatternFamilyLabel(fam)}</span>
+                              ))
+                            ) : (
+                              <span className="caption-text-gravel">None</span>
+                            )}
+                          </div>
+
+                          {previewResult.pattern_family_targeting.evidence.length > 0 && (
+                            <div>
+                              <strong>Targeting Evidence:</strong>
+                              <ul className="caption-text-gravel targeting-evidence-list">
+                                {previewResult.pattern_family_targeting.evidence.map((ev, i) => (
+                                  <li key={i}>{ev}</li>
+                                ))}
+                              </ul>
+                            </div>
+                          )}
+                        </div>
+                      )}
+                    </div>
+                  </div>
+                )}
 
                 {/* Calibration Guardrails Report */}
                 {previewResult.calibration_report && (
@@ -1855,7 +1991,7 @@ export const ProjectWorkspace: React.FC<ProjectWorkspaceProps> = ({ onNavigate }
                           <span className="analysis-patterns-label">Recommend:</span>
                           {intent.recommended_pattern_families.map((fam: string, fIdx: number) => (
                             <span key={fIdx} className="analysis-badge-recommend">
-                              {fam.replace('_', ' ')}
+                              {getPatternFamilyLabel(fam)}
                             </span>
                           ))}
                         </div>
@@ -1865,7 +2001,7 @@ export const ProjectWorkspace: React.FC<ProjectWorkspaceProps> = ({ onNavigate }
                             <span className="analysis-patterns-label">Avoid:</span>
                             {intent.avoid_pattern_families.map((fam: string, fIdx: number) => (
                               <span key={fIdx} className="analysis-badge-avoid">
-                                {fam.replace('_', ' ')}
+                                {getPatternFamilyLabel(fam)}
                               </span>
                             ))}
                           </div>

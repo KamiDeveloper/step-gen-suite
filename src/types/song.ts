@@ -85,6 +85,33 @@ export interface ICalibrationValidationReport {
   summary: string;
 }
 
+export interface IPatternFamilyCandidate {
+  family: string;
+  score: number;
+  confidence: string;
+  evidence: string[];
+  warnings: string[];
+}
+
+export interface IPatternFamilyTargetingReport {
+  requested_mode: string;
+  primary_family: string;
+  secondary_families: string[];
+  avoid_families: string[];
+  candidates: IPatternFamilyCandidate[];
+  confidence: string;
+  evidence: string[];
+  warnings: string[];
+}
+
+export interface ICalibrationContextSummary {
+  available: boolean;
+  target_level: string;
+  level_confidence: string;
+  warning_count: number;
+  error_count: number;
+}
+
 export interface IAppendChartResult {
   charts: IChartDetails[];
   validation: IValidatedChartSection;
@@ -95,6 +122,9 @@ export interface IAppendChartResult {
   backup_path?: string | null;
   context_sources_used?: string[] | null;
   calibration_report?: ICalibrationValidationReport | null;
+  calibrated_prompt_context_used?: boolean | null;
+  pattern_family_targeting?: IPatternFamilyTargetingReport | null;
+  calibration_context_summary?: ICalibrationContextSummary | null;
 }
 
 export interface IGeminiBiomechanicalState {
